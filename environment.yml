@@ -1,0 +1,16 @@
+name: cyberrunner
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - matplotlib
+  - pip
+  - pip:
+    - mujoco>=3.0
+    - gymnasium
+    - stable-baselines3[extra]
+    - tensorboard
+    - optuna
+    - optuna-dashboard
