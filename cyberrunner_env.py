@@ -809,12 +809,14 @@ class CyberRunnerEnv(gym.Env):
         render_mode: Optional[str] = None,
         episode_length: int = 2000,
         randomize_init_pos: bool = True,
+        start_from_beginning_prob: float = 0.0,
     ):
         super().__init__()
 
         self.render_mode = render_mode
         self.episode_length = episode_length
         self.randomize_init_pos = randomize_init_pos
+        self.start_from_beginning_prob = start_from_beginning_prob
 
         # Load maze layout
         self.walls_h, self.walls_v, self.holes, self.waypoints = get_hard_layout()
@@ -865,7 +867,10 @@ class CyberRunnerEnv(gym.Env):
 
         # Set initial marble position
         if self.randomize_init_pos:
-            idx = self.np_random.integers(0, len(self.waypoints))
+            if self.start_from_beginning_prob > 0 and self.np_random.random() < self.start_from_beginning_prob:
+                idx = 0
+            else:
+                idx = self.np_random.integers(0, len(self.waypoints))
             init_pos = self.waypoints[idx]
         else:
             init_pos = self.waypoints[0]
