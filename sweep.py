@@ -19,6 +19,7 @@ import optuna
 from optuna.samplers import TPESampler
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import VecNormalize, VecFrameStack
 from stable_baselines3.common.evaluation import evaluate_policy
 
 from cyberrunner_env import CyberRunnerEnv
@@ -39,7 +40,7 @@ def make_env():
 def sample_ppo_params(trial: optuna.Trial) -> dict:
     return {
         # Anchored near best known value
-        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-4, log=True),
+        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 9.99e-4, log=True),
         "n_steps":       trial.suggest_categorical("n_steps", [2048, 4096]),
         "batch_size":    trial.suggest_categorical("batch_size", [64, 128, 256]),
         "n_epochs":      trial.suggest_int("n_epochs", 10, 20),
@@ -49,7 +50,7 @@ def sample_ppo_params(trial: optuna.Trial) -> dict:
         "clip_range":    trial.suggest_float("clip_range", 0.2, 0.35),
         # Widened: explore whether more entropy helps navigate past holes
         "ent_coef":      trial.suggest_float("ent_coef", 1e-4, 0.05, log=True),
-        "net_arch":      trial.suggest_categorical("net_arch", ["medium", "large"]),
+        "net_arch":      trial.suggest_categorical("net_arch", ["small", "medium"]),
     }
 
 
@@ -67,19 +68,26 @@ def sample_sac_params(trial: optuna.Trial) -> dict:
     }
 
 
-def objective(trial: optuna.Trial, algo: str, timesteps: int, n_envs: int) -> float:
+def objective(trial: optuna.Trial, algo: str, timesteps: int, n_envs: int,
+              frame_stack: int) -> float:
     if algo == "ppo":
         params = sample_ppo_params(trial)
-        # n_steps must be >= batch_size for PPO
         if params["n_steps"] < params["batch_size"]:
             raise optuna.TrialPruned()
         train_env = make_vec_env(make_env, n_envs=n_envs)
     else:
         params = sample_sac_params(trial)
-        train_env = make_vec_env(make_env, n_envs=1)  # SAC is off-policy, 1 env is standard
+        train_env = make_vec_env(make_env, n_envs=1)
 
     net_arch = NET_ARCHS[params.pop("net_arch")]
     eval_env = make_vec_env(make_env, n_envs=1)
+
+    train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
+
+    if frame_stack > 1:
+        train_env = VecFrameStack(train_env, n_stack=frame_stack)
+        eval_env = VecFrameStack(eval_env, n_stack=frame_stack)
 
     try:
         model = ALGO_CLS[algo](
@@ -90,7 +98,16 @@ def objective(trial: optuna.Trial, algo: str, timesteps: int, n_envs: int) -> fl
             tensorboard_log=None,
             **params,
         )
-        model.learn(total_timesteps=timesteps)
+        model.learn(total_timesteps=timesteps, progress_bar=True)
+
+        # Sync normalization stats from train to eval
+        if frame_stack > 1:
+            eval_env.venv.obs_rms = train_env.venv.obs_rms
+            eval_env.venv.ret_rms = train_env.venv.ret_rms
+        else:
+            eval_env.obs_rms = train_env.obs_rms
+            eval_env.ret_rms = train_env.ret_rms
+
         mean_reward, _ = evaluate_policy(model, eval_env, n_eval_episodes=10, deterministic=True)
     finally:
         train_env.close()
@@ -112,7 +129,7 @@ def main(args):
     )
 
     study.optimize(
-        lambda trial: objective(trial, algo, args.timesteps, args.n_envs),
+        lambda trial: objective(trial, algo, args.timesteps, args.n_envs, args.frame_stack),
         n_trials=args.trials,
         n_jobs=args.n_jobs,
         show_progress_bar=True,
@@ -136,5 +153,7 @@ if __name__ == "__main__":
                         help="Parallel envs (PPO only; SAC always uses 1)")
     parser.add_argument("--n-jobs", type=int, default=1,
                         help="Parallel Optuna trials (n_envs × n_jobs <= n_cores)")
+    parser.add_argument("--frame-stack", type=int, default=1,
+                        help="Number of frames to stack (must match training)")
     args = parser.parse_args()
     main(args)

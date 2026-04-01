@@ -26,37 +26,49 @@ def make_env(start_from_beginning_prob: float = 0.0):
 
 
 class CurriculumCallback(BaseCallback):
-    """Linearly decay start_from_beginning_prob during training."""
+    """Decay start_from_beginning_prob to 0 over a warmup fraction of training."""
 
-    def __init__(self, initial_prob: float, final_prob: float, verbose: int = 0):
+    def __init__(self, initial_prob: float, warmup_frac: float = 0.3, verbose: int = 0):
         super().__init__(verbose)
         self.initial_prob = initial_prob
-        self.final_prob = final_prob
+        self.warmup_frac = warmup_frac
+        self._done = False
 
     def _on_step(self) -> bool:
-        progress = self.num_timesteps / self.locals["total_timesteps"]
-        current_prob = self.initial_prob + (self.final_prob - self.initial_prob) * progress
+        if self._done or self.num_timesteps % 10_000 != 0:
+            return True
 
-        # Update all training envs
+        total = self.locals["total_timesteps"]
+        warmup_end = total * self.warmup_frac
+
+        if self.num_timesteps >= warmup_end:
+            current_prob = 0.0
+            self._done = True
+        else:
+            current_prob = self.initial_prob * (1.0 - self.num_timesteps / warmup_end)
+
         for env in self.training_env.envs:
             env.start_from_beginning_prob = current_prob
 
-        if self.verbose > 0 and self.num_timesteps % 50_000 < self.locals.get("n_steps", 2048):
-            print(f"  [curriculum] step {self.num_timesteps}: start_prob={current_prob:.3f}")
+        if self.verbose > 0 and self._done:
+            print(f"  [curriculum] warmup done at step {self.num_timesteps}, back to uniform")
 
         return True
 
 
 ALGO_DEFAULTS = {
+    # Pre-tuning defaults:
+    # learning_rate=3e-4, n_steps=2048, batch_size=64, n_epochs=16,
+    # gamma=0.99, gae_lambda=0.98, clip_range=0.2, ent_coef=0.001
     "ppo": dict(
-        learning_rate=3e-4,
+        learning_rate=1e-4,
         n_steps=2048,
-        batch_size=64,
-        n_epochs=16,
-        gamma=0.99,
-        gae_lambda=0.98,
-        clip_range=0.2,
-        ent_coef=0.001,
+        batch_size=128,
+        n_epochs=17,
+        gamma=0.997,
+        gae_lambda=0.974,
+        clip_range=0.21,
+        ent_coef=0.0037,
     ),
     "sac": dict(
         learning_rate=3e-4,
@@ -125,17 +137,18 @@ def main(args):
         best_model_save_path=best_path,
         log_path=f"{log_dir}/eval",
         eval_freq=max(10_000 // n_envs, 1),
-        n_eval_episodes=5,
+        n_eval_episodes=20,
         deterministic=True,
     ))
 
     if args.start_from_beginning_prob > 0:
         callbacks.append(CurriculumCallback(
             initial_prob=args.start_from_beginning_prob,
-            final_prob=args.final_start_prob,
+            warmup_frac=args.warmup_frac,
             verbose=1,
         ))
-        print(f"Curriculum: start_prob {args.start_from_beginning_prob} → {args.final_start_prob}")
+        print(f"Curriculum: start_prob {args.start_from_beginning_prob} → 0.0 "
+              f"over first {int(args.warmup_frac * 100)}% of training")
 
     model.learn(
         total_timesteps=args.timesteps,
@@ -158,7 +171,7 @@ if __name__ == "__main__":
     parser.add_argument("--run-name", type=str, default=None,
                         help="Run name. Auto-generated as <algo>_<timestamp> if not provided.")
     parser.add_argument("--timesteps", type=int, default=1_000_000)
-    parser.add_argument("--n-envs", type=int, default=4,
+    parser.add_argument("--n-envs", type=int, default=8,
                         help="Parallel envs (PPO only; SAC always uses 1)")
     parser.add_argument("--resume", action="store_true",
                         help="Resume training from ./models/<run-name>/final.zip")
@@ -166,7 +179,7 @@ if __name__ == "__main__":
                         help="Number of frames to stack (>1 gives velocity info)")
     parser.add_argument("--start-from-beginning-prob", type=float, default=0.0,
                         help="Initial probability of starting at waypoint 0")
-    parser.add_argument("--final-start-prob", type=float, default=0.0,
-                        help="Final probability of starting at waypoint 0 (decays linearly)")
+    parser.add_argument("--warmup-frac", type=float, default=0.3,
+                        help="Fraction of training over which curriculum decays to uniform (default: 0.3)")
     args = parser.parse_args()
     main(args)
