@@ -23,8 +23,9 @@ from stable_baselines3.common.vec_env import VecNormalize, VecFrameStack
 from stable_baselines3.common.evaluation import evaluate_policy
 
 from cyberrunner_env import CyberRunnerEnv
+from maxinfosac_compat import MaxInfoSAC
 
-ALGO_CLS = {"ppo": PPO, "sac": SAC}
+ALGO_CLS = {"ppo": PPO, "sac": SAC, "maxinfosac": MaxInfoSAC}
 
 NET_ARCHS = {
     "small":  dict(pi=[64, 64],        vf=[64, 64]),
@@ -70,6 +71,7 @@ def sample_sac_params(trial: optuna.Trial) -> dict:
 
 def objective(trial: optuna.Trial, algo: str, timesteps: int, n_envs: int,
               frame_stack: int) -> float:
+    use_pre_norm_stack = algo != "ppo" and frame_stack > 1
     if algo == "ppo":
         params = sample_ppo_params(trial)
         if params["n_steps"] < params["batch_size"]:
@@ -82,12 +84,17 @@ def objective(trial: optuna.Trial, algo: str, timesteps: int, n_envs: int,
     net_arch = NET_ARCHS[params.pop("net_arch")]
     eval_env = make_vec_env(make_env, n_envs=1)
 
-    train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
-    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
-
-    if frame_stack > 1:
+    if use_pre_norm_stack:
         train_env = VecFrameStack(train_env, n_stack=frame_stack)
         eval_env = VecFrameStack(eval_env, n_stack=frame_stack)
+        train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+        eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
+    else:
+        train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+        eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
+        if frame_stack > 1:
+            train_env = VecFrameStack(train_env, n_stack=frame_stack)
+            eval_env = VecFrameStack(eval_env, n_stack=frame_stack)
 
     try:
         model = ALGO_CLS[algo](
@@ -101,7 +108,7 @@ def objective(trial: optuna.Trial, algo: str, timesteps: int, n_envs: int,
         model.learn(total_timesteps=timesteps, progress_bar=True)
 
         # Sync normalization stats from train to eval
-        if frame_stack > 1:
+        if frame_stack > 1 and not use_pre_norm_stack:
             eval_env.venv.obs_rms = train_env.venv.obs_rms
             eval_env.venv.ret_rms = train_env.venv.ret_rms
         else:
@@ -154,6 +161,6 @@ if __name__ == "__main__":
     parser.add_argument("--n-jobs", type=int, default=1,
                         help="Parallel Optuna trials (n_envs × n_jobs <= n_cores)")
     parser.add_argument("--frame-stack", type=int, default=1,
-                        help="Number of frames to stack (must match training)")
+                        help="Number of frames to stack (>1 supported for all algos)")
     args = parser.parse_args()
     main(args)

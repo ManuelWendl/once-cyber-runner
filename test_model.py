@@ -11,14 +11,17 @@ import os
 import time
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecFrameStack
+from maxinfosac_compat import MaxInfoSAC
 from cyberrunner_env import CyberRunnerEnv
 
 CONTROL_HZ = 60
-ALGO_CLS = {"ppo": PPO, "sac": SAC}
+ALGO_CLS = {"ppo": PPO, "sac": SAC, "maxinfosac": MaxInfoSAC}
 
 
 def main(args):
     algo = args.algo.lower()
+    frame_stack = args.frame_stack
+    use_pre_norm_stack = algo != "ppo" and frame_stack > 1
     run_name = args.run_name or algo
     model_dir = f"./models/{run_name}"
     vecnorm_path = f"{model_dir}/vecnormalize.pkl"
@@ -34,15 +37,19 @@ def main(args):
     render_mode = None if args.no_render else "human"
     env = DummyVecEnv([lambda: CyberRunnerEnv(render_mode=render_mode, randomize_init_pos=False)])
 
+    if use_pre_norm_stack:
+        env = VecFrameStack(env, n_stack=frame_stack)
+        print(f"Frame stacking (pre-normalization): {frame_stack}")
+
     if os.path.exists(vecnorm_path):
         env = VecNormalize.load(vecnorm_path, env)
         env.training = False
         env.norm_reward = False
         print(f"Loaded VecNormalize stats from {vecnorm_path}")
 
-    if args.frame_stack > 1:
-        env = VecFrameStack(env, n_stack=args.frame_stack)
-        print(f"Frame stacking: {args.frame_stack}")
+    if frame_stack > 1 and not use_pre_norm_stack:
+        env = VecFrameStack(env, n_stack=frame_stack)
+        print(f"Frame stacking: {frame_stack}")
 
     for episode in range(args.episodes):
         obs = env.reset()
@@ -73,7 +80,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--algo", type=str, required=True, choices=["ppo", "sac"])
+    parser.add_argument("--algo", type=str, required=True, choices=["ppo", "sac", "maxinfosac"])
     parser.add_argument("--run-name", type=str, default=None,
                         help="Run name used during training. Loads from ./models/<run-name>/")
     parser.add_argument("--model-path", type=str, default=None,
@@ -83,6 +90,6 @@ if __name__ == "__main__":
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--no-render", action="store_true")
     parser.add_argument("--frame-stack", type=int, default=1,
-                        help="Number of stacked frames (must match training)")
+                        help="Number of stacked frames (must match training; >1 typically PPO only)")
     args = parser.parse_args()
     main(args)

@@ -12,8 +12,9 @@ import argparse
 from datetime import datetime
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import VecNormalize, VecFrameStack
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize, VecFrameStack
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+from maxinfosac_compat import MaxInfoSAC
 from cyberrunner_env import CyberRunnerEnv
 
 
@@ -79,14 +80,34 @@ ALGO_DEFAULTS = {
         learning_starts=10_000,
         ent_coef="auto",
     ),
+    "maxinfosac": dict(
+        learning_rate=1e-4,
+        buffer_size=1_000_000,
+        batch_size=256,
+        tau=0.005,
+        gamma=0.99,
+        learning_starts=10_000,
+        ent_coef="auto",
+        ensemble_model_kwargs=dict(
+            learn_std=False,
+            features=(256, 256),
+            optimizer_kwargs={"lr": 3e-4, "weight_decay": 0.0},
+        ),
+        normalize_ensemble_training=True,
+        pred_diff=True,
+        learn_rewards=True,
+        dyn_entropy_scale="auto",
+    ),
 }
 
-ALGO_CLS = {"ppo": PPO, "sac": SAC}
+ALGO_CLS = {"ppo": PPO, "sac": SAC, "maxinfosac": MaxInfoSAC}
 
 
 def main(args):
     algo = args.algo.lower()
     algo_cls = ALGO_CLS[algo]
+    if args.n_envs < 1:
+        raise ValueError("--n-envs must be >= 1")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = args.run_name or f"{algo}_{timestamp}"
 
@@ -96,31 +117,61 @@ def main(args):
     final_path = f"{model_dir}/final"
     best_path = f"{model_dir}/best"
 
-    # SAC is off-policy: multiple envs give limited benefit, 1 is standard
-    n_envs = args.n_envs if algo == "ppo" else 1
+    n_envs = args.n_envs
     n_stack = args.frame_stack
+    use_pre_norm_stack = algo != "ppo" and n_stack > 1
 
-    train_env = make_vec_env(make_env(args.start_from_beginning_prob), n_envs=n_envs)
+    vec_env_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
+    train_env = make_vec_env(
+        make_env(args.start_from_beginning_prob),
+        n_envs=n_envs,
+        vec_env_cls=vec_env_cls,
+    )
     eval_env = make_vec_env(make_env(0.0), n_envs=1)
+    if algo != "ppo" and n_envs > 1:
+        print(
+            f"Using n_envs={n_envs} for {algo.upper()}. This is valid, but speedups "
+            "depend on CPU/IPC overhead and environment step cost."
+        )
+    if use_pre_norm_stack:
+        print(
+            f"Using frame_stack={n_stack} for {algo.upper()} with VecFrameStack before "
+            "VecNormalize (required for off-policy replay-buffer compatibility)."
+        )
 
     if args.resume:
-        train_env = VecNormalize.load(vecnorm_path, train_env)
-        train_env.training = True
-        eval_env = VecNormalize.load(vecnorm_path, eval_env)
-        eval_env.training = False
-        eval_env.norm_reward = False
-        if n_stack > 1:
+        if use_pre_norm_stack:
             train_env = VecFrameStack(train_env, n_stack=n_stack)
             eval_env = VecFrameStack(eval_env, n_stack=n_stack)
+            train_env = VecNormalize.load(vecnorm_path, train_env)
+            train_env.training = True
+            eval_env = VecNormalize.load(vecnorm_path, eval_env)
+            eval_env.training = False
+            eval_env.norm_reward = False
+        else:
+            train_env = VecNormalize.load(vecnorm_path, train_env)
+            train_env.training = True
+            eval_env = VecNormalize.load(vecnorm_path, eval_env)
+            eval_env.training = False
+            eval_env.norm_reward = False
+            if n_stack > 1:
+                train_env = VecFrameStack(train_env, n_stack=n_stack)
+                eval_env = VecFrameStack(eval_env, n_stack=n_stack)
         model = algo_cls.load(f"{final_path}.zip", env=train_env,
                               tensorboard_log=log_dir)
         print(f"Resumed run '{run_name}' from {final_path}.zip")
     else:
-        train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
-        eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
-        if n_stack > 1:
+        if use_pre_norm_stack:
             train_env = VecFrameStack(train_env, n_stack=n_stack)
             eval_env = VecFrameStack(eval_env, n_stack=n_stack)
+            train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+            eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
+        else:
+            train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+            eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
+            if n_stack > 1:
+                train_env = VecFrameStack(train_env, n_stack=n_stack)
+                eval_env = VecFrameStack(eval_env, n_stack=n_stack)
         model = algo_cls(
             policy="MlpPolicy",
             env=train_env,
@@ -167,16 +218,16 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--algo", type=str, required=True, choices=["ppo", "sac"])
+    parser.add_argument("--algo", type=str, required=True, choices=["ppo", "sac", "maxinfosac"])
     parser.add_argument("--run-name", type=str, default=None,
                         help="Run name. Auto-generated as <algo>_<timestamp> if not provided.")
     parser.add_argument("--timesteps", type=int, default=1_000_000)
     parser.add_argument("--n-envs", type=int, default=8,
-                        help="Parallel envs (PPO only; SAC always uses 1)")
+                        help="Number of parallel envs for data collection")
     parser.add_argument("--resume", action="store_true",
                         help="Resume training from ./models/<run-name>/final.zip")
     parser.add_argument("--frame-stack", type=int, default=1,
-                        help="Number of frames to stack (>1 gives velocity info)")
+                        help="Number of frames to stack (>1 supported for all algos)")
     parser.add_argument("--start-from-beginning-prob", type=float, default=0.0,
                         help="Initial probability of starting at waypoint 0")
     parser.add_argument("--warmup-frac", type=float, default=0.3,

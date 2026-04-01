@@ -14,3 +14,4 @@ dependencies:
     - tensorboard
     - optuna
     - optuna-dashboard
+    - maxinforl_torch @ git+https://github.com/sukhijab/maxinforl_torch.git
