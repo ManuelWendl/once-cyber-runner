@@ -1,1 +1,13 @@
+# Python
 __pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Training outputs
+models/
+logs/
+*.db
+
+# OS
+.DS_Store
