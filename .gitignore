@@ -11,3 +11,9 @@ logs/
 
 # OS
 .DS_Store
+
+bash.exe.stackdump
+
+# Claude
+.claude/
+CLAUDE.md
