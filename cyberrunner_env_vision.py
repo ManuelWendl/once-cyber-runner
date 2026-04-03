@@ -4,6 +4,7 @@ import gymnasium as gym
 from gymnasium import spaces
 from PIL import Image, ImageDraw
 from typing import Tuple, Optional, Dict, Any
+import os
 import time
 import tempfile
 
@@ -655,11 +656,14 @@ def build_model(
     # Marble
     _add_marble(world, waypoints[0])
 
-    with tempfile.NamedTemporaryFile(suffix='.png') as f:
-        board_img.save(f)
-        f.flush()
-        tex.file = f.name
+    tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+    try:
+        board_img.save(tmp.name, format='PNG')
+        tex.file = tmp.name
         return spec.compile()
+    finally:
+        tmp.close()
+        os.unlink(tmp.name)
 
 
 def _add_board_edges(board):
