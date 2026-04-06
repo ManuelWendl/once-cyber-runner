@@ -2,13 +2,21 @@ import torch
 from torchrl.data.replay_buffers import LazyTensorStorage, ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SliceSampler
 
+# CyberRunner board dimensions (meters), used for mirror augmentation.
+_BOARD_WIDTH = 0.276
+_BOARD_HEIGHT = 0.231
+
+# (flip_x, flip_y) configs for the 3 non-identity mirrors.
+_MIRROR_CONFIGS = [(True, False), (False, True), (True, True)]
+
 
 class Buffer:
-    def __init__(self, config):
+    def __init__(self, config, mirror_augment=False):
         self.device = torch.device(config.device)
         self.storage_device = torch.device(config.storage_device)
         self.batch_size = int(config.batch_size)
         self.batch_length = int(config.batch_length)
+        self.mirror_augment = mirror_augment
         self.num_eps = 0
         self._buffer = ReplayBuffer(
             storage=LazyTensorStorage(max_size=config.max_size, device=self.storage_device, ndim=2),
@@ -20,9 +28,49 @@ class Buffer:
         )
 
     def add_transition(self, data):
-        # This is batched data and lifted for storage.
-        # (B, ...) -> (B, 1, ...)
-        self._buffer.extend(data.unsqueeze(1))
+        if not self.mirror_augment:
+            self._buffer.extend(data.unsqueeze(1))
+            return
+
+        env_num = data.shape[0]
+        copies = [data]
+        for i, (fx, fy) in enumerate(_MIRROR_CONFIGS, start=1):
+            mirrored = self._mirror(data, fx, fy)
+            mirrored["episode"] = data["episode"] + i * env_num
+            copies.append(mirrored)
+        # (env_num*4, ...) -> (env_num*4, 1, ...)
+        self._buffer.extend(torch.cat(copies, dim=0).unsqueeze(1))
+
+    @staticmethod
+    def _mirror(data, flip_x, flip_y):
+        """Create a mirrored copy of a batch of CyberRunner transitions."""
+        data = data.clone()
+        states = data["states"].clone()
+        action = data["action"].clone()
+
+        if flip_x:
+            action[..., 0] *= -1  # alpha motor
+            states[..., 0] *= -1  # alpha angle
+            states[..., 2] = _BOARD_WIDTH - states[..., 2]  # ball x
+            states[..., 4] *= -1  # vec_to_closest x
+            states[..., 6] *= -1  # vec_to_next_wp x
+            states[..., 8] *= -1  # vec_to_next_next_wp x
+            if "image" in data:
+                data["image"] = data["image"].flip(-2)  # flip width (HWC)
+
+        if flip_y:
+            action[..., 1] *= -1  # beta motor
+            states[..., 1] *= -1  # beta angle
+            states[..., 3] = _BOARD_HEIGHT - states[..., 3]  # ball y
+            states[..., 5] *= -1  # vec_to_closest y
+            states[..., 7] *= -1  # vec_to_next_wp y
+            states[..., 9] *= -1  # vec_to_next_next_wp y
+            if "image" in data:
+                data["image"] = data["image"].flip(-3)  # flip height (HWC)
+
+        data["states"] = states
+        data["action"] = action
+        return data
 
     def sample(self):
         sample_td, info = self._buffer.sample(return_info=True)

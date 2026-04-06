@@ -1,0 +1,20 @@
+task: 'cyberrunner_vision'
+mirror_augment: true
+steps: 5.01e5
+env_num: 16
+eval_every: 1e5
+eval_episode_num: 10
+action_repeat: 1
+train_ratio: 512
+time_limit: 2000
+
+seed: ${seed}
+device: ${device}
+
+size: [64, 64]
+encoder:
+  mlp_keys: 'states'
+  cnn_keys: 'image'
+decoder:
+  mlp_keys: 'states'
+  cnn_keys: 'image'

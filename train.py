@@ -36,7 +36,8 @@ def main(config):
     # save config
     logger.log_hydra_config(config)
 
-    replay_buffer = Buffer(config.buffer)
+    mirror_augment = getattr(config.env, "mirror_augment", False)
+    replay_buffer = Buffer(config.buffer, mirror_augment=mirror_augment)
 
     print("Create envs.")
     train_envs, eval_envs, obs_space, act_space = make_envs(config.env)

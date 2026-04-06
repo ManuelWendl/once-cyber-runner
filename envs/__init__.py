@@ -60,6 +60,10 @@ def make_env(config, id):
             config.camera,
             config.seed + id,
         )
+    elif suite == "cyberrunner":
+        import envs.cyberrunner as cyberrunner
+
+        env = cyberrunner.CyberRunner(task, config.action_repeat, config.size, config.seed + id)
     else:
         raise NotImplementedError(suite)
     env = wrappers.TimeLimit(env, config.time_limit // config.action_repeat)

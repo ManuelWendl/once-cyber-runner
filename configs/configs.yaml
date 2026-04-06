@@ -17,6 +17,11 @@ hydra:
 batch_size: 16
 batch_length: 64
 
+# Eval script args (used by eval.py)
+checkpoint: ???
+video_path: eval.mp4
+num_episodes: 3
+
 buffer:
   batch_size: ${batch_size}
   batch_length: ${batch_length}
