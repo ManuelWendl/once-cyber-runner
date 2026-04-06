@@ -5,7 +5,7 @@ ruamel.yaml==0.17.4
 moviepy==1.0.3
 einops==0.3.0
 protobuf==3.20.0
-mujoco==3.6.0
+mujoco==3.3.0
 dm_control==1.0.28
 metaworld==3.0.0
 memory_maze==1.0.3
