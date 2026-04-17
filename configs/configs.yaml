@@ -21,7 +21,7 @@ hydra:
   run:
     dir: ${logdir}
 
-batch_size: 16
+batch_size: 8
 batch_length: 64
 
 # Eval script args (used by eval.py)

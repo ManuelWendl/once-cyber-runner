@@ -1,7 +1,7 @@
 task: 'cyberrunner_vision'
 mirror_augment: false
 steps: 5.01e5
-env_num: 4
+env_num: 8
 eval_every: 1e5
 eval_episode_num: 10
 action_repeat: 1
