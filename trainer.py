@@ -92,6 +92,13 @@ class OnlineTrainer:
                     )
                 ),
             )
+        if agent.optimistic and cache is not None and "image" in cache:
+            from visualizations.sigma_viz import sigma_bar_frames
+            _sigma, _ = agent.compute_sigma(cache[:1].to(agent.device))
+            frames = tools.to_np(cache["image"][0])   # (T, H, W, C)
+            sig_np = tools.to_np(_sigma[0])           # (T-1,)
+            barred = sigma_bar_frames(frames, sig_np)  # (T, H+6, W, C)
+            self.logger.video("optimistic/eval_sigma_bar", barred[None])
         self.logger.write(train_step)
         agent.train()
 
