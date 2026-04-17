@@ -1,5 +1,5 @@
 task: 'cyberrunner_vision'
-mirror_augment: true
+mirror_augment: false
 steps: 5.01e5
 env_num: 16
 eval_every: 1e5
