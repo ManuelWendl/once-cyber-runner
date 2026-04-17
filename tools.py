@@ -176,8 +176,8 @@ class Logger:
             wb_log = {"trainer/step": step}
             wb_log.update({k: v for k, v in scalars})
             for name, value in self._images.items():
-                # value is (C, H, W); wandb.Image accepts HWC or CHW
-                wb_log[name] = wb.Image(value)
+                # wandb.Image requires (H, W, C); transpose from (C, H, W)
+                wb_log[name] = wb.Image(value.transpose(1, 2, 0))
             for name, value in self._videos.items():
                 name = name if isinstance(name, str) else name.decode("utf-8")
                 if np.issubdtype(value.dtype, np.floating):

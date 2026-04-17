@@ -1,5 +1,5 @@
 task: 'cyberrunner_state'
-mirror_augment: true
+mirror_augment: false
 steps: 1.01e6
 env_num: 16
 eval_every: 1e5
