@@ -81,8 +81,6 @@ class OnlineTrainer:
             if key == "log_success":
                 value = torch.clip(value, max=1.0)  # make sure 1.0 for success episode
             self.logger.scalar(f"episode/eval_{key[4:]}", value.mean())
-        if cache is not None and "image" in cache:
-            self.logger.video("eval_video", tools.to_np(cache["image"][:1]))
         if self.video_pred_log and cache is not None:
             initial = agent.get_initial_state(1)
             self.logger.video(
@@ -94,16 +92,6 @@ class OnlineTrainer:
                     )
                 ),
             )
-        if agent.optimistic and cache is not None and "states" in cache:
-            from visualizations.sigma_viz import sigma_heatmap, sigma_bar_frames
-            _sigma, _states = agent.compute_sigma(cache[:1].to(agent.device))
-            hm = sigma_heatmap(tools.to_np(_sigma), tools.to_np(_states))
-            self.logger.image("optimistic/sigma_map_eval", hm)
-            if "image" in cache:
-                frames = tools.to_np(cache["image"][0])   # (T, H, W, C)
-                sig_np = tools.to_np(_sigma[0])           # (T-1,)
-                barred = sigma_bar_frames(frames, sig_np)  # (T, H+6, W, C)
-                self.logger.video("optimistic/eval_sigma_bar", barred[None])
         self.logger.write(train_step)
         agent.train()
 
@@ -137,9 +125,7 @@ class OnlineTrainer:
             if done.any():
                 for i, d in enumerate(done):
                     if d and lengths[i] > 0:
-                        if i == 0 and len(video_cache) > 0:
-                            video = torch.stack(video_cache, axis=0)
-                            self.logger.video("train_video", tools.to_np(video[None]))
+                        if i == 0:
                             video_cache = []
                         self.logger.scalar("episode/score", returns[i])
                         self.logger.scalar("episode/length", lengths[i])
@@ -199,12 +185,4 @@ class OnlineTrainer:
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
-                    if agent.optimistic:
-                        from visualizations.sigma_viz import sigma_heatmap
-                        _data, _, _initial = self.replay_buffer.sample()
-                        _sigma, _states = agent.compute_sigma(
-                            _data.to(agent.device, non_blocking=True))
-                        if _states is not None:
-                            hm = sigma_heatmap(tools.to_np(_sigma), tools.to_np(_states))
-                            self.logger.image("optimistic/sigma_map", hm)
                     self.logger.write(step, fps=True)

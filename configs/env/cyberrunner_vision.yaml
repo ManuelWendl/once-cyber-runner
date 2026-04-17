@@ -9,7 +9,7 @@ train_ratio: 512
 time_limit: 2000
 
 reward_every_n_waypoints: 3
-hole_penalty: 1.0
+hole_penalty: 0.0
 
 seed: ${seed}
 device: ${device}
