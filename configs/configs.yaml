@@ -10,6 +10,13 @@ seed: 0
 deterministic_run: False
 device: 'cuda:0'
 
+wandb:
+  enabled: True
+  project: r2dreamer
+  entity: pmlr-team06
+  group: null
+  name: null
+
 hydra:
   run:
     dir: ${logdir}

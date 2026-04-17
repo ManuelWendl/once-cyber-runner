@@ -126,6 +126,12 @@ class Logger:
         self._images = {}
         self._videos = {}
         self._histograms = {}
+        self._wandb = None  # set via init_wandb()
+
+    def init_wandb(self, project, entity=None, name=None, group=None, config=None):
+        import wandb
+        self._wandb = wandb
+        wandb.init(project=project, entity=entity, name=name, group=group, config=config)
 
     def scalar(self, name, value):
         self._scalars[name] = float(value)
@@ -164,6 +170,25 @@ class Logger:
             self._writer.add_histogram(name, value, step)
 
         self._writer.flush()
+
+        if self._wandb is not None:
+            wb = self._wandb
+            wb_log = {"trainer/step": step}
+            wb_log.update({k: v for k, v in scalars})
+            for name, value in self._images.items():
+                # value is (C, H, W); wandb.Image accepts HWC or CHW
+                wb_log[name] = wb.Image(value)
+            for name, value in self._videos.items():
+                name = name if isinstance(name, str) else name.decode("utf-8")
+                if np.issubdtype(value.dtype, np.floating):
+                    value = np.clip(255 * value, 0, 255).astype(np.uint8)
+                # value is (B, T, H, W, C); log each B as a separate video
+                for i, v in enumerate(value):
+                    key = name if value.shape[0] == 1 else f"{name}/{i}"
+                    # wandb.Video expects (T, C, H, W)
+                    wb_log[key] = wb.Video(v.transpose(0, 3, 1, 2), fps=16, format="mp4")
+            wb.log(wb_log, step=step)
+
         self._scalars = {}
         self._images = {}
         self._videos = {}

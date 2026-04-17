@@ -33,6 +33,15 @@ def main(config):
     print("Logdir", logdir)
 
     logger = tools.Logger(logdir)
+    if config.wandb.enabled:
+        from omegaconf import OmegaConf
+        logger.init_wandb(
+            project=config.wandb.project,
+            entity=config.wandb.entity or None,
+            name=config.wandb.name or None,
+            group=config.wandb.group or None,
+            config=OmegaConf.to_container(config, resolve=True),
+        )
     # save config
     logger.log_hydra_config(config)
 

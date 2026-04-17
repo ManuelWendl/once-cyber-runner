@@ -607,6 +607,24 @@ class Dreamer(nn.Module):
         return torch.stack(list(reversed(out))[:-1], 1)
 
     @torch.no_grad()
+    def compute_sigma(self, data):
+        """Return per-step sigma (B, T-1) and states (B, T, *) from a replay batch."""
+        p_data = self.preprocess(data)
+        B, T = p_data.shape
+        embed = self._frozen_encoder(p_data)
+        initial = self.rssm.initial(B)
+        post_stoch, post_deter, _ = self._frozen_rssm.observe(
+            embed, p_data["action"], initial, p_data["is_first"]
+        )
+        h_prev = post_deter[:, :-1]
+        z_prev = post_stoch[:, :-1]
+        a_next = p_data["action"][:, 1:]
+        preds = self.ensemble(h_prev, z_prev, a_next)
+        sigma = disagreement(preds)
+        states = p_data.get("states", None)
+        return sigma, states
+
+    @torch.no_grad()
     def preprocess(self, data):
         if "image" in data:
             data["image"] = to_f32(data["image"]) / 255.0
