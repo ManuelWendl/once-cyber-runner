@@ -63,7 +63,14 @@ def make_env(config, id):
     elif suite == "cyberrunner":
         import envs.cyberrunner as cyberrunner
 
-        env = cyberrunner.CyberRunner(task, config.action_repeat, config.size, config.seed + id)
+        env = cyberrunner.CyberRunner(
+            task,
+            config.action_repeat,
+            config.size,
+            config.seed + id,
+            reward_every_n_waypoints=config.reward_every_n_waypoints,
+            hole_penalty=config.hole_penalty,
+        )
     else:
         raise NotImplementedError(suite)
     env = wrappers.TimeLimit(env, config.time_limit // config.action_repeat)

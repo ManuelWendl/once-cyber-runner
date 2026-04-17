@@ -54,6 +54,7 @@ JOINT_ANGLE_NOISE = 0.25 * np.pi / 180  # 0.25 degrees
 PROGRESS_SCALE = 1.0
 GOAL_BONUS = 10.0
 GOAL_THRESHOLD = 0.004  # 4mm
+CHECKPOINT_REWARD = 1.0  # paid per reward-waypoint crossed under modulo-N sparsification
 
 
 # ============================================================================
@@ -846,6 +847,8 @@ class CyberRunnerEnv(gym.Env):
         episode_length: int = 2000,
         randomize_init_pos: bool = False,
         include_vision: bool = True,
+        reward_every_n_waypoints: int = 3,
+        hole_penalty: float = 5.0,
     ):
         super().__init__()
 
@@ -853,6 +856,8 @@ class CyberRunnerEnv(gym.Env):
         self.episode_length = episode_length
         self.randomize_init_pos = randomize_init_pos
         self.include_vision = include_vision
+        self.reward_every_n_waypoints = reward_every_n_waypoints
+        self.hole_penalty = hole_penalty
 
         # Load maze layout
         self.walls_h, self.walls_v, self.holes, self.waypoints = get_hard_layout()
@@ -909,6 +914,7 @@ class CyberRunnerEnv(gym.Env):
         self._closest_point = np.zeros(2, dtype=np.float32)
         self._obs_bias = None
         self._path_detected = False
+        self._max_checkpoint_reached = 0
 
     def reset(
         self, seed: int | None = None, options: dict[str, Any] | None = None
@@ -943,6 +949,7 @@ class CyberRunnerEnv(gym.Env):
 
         # Reset episode state
         self._step_count = 0
+        self._max_checkpoint_reached = 0
         ball_pos = self._get_ball_pos_board_frame()
         self._prev_progress, self._seg_idx, _, self._closest_point = compute_path_progress(
             ball_pos, self.waypoints, self.seg_lengths, self.cum_distances, self.walls_h, self.walls_v, self.holes
@@ -974,7 +981,7 @@ class CyberRunnerEnv(gym.Env):
         self._path_detected = curr_progress >= 0
 
         # Compute reward
-        reward = self._compute_reward(ball_pos, curr_progress)
+        reward = self._compute_reward(ball_pos, curr_progress, self._seg_idx)
 
         # Check termination
         terminated, truncated, info = self._check_termination(ball_pos)
@@ -1060,19 +1067,24 @@ class CyberRunnerEnv(gym.Env):
 
         return obs
 
-    def _compute_reward(self, ball_pos: np.ndarray, curr_progress: float) -> float:
-        """Compute reward based on path progress."""
-        # Progress reward (only if both valid)
-        if curr_progress >= 0 and self._prev_progress >= 0:
-            progress_reward = (curr_progress - self._prev_progress) * PROGRESS_SCALE
-        else:
-            progress_reward = 0.0
+    def _compute_reward(self, ball_pos: np.ndarray, curr_progress: float, seg_idx: int) -> float:
+        """Sparse modulo-N checkpoint reward + goal bonus + hole penalty."""
+        checkpoint_reward = 0.0
+        if curr_progress >= 0:
+            num_reached = seg_idx // self.reward_every_n_waypoints
+            if num_reached > self._max_checkpoint_reached:
+                checkpoint_reward = (
+                    (num_reached - self._max_checkpoint_reached) * CHECKPOINT_REWARD
+                )
+                self._max_checkpoint_reached = num_reached
 
-        # Goal bonus
         dist_to_goal = np.linalg.norm(ball_pos - self.goal_pos)
         goal_reward = GOAL_BONUS if dist_to_goal < GOAL_THRESHOLD else 0.0
 
-        return progress_reward + goal_reward
+        hole_distances = np.linalg.norm(self.holes - ball_pos, axis=1)
+        hole_reward = -self.hole_penalty if np.any(hole_distances < HOLE_RADIUS) else 0.0
+
+        return checkpoint_reward + goal_reward + hole_reward
 
     def _check_termination(self, ball_pos: np.ndarray) -> tuple[bool, bool, dict[str, Any]]:
         """Check termination conditions."""
@@ -1154,13 +1166,18 @@ class CyberRunnerEnv(gym.Env):
 class CyberRunner(gym.Env):
     """Wrapper around CyberRunnerEnv matching R2-Dreamer env interface."""
 
-    def __init__(self, name, action_repeat=1, size=(64, 64), seed=0):
+    def __init__(
+        self, name, action_repeat=1, size=(64, 64), seed=0,
+        reward_every_n_waypoints=5, hole_penalty=5.0,
+    ):
         include_vision = name == "vision"
         self._env = CyberRunnerEnv(
             render_mode="rgb_array",
             episode_length=1_000_000,
             randomize_init_pos=False,
             include_vision=include_vision,
+            reward_every_n_waypoints=reward_every_n_waypoints,
+            hole_penalty=hole_penalty,
         )
         self._action_repeat = action_repeat
         self._size = size
