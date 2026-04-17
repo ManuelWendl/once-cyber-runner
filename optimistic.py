@@ -6,7 +6,7 @@ class DisagreementEnsemble(nn.Module):
     """K parallel MLPs predicting the next-step encoder embedding from (h, z, a)."""
 
     def __init__(self, input_dim: int, out_dim: int, K: int = 5,
-                 layers: int = 2, units: int = 512, act: str = "SiLU"):
+                 layers: int = 2, units: int = 128, act: str = "SiLU"):
         super().__init__()
         self.K = K
         self.out_dim = out_dim
