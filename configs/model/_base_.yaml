@@ -8,6 +8,14 @@ log_grads: False
 device: ${device}
 rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
 
+optimistic: False
+optimistic_lambda: 0.1
+opt_ensemble:
+  K: 5
+  layers: 2
+  units: 512
+  act: 'SiLU'
+
 lr: 4e-5
 agc: 0.3
 pmin: 1e-3
@@ -32,6 +40,7 @@ loss_scales:
   swav: 1.0
   temp: 1.0
   norm: 1.0
+  ensemble: 1.0
 
 r2dreamer:
   lambd: 5e-4

@@ -14,6 +14,7 @@ import rssm
 import tools
 from networks import Projector
 from optim import LaProp, clip_grad_agc_
+from optimistic import DisagreementEnsemble, disagreement
 from tools import to_f32
 
 
@@ -66,6 +67,9 @@ class Dreamer(nn.Module):
         self._loss_scales = dict(config.loss_scales)
         self._log_grads = bool(config.log_grads)
 
+        self.optimistic = bool(config.optimistic)
+        self.optimistic_lambda = float(config.optimistic_lambda)
+
         modules = {
             "rssm": self.rssm,
             "actor": self.actor,
@@ -74,6 +78,18 @@ class Dreamer(nn.Module):
             "cont": self.cont,
             "encoder": self.encoder,
         }
+
+        if self.optimistic:
+            ens_input_dim = self.rssm._deter + self.rssm.flat_stoch + self.act_dim
+            self.ensemble = DisagreementEnsemble(
+                input_dim=ens_input_dim,
+                out_dim=self.embed_size,
+                **dict(config.opt_ensemble),
+            )
+            modules.update({"ensemble": self.ensemble})
+        else:
+            # loss_scales always contains "ensemble"; drop if unused so totals match
+            self._loss_scales.pop("ensemble", None)
 
         if self.rep_loss == "dreamer":
             self.decoder = networks.MultiDecoder(
@@ -372,6 +388,16 @@ class Dreamer(nn.Module):
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
         losses["dyn"] = torch.mean(dyn_loss)
         losses["rep"] = torch.mean(rep_loss)
+
+        if self.optimistic:
+            # Plan2Explore: predict next-step encoder embedding from (h_t, z_t, a_{t+1}).
+            # Target is stop-gradiented so grads don't flow into the encoder via this path.
+            h_prev = post_deter[:, :-1]
+            z_prev = post_stoch[:, :-1]
+            a_next = data["action"][:, 1:]
+            embed_next = embed[:, 1:].detach()
+            preds = self.ensemble(h_prev, z_prev, a_next)
+            losses["ensemble"] = ((preds - embed_next.unsqueeze(-2)) ** 2).mean()
         # === Representation / auxiliary losses ===
         # (B, T, F)
         feat = self.rssm.get_feat(post_stoch, post_deter)
@@ -446,6 +472,21 @@ class Dreamer(nn.Module):
 
         # (B*T, T_imag, 1)
         imag_reward = self._frozen_reward(imag_feat).mode()
+        if self.optimistic:
+            # imag_feat layout from rssm.get_feat is [stoch_flat, deter]
+            S = self.rssm.flat_stoch
+            imag_stoch_flat = imag_feat[..., :S]
+            imag_deter = imag_feat[..., S:]
+            imag_stoch = imag_stoch_flat.reshape(
+                *imag_stoch_flat.shape[:-1], self.rssm._stoch, self.rssm._discrete
+            )
+            with torch.no_grad():
+                preds_pi = self.ensemble(imag_deter, imag_stoch, imag_action)
+                sigma_pi = disagreement(preds_pi).unsqueeze(-1)
+                bonus = self.optimistic_lambda * sigma_pi
+            imag_reward = imag_reward + bonus
+            metrics["optimistic/sigma_pi"] = sigma_pi.mean()
+            metrics["optimistic/bonus_frac"] = bonus.abs().sum() / (imag_reward.abs().sum() + 1e-8)
         # (B*T, T_imag, 1)  probability of continuation
         imag_cont = self._frozen_cont(imag_feat).mean
         # (B*T, T_imag, 1)
