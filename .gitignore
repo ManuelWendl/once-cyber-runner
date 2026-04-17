@@ -130,3 +130,7 @@ dmypy.json
 # IDE
 .vscode
 .clinerules
+
+bash.exe.stackdump
+
+.claude
