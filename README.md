@@ -13,17 +13,6 @@ If you prefer Docker, follow [`docs/docker.md`](docs/docker.md).
 pip install -r requirements.txt
 ```
 
-Run training on default settings:
-
-```bash
-python3 train.py logdir=./logdir/test
-```
-
-Monitoring results:
-```bash
-tensorboard --logdir ./logdir
-```
-
 Switching algorithms:
 
 ```bash
@@ -35,28 +24,9 @@ python3 train.py model.rep_loss=r2dreamer
 For easier code reading, inline tensor shape annotations are provided. See [`docs/tensor_shapes.md`](docs/tensor_shapes.md).
 
 
-## Available Benchmarks
-At the moment, the following benchmarks are available in this repository.
-
-| Environment        | Observation | Action | Budget | Description |
-|-------------------|---|---|---|-----------------------|
-| [Meta-World](https://github.com/Farama-Foundation/Metaworld) | Image | Continuous | 1M | Robotic manipulation with complex contact interactions.|
-| [DMC Proprio](https://github.com/deepmind/dm_control) | State | Continuous | 500K | DeepMind Control Suite with low-dimensional inputs. |
-| [DMC Vision](https://github.com/deepmind/dm_control) | Image | Continuous |1M| DeepMind Control Suite with high-dimensional images inputs. |
-| [DMC Subtle](envs/dmc_subtle.py) | Image | Continuous |1M| DeepMind Control Suite with tiny task-relevant objects. |
-| [Atari 100k](https://github.com/Farama-Foundation/Arcade-Learning-Environment) | Image | Discrete |400K| 26 Atari games. |
-| [Crafter](https://github.com/danijar/crafter) | Image | Discrete |1M| Survival environment to evaluates diverse agent abilities.|
-| [Memory Maze](https://github.com/jurgisp/memory-maze) | Image |Discrete |100M| 3D mazes to evaluate RL agents' long-term memory.|
-
-Use Hydra to select a benchmark and a specific task using `env` and `env.task`, respectively.
-
-```bash
-python3 train.py ... env=dmc_vision env.task=dmc_walker_walk
-```
-
 ## Headless rendering
 
-If you run MuJoCo-based environments (DMC / MetaWorld) on headless machines, you may need to set `MUJOCO_GL` for offscreen rendering. **Using EGL is recommended** as it accelerates rendering, leading to faster simulation throughput.
+If you run MuJoCo-based environments on headless machines, you may need to set `MUJOCO_GL` for offscreen rendering. **Using EGL is recommended** as it accelerates rendering, leading to faster simulation throughput.
 
 ```bash
 # For example, when using EGL (GPU)
@@ -67,32 +37,56 @@ export MUJOCO_EGL_DEVICE_ID=0
 
 More details: [Working with MuJoCo-based environments](https://docs.pytorch.org/rl/stable/reference/generated/knowledge_base/MUJOCO_INSTALLATION.html)
 
-## Code formatting
 
-If you want automatic formatting/basic checks before commits, you can enable `pre-commit`:
+## Uncertainty-driven exploration on R2-Dreamer
+
+This branch adds uncertainty-driven exploration machinery onto **R2-Dreamer**. The implementation is based on how Vass did this in his branch `world-model-vass` for DreamerV3. It also parametrizes the CyberRunner reward so waypoint density, hole penalty, and the exploration bonus are all config knobs.
+
+### Optimistic R2-Dreamer
+
+Plan2Explore-style intrinsic reward added on top of R2-Dreamer.
+
+- [`optimistic.py`](optimistic.py)
+  - `DisagreementEnsemble`: `K` parallel MLPs that predict the next encoder embedding from `(h_t, z_t, a_{t+1})`.
+  - `disagreement(preds)`: L2 norm of per-dimension variance across ensemble members — a scalar `σ`.
+- [`dreamer.py`](dreamer.py) integration (guarded by `model.optimistic`):
+  - Ensemble is built alongside the RSSM; optimizer and module dict pick it up automatically.
+  - Training loss `losses["ensemble"]`: MSE between ensemble prediction and the *stop-gradiented* next encoder embedding, so no gradients flow back through the encoder via this path.
+  - Imagination-time reward is augmented: `imag_reward += optimistic_lambda * σ_π`, with `σ_π` computed under `no_grad` so the policy treats the bonus as an exogenous reward.
+  - `compute_sigma(data)`: offline hook used by the visualizer to map σ onto replay rollouts.
+
+Relevant config (`configs/model/_base_.yaml`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `model.optimistic` | `False` | Turn exploration bonus on/off |
+| `model.optimistic_lambda` | `1.0` | Bonus weight added to imagined reward |
+| `model.opt_ensemble.K` | `5` | Number of MLP members |
+| `model.opt_ensemble.{layers,units,act}` | `2, 256, SiLU` | Member MLP shape |
+| `model.loss_scales.ensemble` | `1.0` | Scale for the ensemble training loss |
+
+### Parametrized CyberRunner reward
+
+[`envs/cyberrunner.py`](envs/cyberrunner.py)'s `_compute_reward` replaces the original dense progress reward with a parametrized version:
+
+- **Sparse checkpoint reward** — `CHECKPOINT_REWARD = 1.0` is paid once per `reward_every_n_waypoints` waypoints crossed, tracked via `_max_checkpoint_reached` so it's never double-paid.
+- **Goal bonus** — unchanged: `GOAL_BONUS` when the ball is within `GOAL_THRESHOLD` of the goal.
+- **Hole penalty** — `-hole_penalty` whenever the ball overlaps any hole (`‖ball − hole‖ < HOLE_RADIUS`).
+
+The two knobs are plumbed end-to-end (`envs/__init__.py` → `CyberRunner.__init__` → `CyberRunnerEnv.__init__`) and surfaced in the env configs:
+
+```yaml
+# configs/env/cyberrunner_state.yaml (and cyberrunner_vision.yaml)
+reward_every_n_waypoints: 3
+hole_penalty: 5.0
+```
+
+### Running
+
+SLURM (see [`train_r2dreamer.sbatch`](train_r2dreamer.sbatch)):
 
 ```bash
-pip install pre-commit
-# This sets up a pre-commit hook so that checks are run every time you commit
-pre-commit install
-# Manual pre-commit run on all files
-pre-commit run --all-files
+ENV_CONFIG=cyberrunner_vision MODEL_SIZE=size50M REP_LOSS=r2dreamer \
+MIRROR_AUGMENT=false SEED=0 EXTRA_ARGS="model.optimistic=True" \
+sbatch train_r2dreamer.sbatch
 ```
-
-## Citation
-
-If you find this code useful, please consider citing:
-
-```bibtex
-@inproceedings{
-morihira2026rdreamer,
-title={R2-Dreamer: Redundancy-Reduced World Models without Decoders or Augmentation},
-author={Naoki Morihira and Amal Nahar and Kartik Bharadwaj and Yasuhiro Kato and Akinobu Hayashi and Tatsuya Harada},
-booktitle={The Fourteenth International Conference on Learning Representations},
-year={2026},
-url={https://openreview.net/forum?id=Je2QqXrcQq}
-}
-```
-
-[r2dreamer]: https://openreview.net/forum?id=Je2QqXrcQq&referrer=%5BAuthor%20Console%5D(%2Fgroup%3Fid%3DICLR.cc%2F2026%2FConference%2FAuthors%23your-submissions)
-[dreamerv3-torch]: https://github.com/NM512/dreamerv3-torch
