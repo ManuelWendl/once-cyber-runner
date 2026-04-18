@@ -48,7 +48,7 @@ def sigma_heatmap(sigma, states, bins=32, upscale=8):
     bb = np.where(has, bb, grey)
 
     mp = np.stack([rr, gg, bb], axis=-1)                             # (bins, bins, 3)
-    mp = np.flipud(mp.transpose(1, 0, 2))                            # x→right, y→up
+    mp = np.flipud(mp)                                               # x→right, y→up
     mp = np.repeat(np.repeat(mp, upscale, axis=0), upscale, axis=1) # (H, W, 3)
     return mp.transpose(2, 0, 1)                                     # (3, H, W)
 
