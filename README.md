@@ -40,6 +40,16 @@ More details: [Working with MuJoCo-based environments](https://docs.pytorch.org/
 
 ## Uncertainty-driven exploration on R2-Dreamer
 
+<p align="center">
+  <img src="visualizations/unc_heatmaps/sm_1071.png" width="15%" alt="sigma @ 1.1k steps" />
+  <img src="visualizations/unc_heatmaps/sm_7779.png" width="15%" alt="sigma @ 7.8k steps" />
+  <img src="visualizations/unc_heatmaps/sm_18k.png"  width="15%" alt="sigma @ 18k steps"  />
+  <img src="visualizations/unc_heatmaps/sm_30k.png"  width="15%" alt="sigma @ 30k steps"  />
+  <img src="visualizations/unc_heatmaps/sm_44k.png"  width="15%" alt="sigma @ 44k steps"  />
+  <img src="visualizations/unc_heatmaps/sm_53k.png"  width="15%" alt="sigma @ 53k steps"  />
+</p>
+<p align="center"><em>Ensemble disagreement &sigma; over the maze across training steps (left &rarr; right: 1.1k, 7.8k, 18k, 30k, 44k, 53k).</em></p>
+
 This branch adds uncertainty-driven exploration machinery onto **R2-Dreamer**. The implementation is based on how Vass did this in his branch `world-model-vass` for DreamerV3. It also parametrizes the CyberRunner reward so waypoint density, hole penalty, and the exploration bonus are all config knobs.
 
 ### Optimistic R2-Dreamer
