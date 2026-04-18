@@ -9,11 +9,11 @@
 set -e
 
 # ==== Configurable settings ====
-#   - Data augmentation = env.mirror_augment, default True for cyberrunner_vision.
+#   - Data augmentation = env.mirror_augment, default False (matches env yaml).
 ENV_CONFIG=${ENV_CONFIG:-cyberrunner_vision}    # cyberrunner_vision | cyberrunner_state
 MODEL_SIZE=${MODEL_SIZE:-size50M}               # size12M | size25M | size50M | size100M | ...
 REP_LOSS=${REP_LOSS:-r2dreamer}                 # r2dreamer | dreamer | infonce | dreamerpro
-MIRROR_AUGMENT=${MIRROR_AUGMENT:-true}          # Replay-buffer mirror augmentation (CyberRunner-specific)
+MIRROR_AUGMENT=${MIRROR_AUGMENT:-false}         # Replay-buffer mirror augmentation (CyberRunner-specific)
 SEED=${SEED:-0}
 EXTRA_ARGS=${EXTRA_ARGS:-}                      # Additional Hydra overrides
 
