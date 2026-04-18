@@ -13,7 +13,7 @@ optimistic_lambda: 1.0
 opt_ensemble:
   K: 5
   layers: 2
-  units: 128
+  units: 256
   act: 'SiLU'
 
 lr: 4e-5
