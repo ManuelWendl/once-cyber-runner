@@ -192,4 +192,12 @@ class OnlineTrainer:
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
+                    if agent.optimistic:
+                        from visualizations.sigma_viz import sigma_heatmap
+                        _data, _, _initial = self.replay_buffer.sample()
+                        _sigma, _states = agent.compute_sigma(
+                            _data.to(agent.device, non_blocking=True))
+                        if _states is not None:
+                            hm = sigma_heatmap(tools.to_np(_sigma), tools.to_np(_states))
+                            self.logger.image("optimistic/sigma_map", hm)
                     self.logger.write(step, fps=True)
