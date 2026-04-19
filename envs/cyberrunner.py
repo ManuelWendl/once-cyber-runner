@@ -271,6 +271,41 @@ def compute_waypoint_distances(waypoints: np.ndarray) -> tuple[np.ndarray, np.nd
     return seg_lengths.astype(np.float32), cum_distances.astype(np.float32)
 
 
+def select_safe_checkpoints(
+    waypoints: np.ndarray,
+    holes: np.ndarray,
+    reward_every_n_waypoints: int,
+) -> list[int]:
+    """Pick ordered checkpoint indices using hole-clearance rather than uniform spacing.
+
+    We split the path into coarse progress bins determined by reward_every_n_waypoints
+    and, inside each bin, select the waypoint with the largest distance to the nearest hole.
+    This keeps checkpoints ordered along the path while preferring naturally safer resting spots.
+    """
+    target_count = len(range(reward_every_n_waypoints, len(waypoints) - 1, reward_every_n_waypoints))
+    if target_count <= 0:
+        return []
+
+    hole_clearance = np.linalg.norm(waypoints[:, None, :] - holes[None, :, :], axis=-1).min(axis=1)
+    candidate_indices = np.arange(1, len(waypoints) - 1)
+    if candidate_indices.size == 0:
+        return []
+
+    bins = np.array_split(candidate_indices, target_count)
+    selected = []
+    for bin_indices in bins:
+        if bin_indices.size == 0:
+            continue
+        valid = bin_indices if not selected else bin_indices[bin_indices > selected[-1]]
+        if valid.size == 0:
+            continue
+        scores = hole_clearance[valid]
+        best_idx = int(valid[np.argmax(scores)])
+        selected.append(best_idx)
+
+    return selected
+
+
 # ============================================================================
 # RAYCASTING (simplified - path progress only)
 # ============================================================================
@@ -905,7 +940,11 @@ class CyberRunnerEnv(gym.Env):
 
         # Load maze layout
         self.walls_h, self.walls_v, self.holes, self.waypoints = get_hard_layout()
-        self.checkpoint_indices = list(range(self.reward_every_n_waypoints, len(self.waypoints) - 1, self.reward_every_n_waypoints))
+        self.checkpoint_indices = select_safe_checkpoints(
+            self.waypoints,
+            self.holes,
+            self.reward_every_n_waypoints,
+        )
         self.checkpoint_points = self.waypoints[self.checkpoint_indices] if self.checkpoint_indices else np.zeros((0, 2), dtype=np.float32)
 
         # Precompute path data
