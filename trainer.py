@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 import tools
 
@@ -14,6 +15,7 @@ class OnlineTrainer:
         self.eval_every = int(config.eval_every)
         self.eval_episode_num = int(config.eval_episode_num)
         self.video_pred_log = bool(config.video_pred_log)
+        self.video_render_log = bool(getattr(config, "video_render_log", False))
         self.params_hist_log = bool(config.params_hist_log)
         self.batch_length = int(config.batch_length)
         batch_steps = int(config.batch_size * config.batch_length)
@@ -23,6 +25,53 @@ class OnlineTrainer:
         self._should_log = tools.Every(config.update_log_every)
         self._should_eval = tools.Every(self.eval_every)
         self._action_repeat = config.action_repeat
+        self._episode_log_modes = {
+            "log_path_progress": "final",
+            "log_checkpoint_dist": "final",
+            "log_ball_speed": "mean",
+            "log_ball_speed_true": "mean",
+            "log_min_hole_distance": "min",
+            "log_safe_hole_margin": "min",
+            "log_active_checkpoint_idx": "max",
+            "log_unlocked_checkpoint_idx": "max",
+            "log_stable_steps": "max",
+            "log_success": "max",
+        }
+
+    def _init_episode_metric(self, key, template):
+        mode = self._episode_log_modes.get(key, "sum")
+        if mode == "sum":
+            return torch.zeros_like(template)
+        if mode == "mean":
+            return torch.zeros_like(template)
+        if mode == "max":
+            return torch.full_like(template, -torch.inf)
+        if mode == "min":
+            return torch.full_like(template, torch.inf)
+        if mode == "final":
+            return torch.zeros_like(template)
+        raise ValueError(f"Unknown episode log mode for {key}: {mode}")
+
+    def _update_episode_metric(self, key, storage, value, mask=None):
+        mode = self._episode_log_modes.get(key, "sum")
+        if mask is None:
+            mask = torch.ones_like(value, dtype=torch.bool)
+        if mode in ("sum", "mean"):
+            storage += value * mask
+        elif mode == "max":
+            storage[mask] = torch.maximum(storage[mask], value[mask])
+        elif mode == "min":
+            storage[mask] = torch.minimum(storage[mask], value[mask])
+        elif mode == "final":
+            storage[mask] = value[mask]
+        else:
+            raise ValueError(f"Unknown episode log mode for {key}: {mode}")
+
+    def _finalize_episode_metric(self, key, value, length):
+        mode = self._episode_log_modes.get(key, "sum")
+        if mode == "mean":
+            return value / torch.clamp(length.to(value.dtype), min=1.0)
+        return value
 
     def eval(self, agent, train_step):
         """Run evaluation episodes.
@@ -42,6 +91,7 @@ class OnlineTrainer:
         log_metrics = {}
         # cache is only used for video logging / open-loop prediction.
         cache = []
+        render_frames = []
         agent_state = agent.get_initial_state(envs.env_num)
         # (B, A)
         act = agent_state["prev_action"].clone()
@@ -59,6 +109,11 @@ class OnlineTrainer:
             # (B,)
             done = done_cpu.to(agent.device)
 
+            if self.video_render_log and not once_done[0]:
+                frame = envs.envs[0].render()()
+                if frame is not None:
+                    render_frames.append(frame)
+
             # Store transition.
             # We keep the observation and the action that produced it together.
             trans["action"] = act
@@ -70,14 +125,15 @@ class OnlineTrainer:
             for key, value in trans.items():
                 if key.startswith("log_"):
                     if key not in log_metrics:
-                        log_metrics[key] = torch.zeros_like(returns)
-                    log_metrics[key] += value[:, 0] * ~once_done
+                        log_metrics[key] = self._init_episode_metric(key, returns)
+                    self._update_episode_metric(key, log_metrics[key], value[:, 0], ~once_done)
             once_done |= done
         # dict of (B, T, *)
         cache = torch.stack(cache, dim=1) if len(cache) else None
         self.logger.scalar("episode/eval_score", returns.mean())
         self.logger.scalar("episode/eval_length", steps.to(torch.float32).mean())
         for key, value in log_metrics.items():
+            value = self._finalize_episode_metric(key, value, steps)
             if key == "log_success":
                 value = torch.clip(value, max=1.0)  # make sure 1.0 for success episode
             self.logger.scalar(f"episode/eval_{key[4:]}", value.mean())
@@ -99,6 +155,8 @@ class OnlineTrainer:
             sig_np = tools.to_np(_sigma[0])           # (T-1,)
             barred = sigma_bar_frames(frames, sig_np)  # (T, H+6, W, C)
             self.logger.video("optimistic/eval_sigma_bar", barred[None])
+        if self.video_render_log and render_frames:
+            self.logger.video("eval_rollout", np.stack(render_frames)[None])
         self.logger.write(train_step)
         agent.train()
 
@@ -138,8 +196,9 @@ class OnlineTrainer:
                         self.logger.scalar("episode/score", returns[i])
                         self.logger.scalar("episode/length", lengths[i])
                         for key, value in log_metrics.items():
-                            self.logger.scalar(f"episode/{key[4:]}", value[i])
-                            value[i] = 0
+                            logged = self._finalize_episode_metric(key, value[i], lengths[i])
+                            self.logger.scalar(f"episode/{key[4:]}", logged)
+                            value[i] = self._init_episode_metric(key, value[i : i + 1])[0]
                         self.logger.write(step + i)  # to show all values on tensorboard
                         returns[i] = lengths[i] = 0
             step += int((~done).sum()) * self._action_repeat  # step is based on env side
@@ -177,8 +236,8 @@ class OnlineTrainer:
             for key, value in trans.items():
                 if key.startswith("log_"):
                     if key not in log_metrics:
-                        log_metrics[key] = torch.zeros_like(returns)
-                    log_metrics[key] += value[:, 0]
+                        log_metrics[key] = self._init_episode_metric(key, returns)
+                    self._update_episode_metric(key, log_metrics[key], value[:, 0])
             # Update models after enough data has accumulated
             if step // (envs.env_num * self._action_repeat) > self.batch_length + 1:
                 if self._should_pretrain():

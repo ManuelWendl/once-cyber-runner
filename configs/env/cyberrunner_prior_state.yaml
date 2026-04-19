@@ -1,0 +1,35 @@
+task: 'cyberrunner_state'
+mirror_augment: false
+steps: 5.01e5
+env_num: 16
+eval_every: 5e4
+eval_episode_num: 10
+action_repeat: 1
+train_ratio: 512
+time_limit: 500
+
+reward_every_n_waypoints: 3
+hole_penalty: 1.0
+checkpoint_radius: 0.010
+checkpoint_hold_steps: 6
+checkpoint_speed_threshold: 0.05
+checkpoint_arrival_reward: 0.2
+checkpoint_stabilize_reward: 1.0
+checkpoint_hold_reward: 0.02
+safe_hole_margin: 0.004
+checkpoint_speed_ema_alpha: 0.8
+prior_mode: true
+prior_start_waypoint_window: 3
+checkpoint_progress_reward_scale: 20.0
+terminate_on_checkpoint_stabilized: true
+
+seed: ${seed}
+device: ${device}
+
+size: [64, 64]
+encoder:
+  mlp_keys: '(states|checkpoint)'
+  cnn_keys: '$^'
+decoder:
+  mlp_keys: '(states|checkpoint)'
+  cnn_keys: '$^'
