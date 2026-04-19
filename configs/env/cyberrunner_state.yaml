@@ -1,0 +1,23 @@
+task: 'cyberrunner_state'
+mirror_augment: false
+steps: 1.01e6
+env_num: 16
+eval_every: 1e5
+eval_episode_num: 10
+action_repeat: 1
+train_ratio: 512
+time_limit: 2000
+
+reward_every_n_waypoints: 3
+hole_penalty: 5.0
+
+seed: ${seed}
+device: ${device}
+
+size: [64, 64]
+encoder:
+  mlp_keys: 'states'
+  cnn_keys: '$^'
+decoder:
+  mlp_keys: 'states'
+  cnn_keys: '$^'
