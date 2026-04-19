@@ -17,6 +17,7 @@ checkpoint_arrival_reward: 0.2
 checkpoint_stabilize_reward: 1.0
 checkpoint_hold_reward: 0.02
 safe_hole_margin: 0.004
+checkpoint_speed_ema_alpha: 0.8
 
 seed: ${seed}
 device: ${device}

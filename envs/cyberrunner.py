@@ -884,6 +884,7 @@ class CyberRunnerEnv(gym.Env):
         checkpoint_stabilize_reward: float = 1.0,
         checkpoint_hold_reward: float = 0.02,
         safe_hole_margin: float = 0.004,
+        checkpoint_speed_ema_alpha: float = 0.8,
     ):
         super().__init__()
 
@@ -900,6 +901,7 @@ class CyberRunnerEnv(gym.Env):
         self.checkpoint_stabilize_reward = checkpoint_stabilize_reward
         self.checkpoint_hold_reward = checkpoint_hold_reward
         self.safe_hole_margin = safe_hole_margin
+        self.checkpoint_speed_ema_alpha = checkpoint_speed_ema_alpha
 
         # Load maze layout
         self.walls_h, self.walls_v, self.holes, self.waypoints = get_hard_layout()
@@ -969,8 +971,10 @@ class CyberRunnerEnv(gym.Env):
         self._stable_steps = 0
         self._in_checkpoint_prev = False
         self._ball_speed = 0.0
+        self._ball_speed_true = 0.0
         self._min_hole_distance = np.inf
         self._prev_ball_pos = np.zeros(2, dtype=np.float32)
+        self._prev_ball_pos_noisy = np.zeros(2, dtype=np.float32)
 
     def reset(
         self, seed: int | None = None, options: dict[str, Any] | None = None
@@ -1011,7 +1015,11 @@ class CyberRunnerEnv(gym.Env):
         self._in_checkpoint_prev = False
         ball_pos = self._get_ball_pos_board_frame()
         self._prev_ball_pos = ball_pos.copy()
+        ball_noise = self.np_random.uniform(-BALL_POS_NOISE, BALL_POS_NOISE, size=2)
+        ball_pos_noisy = ball_pos + self._obs_bias["ball"] + ball_noise
+        self._prev_ball_pos_noisy = ball_pos_noisy.astype(np.float32)
         self._ball_speed = 0.0
+        self._ball_speed_true = 0.0
         self._min_hole_distance = self._compute_min_hole_distance(ball_pos)
         self._prev_progress, self._seg_idx, _, self._closest_point = compute_path_progress(
             ball_pos, self.waypoints, self.seg_lengths, self.cum_distances, self.walls_h, self.walls_v, self.holes
@@ -1036,8 +1044,14 @@ class CyberRunnerEnv(gym.Env):
         # Get ball state
         ball_pos = self._get_ball_pos_board_frame()
         dt = TIMESTEP * FRAME_SKIP
-        self._ball_speed = float(np.linalg.norm(ball_pos - self._prev_ball_pos) / max(dt, 1e-8))
+        self._ball_speed_true = float(np.linalg.norm(ball_pos - self._prev_ball_pos) / max(dt, 1e-8))
         self._prev_ball_pos = ball_pos.copy()
+        ball_noise = self.np_random.uniform(-BALL_POS_NOISE, BALL_POS_NOISE, size=2)
+        ball_pos_noisy = ball_pos + self._obs_bias["ball"] + ball_noise
+        obs_ball_speed = float(np.linalg.norm(ball_pos_noisy - self._prev_ball_pos_noisy) / max(dt, 1e-8))
+        self._prev_ball_pos_noisy = ball_pos_noisy.astype(np.float32)
+        alpha = self.checkpoint_speed_ema_alpha
+        self._ball_speed = float(alpha * self._ball_speed + (1.0 - alpha) * obs_ball_speed)
         self._min_hole_distance = self._compute_min_hole_distance(ball_pos)
 
         # Compute path progress and get segment info
@@ -1081,6 +1095,7 @@ class CyberRunnerEnv(gym.Env):
             "path_progress": float(curr_progress),
             "checkpoint_dist": checkpoint_dist,
             "ball_speed": float(self._ball_speed),
+            "ball_speed_true": float(self._ball_speed_true),
             "min_hole_distance": float(self._min_hole_distance),
             "safe_hole_margin": float(self._min_hole_distance - HOLE_RADIUS),
             "active_checkpoint_idx": int(self._active_checkpoint_idx),
@@ -1089,6 +1104,7 @@ class CyberRunnerEnv(gym.Env):
             "log_path_progress": np.array([curr_progress], dtype=np.float32),
             "log_checkpoint_dist": np.array([checkpoint_dist], dtype=np.float32),
             "log_ball_speed": np.array([self._ball_speed], dtype=np.float32),
+            "log_ball_speed_true": np.array([self._ball_speed_true], dtype=np.float32),
             "log_min_hole_distance": np.array([self._min_hole_distance], dtype=np.float32),
             "log_safe_hole_margin": np.array([self._min_hole_distance - HOLE_RADIUS], dtype=np.float32),
             "log_active_checkpoint_idx": np.array([self._active_checkpoint_idx], dtype=np.float32),
@@ -1298,6 +1314,7 @@ class CyberRunner(gym.Env):
         checkpoint_stabilize_reward=1.0,
         checkpoint_hold_reward=0.02,
         safe_hole_margin=0.004,
+        checkpoint_speed_ema_alpha=0.8,
     ):
         include_vision = name == "vision"
         self._env = CyberRunnerEnv(
@@ -1314,6 +1331,7 @@ class CyberRunner(gym.Env):
             checkpoint_stabilize_reward=checkpoint_stabilize_reward,
             checkpoint_hold_reward=checkpoint_hold_reward,
             safe_hole_margin=safe_hole_margin,
+            checkpoint_speed_ema_alpha=checkpoint_speed_ema_alpha,
         )
         self._action_repeat = action_repeat
         self._size = size
@@ -1327,6 +1345,7 @@ class CyberRunner(gym.Env):
             "log_path_progress": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             "log_checkpoint_dist": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             "log_ball_speed": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+            "log_ball_speed_true": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             "log_min_hole_distance": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             "log_safe_hole_margin": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             "log_active_checkpoint_idx": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
@@ -1360,6 +1379,7 @@ class CyberRunner(gym.Env):
             "log_path_progress": last_info["log_path_progress"],
             "log_checkpoint_dist": last_info["log_checkpoint_dist"],
             "log_ball_speed": last_info["log_ball_speed"],
+            "log_ball_speed_true": last_info["log_ball_speed_true"],
             "log_min_hole_distance": last_info["log_min_hole_distance"],
             "log_safe_hole_margin": last_info["log_safe_hole_margin"],
             "log_active_checkpoint_idx": last_info["log_active_checkpoint_idx"],
@@ -1380,6 +1400,7 @@ class CyberRunner(gym.Env):
             "log_path_progress": info["log_path_progress"],
             "log_checkpoint_dist": info["log_checkpoint_dist"],
             "log_ball_speed": info["log_ball_speed"],
+            "log_ball_speed_true": info["log_ball_speed_true"],
             "log_min_hole_distance": info["log_min_hole_distance"],
             "log_safe_hole_margin": info["log_safe_hole_margin"],
             "log_active_checkpoint_idx": info["log_active_checkpoint_idx"],

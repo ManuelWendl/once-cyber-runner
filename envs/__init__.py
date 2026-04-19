@@ -77,6 +77,7 @@ def make_env(config, id):
             checkpoint_stabilize_reward=config.checkpoint_stabilize_reward,
             checkpoint_hold_reward=config.checkpoint_hold_reward,
             safe_hole_margin=config.safe_hole_margin,
+            checkpoint_speed_ema_alpha=config.checkpoint_speed_ema_alpha,
         )
     else:
         raise NotImplementedError(suite)
