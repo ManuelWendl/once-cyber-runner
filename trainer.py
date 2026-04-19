@@ -120,6 +120,7 @@ class OnlineTrainer:
         episode_ids = torch.arange(
             envs.env_num, dtype=torch.int32, device=agent.device
         )  # Increment this to prevent sampling across episode boundaries
+        log_metrics = {}
         train_metrics = {}
         agent_state = agent.get_initial_state(envs.env_num)
         # (B, A)
@@ -136,6 +137,9 @@ class OnlineTrainer:
                             video_cache = []
                         self.logger.scalar("episode/score", returns[i])
                         self.logger.scalar("episode/length", lengths[i])
+                        for key, value in log_metrics.items():
+                            self.logger.scalar(f"episode/{key[4:]}", value[i])
+                            value[i] = 0
                         self.logger.write(step + i)  # to show all values on tensorboard
                         returns[i] = lengths[i] = 0
             step += int((~done).sum()) * self._action_repeat  # step is based on env side
@@ -170,6 +174,11 @@ class OnlineTrainer:
                 video_cache.append(trans["image"][0])
             self.replay_buffer.add_transition(trans.detach())
             returns += trans["reward"][:, 0]
+            for key, value in trans.items():
+                if key.startswith("log_"):
+                    if key not in log_metrics:
+                        log_metrics[key] = torch.zeros_like(returns)
+                    log_metrics[key] += value[:, 0]
             # Update models after enough data has accumulated
             if step // (envs.env_num * self._action_repeat) > self.batch_length + 1:
                 if self._should_pretrain():

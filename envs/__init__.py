@@ -70,6 +70,13 @@ def make_env(config, id):
             config.seed + id,
             reward_every_n_waypoints=config.reward_every_n_waypoints,
             hole_penalty=config.hole_penalty,
+            checkpoint_radius=config.checkpoint_radius,
+            checkpoint_hold_steps=config.checkpoint_hold_steps,
+            checkpoint_speed_threshold=config.checkpoint_speed_threshold,
+            checkpoint_arrival_reward=config.checkpoint_arrival_reward,
+            checkpoint_stabilize_reward=config.checkpoint_stabilize_reward,
+            checkpoint_hold_reward=config.checkpoint_hold_reward,
+            safe_hole_margin=config.safe_hole_margin,
         )
     else:
         raise NotImplementedError(suite)

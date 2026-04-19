@@ -10,6 +10,13 @@ time_limit: 2000
 
 reward_every_n_waypoints: 3
 hole_penalty: 5.0
+checkpoint_radius: 0.010
+checkpoint_hold_steps: 12
+checkpoint_speed_threshold: 0.015
+checkpoint_arrival_reward: 0.2
+checkpoint_stabilize_reward: 1.0
+checkpoint_hold_reward: 0.02
+safe_hole_margin: 0.004
 
 seed: ${seed}
 device: ${device}

@@ -498,8 +498,12 @@ def check_endpoint_connected(
     return False
 
 
-def _generate_board_texture(holes: np.ndarray, waypoints: np.ndarray):
-    """Generate a board texture image with holes and path baked in."""
+def _generate_board_texture(
+    holes: np.ndarray,
+    waypoints: np.ndarray,
+    checkpoint_points: np.ndarray | None = None,
+):
+    """Generate a board texture image with holes, path, and checkpoint markers."""
     # Board floor geom spans -0.007 to 0.283 in x, -0.007 to 0.238 in y
     # (centered at [0.138, 0.1155] with half-size [0.145, 0.1225])
     # Maze coordinates start at 0, so offset by 0.007 to place them correctly.
@@ -526,11 +530,35 @@ def _generate_board_texture(holes: np.ndarray, waypoints: np.ndarray):
         p2 = (int((waypoints[i + 1][0] + margin) * scale), int((waypoints[i + 1][1] + margin) * scale))
         draw.line([p1, p2], fill=(30, 30, 30), width=path_w)
 
+    # Draw checkpoint markers as green rings so they are visible in videos.
+    if checkpoint_points is not None and len(checkpoint_points):
+        outer_r = max(int(0.006 * scale), 1)
+        inner_r = max(int(0.0035 * scale), 1)
+        for checkpoint in checkpoint_points:
+            cx = int((checkpoint[0] + margin) * scale)
+            cy = int((checkpoint[1] + margin) * scale)
+            draw.ellipse(
+                [cx - outer_r, cy - outer_r, cx + outer_r, cy + outer_r],
+                fill=(60, 180, 75),
+                outline=(20, 90, 30),
+                width=max(int(0.0012 * scale), 1),
+            )
+            draw.ellipse(
+                [cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r],
+                fill=(204, 204, 204),
+            )
+
     # MuJoCo textures have origin at bottom-left
     return img.transpose(Image.FLIP_TOP_BOTTOM)
 
 
-def build_model(walls_h: np.ndarray, walls_v: np.ndarray, holes: np.ndarray, waypoints: np.ndarray) -> mujoco.MjModel:
+def build_model(
+    walls_h: np.ndarray,
+    walls_v: np.ndarray,
+    holes: np.ndarray,
+    waypoints: np.ndarray,
+    checkpoint_points: np.ndarray | None = None,
+) -> mujoco.MjModel:
     """Build the MuJoCo model using mjSpec."""
     spec = mujoco.MjSpec()
     spec.modelname = "cyberrunner"
@@ -538,7 +566,7 @@ def build_model(walls_h: np.ndarray, walls_v: np.ndarray, holes: np.ndarray, way
     spec.option.timestep = TIMESTEP
 
     # Board texture with holes and path baked in
-    board_img = _generate_board_texture(holes, waypoints)
+    board_img = _generate_board_texture(holes, waypoints, checkpoint_points)
 
     tex = spec.add_texture()
     tex.name = "board_tex"
@@ -849,6 +877,13 @@ class CyberRunnerEnv(gym.Env):
         include_vision: bool = True,
         reward_every_n_waypoints: int = 3,
         hole_penalty: float = 5.0,
+        checkpoint_radius: float = 0.010,
+        checkpoint_hold_steps: int = 12,
+        checkpoint_speed_threshold: float = 0.015,
+        checkpoint_arrival_reward: float = 0.2,
+        checkpoint_stabilize_reward: float = 1.0,
+        checkpoint_hold_reward: float = 0.02,
+        safe_hole_margin: float = 0.004,
     ):
         super().__init__()
 
@@ -858,16 +893,31 @@ class CyberRunnerEnv(gym.Env):
         self.include_vision = include_vision
         self.reward_every_n_waypoints = reward_every_n_waypoints
         self.hole_penalty = hole_penalty
+        self.checkpoint_radius = checkpoint_radius
+        self.checkpoint_hold_steps = checkpoint_hold_steps
+        self.checkpoint_speed_threshold = checkpoint_speed_threshold
+        self.checkpoint_arrival_reward = checkpoint_arrival_reward
+        self.checkpoint_stabilize_reward = checkpoint_stabilize_reward
+        self.checkpoint_hold_reward = checkpoint_hold_reward
+        self.safe_hole_margin = safe_hole_margin
 
         # Load maze layout
         self.walls_h, self.walls_v, self.holes, self.waypoints = get_hard_layout()
+        self.checkpoint_indices = list(range(self.reward_every_n_waypoints, len(self.waypoints) - 1, self.reward_every_n_waypoints))
+        self.checkpoint_points = self.waypoints[self.checkpoint_indices] if self.checkpoint_indices else np.zeros((0, 2), dtype=np.float32)
 
         # Precompute path data
         self.seg_lengths, self.cum_distances = compute_waypoint_distances(self.waypoints)
         self.goal_pos = self.waypoints[-1]
 
         # Build model
-        self.model = build_model(self.walls_h, self.walls_v, self.holes, self.waypoints)
+        self.model = build_model(
+            self.walls_h,
+            self.walls_v,
+            self.holes,
+            self.waypoints,
+            self.checkpoint_points,
+        )
         self.data = mujoco.MjData(self.model)
 
         # Get body IDs
@@ -915,6 +965,12 @@ class CyberRunnerEnv(gym.Env):
         self._obs_bias = None
         self._path_detected = False
         self._max_checkpoint_reached = 0
+        self._active_checkpoint_idx = 0
+        self._stable_steps = 0
+        self._in_checkpoint_prev = False
+        self._ball_speed = 0.0
+        self._min_hole_distance = np.inf
+        self._prev_ball_pos = np.zeros(2, dtype=np.float32)
 
     def reset(
         self, seed: int | None = None, options: dict[str, Any] | None = None
@@ -950,14 +1006,20 @@ class CyberRunnerEnv(gym.Env):
         # Reset episode state
         self._step_count = 0
         self._max_checkpoint_reached = 0
+        self._active_checkpoint_idx = 0
+        self._stable_steps = 0
+        self._in_checkpoint_prev = False
         ball_pos = self._get_ball_pos_board_frame()
+        self._prev_ball_pos = ball_pos.copy()
+        self._ball_speed = 0.0
+        self._min_hole_distance = self._compute_min_hole_distance(ball_pos)
         self._prev_progress, self._seg_idx, _, self._closest_point = compute_path_progress(
             ball_pos, self.waypoints, self.seg_lengths, self.cum_distances, self.walls_h, self.walls_v, self.holes
         )
         self._path_detected = self._prev_progress >= 0
 
         obs = self._get_obs()
-        info = {"path_progress": self._prev_progress}
+        info = self._build_info(ball_pos, self._prev_progress)
 
         return obs, info
 
@@ -973,6 +1035,10 @@ class CyberRunnerEnv(gym.Env):
 
         # Get ball state
         ball_pos = self._get_ball_pos_board_frame()
+        dt = TIMESTEP * FRAME_SKIP
+        self._ball_speed = float(np.linalg.norm(ball_pos - self._prev_ball_pos) / max(dt, 1e-8))
+        self._prev_ball_pos = ball_pos.copy()
+        self._min_hole_distance = self._compute_min_hole_distance(ball_pos)
 
         # Compute path progress and get segment info
         curr_progress, self._seg_idx, _, self._closest_point = compute_path_progress(
@@ -991,9 +1057,44 @@ class CyberRunnerEnv(gym.Env):
             self._prev_progress = curr_progress
 
         obs = self._get_obs()
-        info["path_progress"] = curr_progress
+        info.update(self._build_info(ball_pos, curr_progress))
 
         return obs, reward, terminated, truncated, info
+
+    def _compute_min_hole_distance(self, ball_pos: np.ndarray) -> float:
+        hole_distances = np.linalg.norm(self.holes - ball_pos, axis=1)
+        return float(np.min(hole_distances))
+
+    def _get_active_checkpoint_waypoint(self) -> np.ndarray | None:
+        if self._active_checkpoint_idx >= len(self.checkpoint_indices):
+            return None
+        return self.waypoints[self.checkpoint_indices[self._active_checkpoint_idx]]
+
+    def _build_info(self, ball_pos: np.ndarray, curr_progress: float) -> dict[str, Any]:
+        active_checkpoint = self._get_active_checkpoint_waypoint()
+        checkpoint_dist = (
+            float(np.linalg.norm(ball_pos - active_checkpoint))
+            if active_checkpoint is not None
+            else np.inf
+        )
+        return {
+            "path_progress": float(curr_progress),
+            "checkpoint_dist": checkpoint_dist,
+            "ball_speed": float(self._ball_speed),
+            "min_hole_distance": float(self._min_hole_distance),
+            "safe_hole_margin": float(self._min_hole_distance - HOLE_RADIUS),
+            "active_checkpoint_idx": int(self._active_checkpoint_idx),
+            "unlocked_checkpoint_idx": int(self._max_checkpoint_reached),
+            "stable_steps": int(self._stable_steps),
+            "log_path_progress": np.array([curr_progress], dtype=np.float32),
+            "log_checkpoint_dist": np.array([checkpoint_dist], dtype=np.float32),
+            "log_ball_speed": np.array([self._ball_speed], dtype=np.float32),
+            "log_min_hole_distance": np.array([self._min_hole_distance], dtype=np.float32),
+            "log_safe_hole_margin": np.array([self._min_hole_distance - HOLE_RADIUS], dtype=np.float32),
+            "log_active_checkpoint_idx": np.array([self._active_checkpoint_idx], dtype=np.float32),
+            "log_unlocked_checkpoint_idx": np.array([self._max_checkpoint_reached], dtype=np.float32),
+            "log_stable_steps": np.array([self._stable_steps], dtype=np.float32),
+        }
 
     def _get_ball_pos_board_frame(self) -> np.ndarray:
         """Get ball position in board frame."""
@@ -1068,21 +1169,42 @@ class CyberRunnerEnv(gym.Env):
         return obs
 
     def _compute_reward(self, ball_pos: np.ndarray, curr_progress: float, seg_idx: int) -> float:
-        """Sparse modulo-N checkpoint reward + goal bonus + hole penalty."""
+        """Stabilized frontier checkpoints + goal bonus + hole penalty."""
         checkpoint_reward = 0.0
-        if curr_progress >= 0:
-            num_reached = seg_idx // self.reward_every_n_waypoints
-            if num_reached > self._max_checkpoint_reached:
-                checkpoint_reward = (
-                    (num_reached - self._max_checkpoint_reached) * CHECKPOINT_REWARD
-                )
-                self._max_checkpoint_reached = num_reached
+        active_checkpoint = self._get_active_checkpoint_waypoint()
+        in_checkpoint = False
+
+        if active_checkpoint is not None and curr_progress >= 0:
+            checkpoint_dist = float(np.linalg.norm(ball_pos - active_checkpoint))
+            in_checkpoint = checkpoint_dist < self.checkpoint_radius
+            stable_here = (
+                in_checkpoint
+                and self._ball_speed < self.checkpoint_speed_threshold
+                and self._min_hole_distance > (HOLE_RADIUS + self.safe_hole_margin)
+            )
+            if in_checkpoint and not self._in_checkpoint_prev:
+                checkpoint_reward += self.checkpoint_arrival_reward
+            if stable_here:
+                self._stable_steps += 1
+                checkpoint_reward += self.checkpoint_hold_reward
+            else:
+                self._stable_steps = 0
+
+            if self._stable_steps >= self.checkpoint_hold_steps:
+                checkpoint_reward += self.checkpoint_stabilize_reward
+                self._max_checkpoint_reached += 1
+                self._active_checkpoint_idx += 1
+                self._stable_steps = 0
+                in_checkpoint = False
+        else:
+            self._stable_steps = 0
+
+        self._in_checkpoint_prev = in_checkpoint
 
         dist_to_goal = np.linalg.norm(ball_pos - self.goal_pos)
         goal_reward = GOAL_BONUS if dist_to_goal < GOAL_THRESHOLD else 0.0
 
-        hole_distances = np.linalg.norm(self.holes - ball_pos, axis=1)
-        hole_reward = -self.hole_penalty if np.any(hole_distances < HOLE_RADIUS) else 0.0
+        hole_reward = -self.hole_penalty if self._min_hole_distance < HOLE_RADIUS else 0.0
 
         return checkpoint_reward + goal_reward + hole_reward
 
@@ -1169,6 +1291,13 @@ class CyberRunner(gym.Env):
     def __init__(
         self, name, action_repeat=1, size=(64, 64), seed=0,
         reward_every_n_waypoints=5, hole_penalty=5.0,
+        checkpoint_radius=0.010,
+        checkpoint_hold_steps=12,
+        checkpoint_speed_threshold=0.015,
+        checkpoint_arrival_reward=0.2,
+        checkpoint_stabilize_reward=1.0,
+        checkpoint_hold_reward=0.02,
+        safe_hole_margin=0.004,
     ):
         include_vision = name == "vision"
         self._env = CyberRunnerEnv(
@@ -1178,6 +1307,13 @@ class CyberRunner(gym.Env):
             include_vision=include_vision,
             reward_every_n_waypoints=reward_every_n_waypoints,
             hole_penalty=hole_penalty,
+            checkpoint_radius=checkpoint_radius,
+            checkpoint_hold_steps=checkpoint_hold_steps,
+            checkpoint_speed_threshold=checkpoint_speed_threshold,
+            checkpoint_arrival_reward=checkpoint_arrival_reward,
+            checkpoint_stabilize_reward=checkpoint_stabilize_reward,
+            checkpoint_hold_reward=checkpoint_hold_reward,
+            safe_hole_margin=safe_hole_margin,
         )
         self._action_repeat = action_repeat
         self._size = size
@@ -1188,6 +1324,14 @@ class CyberRunner(gym.Env):
     def observation_space(self):
         spaces_dict = {
             "states": gym.spaces.Box(-np.inf, np.inf, (10,), dtype=np.float32),
+            "log_path_progress": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+            "log_checkpoint_dist": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+            "log_ball_speed": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+            "log_min_hole_distance": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+            "log_safe_hole_margin": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+            "log_active_checkpoint_idx": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+            "log_unlocked_checkpoint_idx": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+            "log_stable_steps": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
         }
         if self._include_vision:
             spaces_dict["image"] = gym.spaces.Box(0, 255, self._size + (3,), dtype=np.uint8)
@@ -1200,9 +1344,11 @@ class CyberRunner(gym.Env):
     def step(self, action):
         assert np.isfinite(action).all(), action
         reward = 0.0
+        last_info = None
         for _ in range(self._action_repeat):
             obs, rew, terminated, truncated, info = self._env.step(action)
             reward += rew
+            last_info = info
             if terminated or truncated:
                 break
         is_last = terminated or truncated
@@ -1211,6 +1357,14 @@ class CyberRunner(gym.Env):
             "is_last": is_last,
             "is_terminal": terminated,
             "states": obs["states"],
+            "log_path_progress": last_info["log_path_progress"],
+            "log_checkpoint_dist": last_info["log_checkpoint_dist"],
+            "log_ball_speed": last_info["log_ball_speed"],
+            "log_min_hole_distance": last_info["log_min_hole_distance"],
+            "log_safe_hole_margin": last_info["log_safe_hole_margin"],
+            "log_active_checkpoint_idx": last_info["log_active_checkpoint_idx"],
+            "log_unlocked_checkpoint_idx": last_info["log_unlocked_checkpoint_idx"],
+            "log_stable_steps": last_info["log_stable_steps"],
         }
         if self._include_vision:
             out["image"] = obs["image"]
@@ -1223,6 +1377,14 @@ class CyberRunner(gym.Env):
             "is_last": False,
             "is_terminal": False,
             "states": obs["states"],
+            "log_path_progress": info["log_path_progress"],
+            "log_checkpoint_dist": info["log_checkpoint_dist"],
+            "log_ball_speed": info["log_ball_speed"],
+            "log_min_hole_distance": info["log_min_hole_distance"],
+            "log_safe_hole_margin": info["log_safe_hole_margin"],
+            "log_active_checkpoint_idx": info["log_active_checkpoint_idx"],
+            "log_unlocked_checkpoint_idx": info["log_unlocked_checkpoint_idx"],
+            "log_stable_steps": info["log_stable_steps"],
         }
         if self._include_vision:
             out["image"] = obs["image"]
