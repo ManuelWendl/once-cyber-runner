@@ -21,7 +21,7 @@ checkpoint_speed_ema_alpha: 0.8
 prior_mode: true
 prior_start_waypoint_window: 3
 checkpoint_progress_reward_scale: 20.0
-terminate_on_checkpoint_stabilized: true
+terminate_on_checkpoint_stabilized: false
 
 seed: ${seed}
 device: ${device}

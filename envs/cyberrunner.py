@@ -1023,7 +1023,7 @@ class CyberRunnerEnv(gym.Env):
         self.prior_mode = prior_mode
         self.prior_start_waypoint_window = prior_start_waypoint_window
         self.checkpoint_progress_reward_scale = checkpoint_progress_reward_scale
-        self.terminate_on_checkpoint_stabilized = terminate_on_checkpoint_stabilized or prior_mode
+        self.terminate_on_checkpoint_stabilized = terminate_on_checkpoint_stabilized
 
         # Load maze layout
         self.walls_h, self.walls_v, self.holes, self.waypoints = get_hard_layout()
