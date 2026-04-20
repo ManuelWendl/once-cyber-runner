@@ -303,84 +303,188 @@ def _point_to_segment_distance(points: np.ndarray, starts: np.ndarray, ends: np.
     return np.linalg.norm(points[:, None, :] - closest, axis=-1).min(axis=1)
 
 
+def _segment_crosses_walls(p: np.ndarray, q: np.ndarray, wall_starts: np.ndarray, wall_ends: np.ndarray) -> bool:
+    """Return True if segment p→q crosses any wall segment (2D cross-product test)."""
+    r = q - p
+    s = wall_ends - wall_starts          # (W, 2)
+    rxs = r[0] * s[:, 1] - r[1] * s[:, 0]
+    nonpar = np.abs(rxs) > 1e-10
+    qmp = wall_starts - p                # (W, 2)
+    t = (qmp[:, 0] * s[:, 1] - qmp[:, 1] * s[:, 0]) / np.where(nonpar, rxs, 1.0)
+    u = (qmp[:, 0] * r[1]    - qmp[:, 1] * r[0]   ) / np.where(nonpar, rxs, 1.0)
+    return bool((nonpar & (t > 0) & (t < 1) & (u > 0) & (u < 1)).any())
+
+
+def _segment_distance_matrix(points: np.ndarray, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
+    """Return full (N_points, N_segments) matrix of distances to 2D line segments."""
+    seg_vecs = ends - starts
+    seg_len_sq = np.maximum(np.sum(seg_vecs**2, axis=1), 1e-10)
+    rel = points[:, None, :] - starts[None, :, :]
+    t = np.sum(rel * seg_vecs[None, :, :], axis=-1) / seg_len_sq[None, :]
+    t = np.clip(t, 0.0, 1.0)
+    closest = starts[None, :, :] + t[..., None] * seg_vecs[None, :, :]
+    return np.linalg.norm(points[:, None, :] - closest, axis=-1)
+
+
 def select_safe_checkpoints(
     waypoints: np.ndarray,
     holes: np.ndarray,
     walls_h: np.ndarray,
     walls_v: np.ndarray,
     reward_every_n_waypoints: int,
-    grid_res: float = 0.004,
+    grid_res: float = 0.002,
 ) -> np.ndarray:
-    """Pick ordered continuous checkpoints from free space using geometry-based safety.
+    """Pick geometrically safe checkpoints where the ball can physically stabilize.
 
-    Candidate checkpoints are sampled on a dense grid over the board, filtered to free
-    space, then scored by hole clearance, moderate wall support, and proximity to the
-    reference path. The path is used only to order checkpoints, not to restrict them to
-    existing waypoints.
+    A point qualifies as safe iff it is a corner: there is both a horizontal AND a
+    vertical surface (wall or board edge) within ``corner_slack`` of the touching
+    distance, so gravity can be balanced by two perpendicular supports. Hole clearance
+    is a hard filter. The result is deduplicated within ``min_sep`` in both Euclidean
+    and path-progress space and ordered along the path.
     """
-    target_count = len(range(reward_every_n_waypoints, len(waypoints) - 1, reward_every_n_waypoints))
-    if target_count <= 0:
-        return np.zeros((0, 2), dtype=np.float32)
+    corner_slack   = 0.003  # 3 mm: wall must be this close to touching to count as support
+    corridor_slack = 0.010  # 10 mm: if walls within this on BOTH sides of same axis → corridor
+    touch_wall = WALL_RADIUS + MARBLE_RADIUS
+    touch_edge = MARBLE_RADIUS
 
     xs = np.arange(MARBLE_RADIUS, BOARD_WIDTH - MARBLE_RADIUS + 1e-9, grid_res, dtype=np.float32)
     ys = np.arange(MARBLE_RADIUS, BOARD_HEIGHT - MARBLE_RADIUS + 1e-9, grid_res, dtype=np.float32)
     xx, yy = np.meshgrid(xs, ys, indexing="xy")
     candidates = np.stack([xx.ravel(), yy.ravel()], axis=-1)
 
-    hole_dist = np.linalg.norm(candidates[:, None, :] - holes[None, :, :], axis=-1).min(axis=1)
+    cx = candidates[:, 0]  # (N,)
+    cy = candidates[:, 1]
+
+    # --- Perpendicular ray-casting ---
+    # For each candidate cast 4 axis-aligned rays. A horizontal wall at y=hy only
+    # contributes to the up/down ray if the candidate's x falls within [hx0, hx1]
+    # (i.e., the wall is directly above/below). Likewise for vertical walls.
+    # This avoids the endpoint-distance artefact of _segment_distance_matrix.
+
+    hx0_arr = walls_h[:, 0][None, :]   # (1, Wh)
+    hx1_arr = walls_h[:, 1][None, :]
+    hy_arr  = walls_h[:, 2][None, :]
+    in_x = (cx[:, None] >= hx0_arr - 1e-6) & (cx[:, None] <= hx1_arr + 1e-6)  # (N, Wh)
+    dy = hy_arr - cy[:, None]                                                    # (N, Wh)
+    ray_up   = np.where(in_x & (dy > 0),  dy, np.inf).min(axis=1)   # (N,)
+    ray_down = np.where(in_x & (dy < 0), -dy, np.inf).min(axis=1)
+
+    vy0_arr = walls_v[:, 0][None, :]   # (1, Wv)
+    vy1_arr = walls_v[:, 1][None, :]
+    vx_arr  = walls_v[:, 2][None, :]
+    in_y = (cy[:, None] >= vy0_arr - 1e-6) & (cy[:, None] <= vy1_arr + 1e-6)  # (N, Wv)
+    dx = vx_arr - cx[:, None]                                                    # (N, Wv)
+    ray_right = np.where(in_y & (dx > 0),  dx, np.inf).min(axis=1)  # (N,)
+    ray_left  = np.where(in_y & (dx < 0), -dx, np.inf).min(axis=1)
+
+    # Combined gap to nearest surface (wall or board edge) in each direction.
+    # gap = 0 means touching, negative means overlapping.
+    gap_up    = np.minimum(ray_up    - touch_wall, BOARD_HEIGHT - cy - touch_edge)
+    gap_down  = np.minimum(ray_down  - touch_wall, cy            - touch_edge)
+    gap_right = np.minimum(ray_right - touch_wall, BOARD_WIDTH - cx - touch_edge)
+    gap_left  = np.minimum(ray_left  - touch_wall, cx            - touch_edge)
+
+    close_up    = gap_up    < corner_slack
+    close_down  = gap_down  < corner_slack
+    close_right = gap_right < corner_slack
+    close_left  = gap_left  < corner_slack
+
+    in_h_corridor = (gap_up < corridor_slack) & (gap_down < corridor_slack)
+    in_v_corridor = (gap_left < corridor_slack) & (gap_right < corridor_slack)
+
+    is_corner = (
+        (close_up | close_down) & (close_right | close_left)
+        & ~in_h_corridor & ~in_v_corridor
+    )
+
+    # Wall clearance for validity (use _segment_distance_matrix — fine for overlap check)
     h_starts = np.stack([walls_h[:, 0], walls_h[:, 2]], axis=1)
-    h_ends = np.stack([walls_h[:, 1], walls_h[:, 2]], axis=1)
+    h_ends   = np.stack([walls_h[:, 1], walls_h[:, 2]], axis=1)
     v_starts = np.stack([walls_v[:, 2], walls_v[:, 0]], axis=1)
-    v_ends = np.stack([walls_v[:, 2], walls_v[:, 1]], axis=1)
-    wall_starts = np.vstack([h_starts, v_starts])
-    wall_ends = np.vstack([h_ends, v_ends])
-    wall_dist = _point_to_segment_distance(candidates, wall_starts, wall_ends)
-    board_edge_dist = np.minimum.reduce([
-        candidates[:, 0],
-        BOARD_WIDTH - candidates[:, 0],
-        candidates[:, 1],
-        BOARD_HEIGHT - candidates[:, 1],
-    ])
+    v_ends   = np.stack([walls_v[:, 2], walls_v[:, 1]], axis=1)
+    all_wall_dist = _point_to_segment_distance(candidates, np.vstack([h_starts, v_starts]), np.vstack([h_ends, v_ends]))
+    wall_clearance = all_wall_dist - touch_wall
+    edge_clearance = np.minimum.reduce([cx, BOARD_WIDTH - cx, cy, BOARD_HEIGHT - cy]) - touch_edge
+
+    # --- Hole clearance with wall-blocked line-of-sight ---
+    # A hole only threatens a candidate if there is no wall between them.
+    clearance_margin = HOLE_RADIUS + MARBLE_RADIUS + 0.010
+    hole_dist_mat = np.linalg.norm(candidates[:, None, :] - holes[None, :, :], axis=-1)  # (N, H)
+    # Start with simple distance; candidates that are far enough are trivially safe.
+    hole_clearance = hole_dist_mat.min(axis=1) - clearance_margin
+    # For candidates where some hole is too close, check if a wall blocks the path.
+    at_risk = np.where(hole_clearance < 0)[0]
+    if len(at_risk) > 0:
+        wall_s = np.vstack([h_starts, v_starts])
+        wall_e = np.vstack([h_ends,   v_ends  ])
+        for i in at_risk:
+            close_hole_idxs = np.where(hole_dist_mat[i] < clearance_margin)[0]
+            worst = -np.inf
+            for j in close_hole_idxs:
+                if _segment_crosses_walls(candidates[i], holes[j], wall_s, wall_e):
+                    # Wall blocks this hole — not a hazard
+                    continue
+                # Unblocked: use its clearance
+                worst = max(worst, clearance_margin - hole_dist_mat[i, j])
+            # If all close holes were blocked, candidate is safe
+            hole_clearance[i] = -worst if worst > -np.inf else clearance_margin
 
     progress, path_offset = _project_points_to_path(candidates, waypoints)
 
-    hole_clearance = hole_dist - (HOLE_RADIUS + MARBLE_RADIUS + 0.002)
-    wall_clearance = wall_dist - (WALL_RADIUS + MARBLE_RADIUS + 0.001)
-    edge_clearance = board_edge_dist - MARBLE_RADIUS
-    valid = (hole_clearance > 0.0) & (wall_clearance > 0.0) & (edge_clearance > 0.0) & (path_offset < 0.05)
-    candidates = candidates[valid]
-    progress = progress[valid]
-    path_offset = path_offset[valid]
-    hole_clearance = hole_clearance[valid]
-    wall_dist = wall_dist[valid]
-
-    if len(candidates) == 0:
+    valid = (
+        (hole_clearance > 0.0)
+        & (wall_clearance >= -1e-6)
+        & (edge_clearance >= -1e-6)
+        & (path_offset < 0.05)
+        & is_corner
+    )
+    if not np.any(valid):
         return np.zeros((0, 2), dtype=np.float32)
 
-    preferred_wall_dist = 0.012
-    wall_support = np.exp(-((wall_dist - preferred_wall_dist) ** 2) / (2 * 0.006**2))
-    score = hole_clearance + 0.012 * wall_support - 0.25 * path_offset
+    candidates = candidates[valid]
+    progress = progress[valid]
+    hole_clearance = hole_clearance[valid]
+    gap_up_v    = gap_up[valid]
+    gap_down_v  = gap_down[valid]
+    gap_left_v  = gap_left[valid]
+    gap_right_v = gap_right[valid]
+    # Tightness: how snugly the corner is pressed (max of the 2 closest directions)
+    best_h = np.minimum(gap_up_v, gap_down_v)
+    best_v = np.minimum(gap_left_v, gap_right_v)
+    touch_score = np.maximum(best_h, best_v)
 
     order = np.argsort(progress)
     candidates = candidates[order]
     progress = progress[order]
-    score = score[order]
+    hole_clearance = hole_clearance[order]
+    touch_score = touch_score[order]
 
-    bins = np.linspace(progress.min(), progress.max(), target_count + 1)
-    selected = []
-    min_sep = 0.02
-    for lo, hi in zip(bins[:-1], bins[1:]):
-        in_bin = (progress >= lo) & (progress <= hi if hi == bins[-1] else progress < hi)
-        if not np.any(in_bin):
+    def _quality(i: int) -> float:
+        return 0.5 * hole_clearance[i] - 10.0 * touch_score[i]
+
+    min_sep = 0.025
+    selected: list[np.ndarray] = []
+    selected_progress: list[float] = []
+    selected_quality: list[float] = []
+    for i in range(len(candidates)):
+        cand = candidates[i]
+        q = _quality(i)
+        if not selected:
+            selected.append(cand)
+            selected_progress.append(progress[i])
+            selected_quality.append(q)
             continue
-        bin_points = candidates[in_bin]
-        bin_scores = score[in_bin]
-        ranked = np.argsort(bin_scores)[::-1]
-        for idx in ranked:
-            candidate = bin_points[idx]
-            if not selected or np.min(np.linalg.norm(np.asarray(selected) - candidate, axis=1)) > min_sep:
-                selected.append(candidate)
-                break
+        dist = np.linalg.norm(np.asarray(selected[-1]) - cand)
+        dprog = progress[i] - selected_progress[-1]
+        if dist < min_sep or dprog < min_sep:
+            if q > selected_quality[-1]:
+                selected[-1] = cand
+                selected_progress[-1] = progress[i]
+                selected_quality[-1] = q
+        else:
+            selected.append(cand)
+            selected_progress.append(progress[i])
+            selected_quality.append(q)
 
     return np.asarray(selected, dtype=np.float32)
 
