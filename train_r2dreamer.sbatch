@@ -3,7 +3,7 @@
 #SBATCH --job-name=r2dreamer
 #SBATCH --account=pmlr_jobs
 #SBATCH --mem=32G
-#SBATCH --time=8:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=logs/slurm_%j.out
 
 set -e
