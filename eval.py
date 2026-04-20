@@ -57,7 +57,7 @@ def main(config):
         print(f"Episode {ep}: return={ep_return:.2f}, length={ep_length}")
 
     video_path.parent.mkdir(parents=True, exist_ok=True)
-    imageio.mimwrite(video_path, frames, fps=30, quality=8)
+    imageio.mimwrite(video_path, frames, fps=60, quality=8)
     print(f"Saved {len(frames)} frames to {video_path}")
 
 
