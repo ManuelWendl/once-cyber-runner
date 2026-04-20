@@ -1001,6 +1001,8 @@ class CyberRunnerEnv(gym.Env):
         checkpoint_speed_ema_alpha: float = 0.8,
         prior_mode: bool = False,
         prior_start_waypoint_window: int = 3,
+        prior_init_ball_speed: float = 0.0,
+        prior_init_tilt_frac: float = 0.0,
         checkpoint_progress_reward_scale: float = 20.0,
         terminate_on_checkpoint_stabilized: bool = False,
     ):
@@ -1022,6 +1024,8 @@ class CyberRunnerEnv(gym.Env):
         self.checkpoint_speed_ema_alpha = checkpoint_speed_ema_alpha
         self.prior_mode = prior_mode
         self.prior_start_waypoint_window = prior_start_waypoint_window
+        self.prior_init_ball_speed = prior_init_ball_speed
+        self.prior_init_tilt_frac = prior_init_tilt_frac
         self.checkpoint_progress_reward_scale = checkpoint_progress_reward_scale
         self.terminate_on_checkpoint_stabilized = terminate_on_checkpoint_stabilized
 
@@ -1141,6 +1145,25 @@ class CyberRunnerEnv(gym.Env):
         self.data.qpos[3] = init_pos[1]
         self.data.qpos[4] = 0.0793  # Height above board
         self.data.qpos[5:9] = [1, 0, 0, 0]  # Identity quaternion
+
+        # Prior-mode handoff randomization: initial tilt + marble velocity so the
+        # prior is trained on states it will actually see when the main policy
+        # hands over control (fast-moving ball, non-zero board tilt).
+        if self.prior_mode:
+            tilt_frac = float(self.prior_init_tilt_frac)
+            if tilt_frac > 0.0:
+                self.data.qpos[0] = self.np_random.uniform(
+                    RANGE_ALPHA[0] * tilt_frac, RANGE_ALPHA[1] * tilt_frac
+                )
+                self.data.qpos[1] = self.np_random.uniform(
+                    RANGE_BETA[0] * tilt_frac, RANGE_BETA[1] * tilt_frac
+                )
+            v_max = float(self.prior_init_ball_speed)
+            if v_max > 0.0:
+                theta = self.np_random.uniform(0.0, 2 * np.pi)
+                speed = self.np_random.uniform(0.0, v_max)
+                self.data.qvel[2] = speed * np.cos(theta)
+                self.data.qvel[3] = speed * np.sin(theta)
 
         # Forward dynamics
         mujoco.mj_forward(self.model, self.data)
@@ -1494,6 +1517,8 @@ class CyberRunner(gym.Env):
         checkpoint_speed_ema_alpha=0.8,
         prior_mode=False,
         prior_start_waypoint_window=3,
+        prior_init_ball_speed=0.0,
+        prior_init_tilt_frac=0.0,
         checkpoint_progress_reward_scale=20.0,
         terminate_on_checkpoint_stabilized=False,
     ):
@@ -1515,6 +1540,8 @@ class CyberRunner(gym.Env):
             checkpoint_speed_ema_alpha=checkpoint_speed_ema_alpha,
             prior_mode=prior_mode,
             prior_start_waypoint_window=prior_start_waypoint_window,
+            prior_init_ball_speed=prior_init_ball_speed,
+            prior_init_tilt_frac=prior_init_tilt_frac,
             checkpoint_progress_reward_scale=checkpoint_progress_reward_scale,
             terminate_on_checkpoint_stabilized=terminate_on_checkpoint_stabilized,
         )

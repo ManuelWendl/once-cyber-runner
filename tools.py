@@ -210,6 +210,8 @@ class Logger:
           - as YAML text under "{name}/yaml"
           - as flattened hparams to the HParams plugin
         """
+        if self._writer is None:
+            return
         # 1) Log YAML to Text plugin
         yaml_str = None
         try:

@@ -80,6 +80,8 @@ def make_env(config, id):
             checkpoint_speed_ema_alpha=config.checkpoint_speed_ema_alpha,
             prior_mode=getattr(config, "prior_mode", False),
             prior_start_waypoint_window=getattr(config, "prior_start_waypoint_window", 3),
+            prior_init_ball_speed=getattr(config, "prior_init_ball_speed", 0.0),
+            prior_init_tilt_frac=getattr(config, "prior_init_tilt_frac", 0.0),
             checkpoint_progress_reward_scale=getattr(config, "checkpoint_progress_reward_scale", 20.0),
             terminate_on_checkpoint_stabilized=getattr(config, "terminate_on_checkpoint_stabilized", False),
         )

@@ -1,6 +1,6 @@
 task: 'cyberrunner_state'
 mirror_augment: false
-steps: 5.01e5
+steps: 1e6
 env_num: 16
 eval_every: 5e4
 eval_episode_num: 10
@@ -19,7 +19,9 @@ checkpoint_hold_reward: 0.02
 safe_hole_margin: 0.004
 checkpoint_speed_ema_alpha: 0.8
 prior_mode: true
-prior_start_waypoint_window: 3
+prior_start_waypoint_window: 6
+prior_init_ball_speed: 0.3
+prior_init_tilt_frac: 0.4
 checkpoint_progress_reward_scale: 20.0
 terminate_on_checkpoint_stabilized: false
 
