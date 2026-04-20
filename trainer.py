@@ -8,6 +8,7 @@ class OnlineTrainer:
     def __init__(self, config, replay_buffer, logger, logdir, train_envs, eval_envs):
         self.replay_buffer = replay_buffer
         self.logger = logger
+        self.logdir = logdir
         self.train_envs = train_envs
         self.eval_envs = eval_envs
         self.steps = int(config.steps)
@@ -24,6 +25,7 @@ class OnlineTrainer:
         self._should_pretrain = tools.Once()
         self._should_log = tools.Every(config.update_log_every)
         self._should_eval = tools.Every(self.eval_every)
+        self._should_save = tools.Every(self.eval_every)
         self._action_repeat = config.action_repeat
         self._episode_log_modes = {
             "log_path_progress": "final",
@@ -187,6 +189,9 @@ class OnlineTrainer:
             # Evaluation
             if self._should_eval(step) and self.eval_episode_num > 0:
                 self.eval(agent, step)
+            # Periodic checkpoint
+            if self._should_save(step):
+                torch.save({"agent_state_dict": agent.state_dict()}, self.logdir / "latest.pt")
             # Save metrics
             if done.any():
                 for i, d in enumerate(done):

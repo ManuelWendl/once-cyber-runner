@@ -33,7 +33,6 @@ cleanup() {
   cp $SCRATCH_DIR/config.yaml $PERMA_DIR/ 2>/dev/null || true
   cp $SCRATCH_DIR/*.jsonl $PERMA_DIR/ 2>/dev/null || true
   cp $SCRATCH_DIR/console.log $PERMA_DIR/ 2>/dev/null || true
-  cp $SCRATCH_DIR/events.out.tfevents.* $PERMA_DIR/ 2>/dev/null || true
   cp $SCRATCH_DIR/latest.pt $PERMA_DIR/ 2>/dev/null || true
 }
 trap cleanup EXIT

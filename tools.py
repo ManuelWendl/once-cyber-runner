@@ -116,10 +116,10 @@ class CudaBenchmark:
 
 
 class Logger:
-    def __init__(self, logdir, filename="metrics.jsonl"):
+    def __init__(self, logdir, filename="metrics.jsonl", use_tensorboard=False):
         self._logdir = logdir
         self._filename = filename
-        self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
+        self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000) if use_tensorboard else None
         self._last_step = None
         self._last_time = None
         self._scalars = {}
@@ -152,24 +152,24 @@ class Logger:
         print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
         with (self._logdir / self._filename).open("a") as f:
             f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
-        for name, value in scalars:
-            if "/" not in name:
-                self._writer.add_scalar("scalars/" + name, value, step)
-            else:
-                self._writer.add_scalar(name, value, step)
-        for name, value in self._images.items():
-            self._writer.add_image(name, value, step)
-        for name, value in self._videos.items():
-            name = name if isinstance(name, str) else name.decode("utf-8")
-            if np.issubdtype(value.dtype, np.floating):
-                value = np.clip(255 * value, 0, 255).astype(np.uint8)
-            B, T, H, W, C = value.shape
-            value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
-            self._writer.add_video(name, value, step, 16)
-        for name, value in self._histograms.items():
-            self._writer.add_histogram(name, value, step)
-
-        self._writer.flush()
+        if self._writer is not None:
+            for name, value in scalars:
+                if "/" not in name:
+                    self._writer.add_scalar("scalars/" + name, value, step)
+                else:
+                    self._writer.add_scalar(name, value, step)
+            for name, value in self._images.items():
+                self._writer.add_image(name, value, step)
+            for name, value in self._videos.items():
+                name = name if isinstance(name, str) else name.decode("utf-8")
+                if np.issubdtype(value.dtype, np.floating):
+                    value = np.clip(255 * value, 0, 255).astype(np.uint8)
+                B, T, H, W, C = value.shape
+                value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
+                self._writer.add_video(name, value, step, 16)
+            for name, value in self._histograms.items():
+                self._writer.add_histogram(name, value, step)
+            self._writer.flush()
 
         if self._wandb is not None:
             wb = self._wandb
