@@ -22,8 +22,10 @@ prior_mode: true
 prior_start_waypoint_window: 3
 prior_init_ball_speed: 0.3
 prior_init_tilt_frac: 0.4
+prior_min_checkpoint_start_dist: 0.02
+prior_max_checkpoint_start_dist: 0.12
 checkpoint_progress_reward_scale: 20.0
-terminate_on_checkpoint_stabilized: false
+terminate_on_checkpoint_stabilized: true
 
 seed: ${seed}
 device: ${device}

@@ -82,6 +82,8 @@ def make_env(config, id):
             prior_start_waypoint_window=getattr(config, "prior_start_waypoint_window", 3),
             prior_init_ball_speed=getattr(config, "prior_init_ball_speed", 0.0),
             prior_init_tilt_frac=getattr(config, "prior_init_tilt_frac", 0.0),
+            prior_min_checkpoint_start_dist=getattr(config, "prior_min_checkpoint_start_dist", 0.02),
+            prior_max_checkpoint_start_dist=getattr(config, "prior_max_checkpoint_start_dist", 0.12),
             checkpoint_progress_reward_scale=getattr(config, "checkpoint_progress_reward_scale", 20.0),
             terminate_on_checkpoint_stabilized=getattr(config, "terminate_on_checkpoint_stabilized", False),
         )
