@@ -1,7 +1,5 @@
-from . import parallel, wrappers
-
-
 def make_envs(config):
+    from . import parallel, wrappers
     def env_constructor(idx):
         return lambda: make_env(config, idx)
 
@@ -13,6 +11,7 @@ def make_envs(config):
 
 
 def make_env(config, id):
+    from . import wrappers
     suite, task = config.task.split("_", 1)
     if suite == "dmc":
         import envs.dmc as dmc
@@ -78,12 +77,14 @@ def make_env(config, id):
             checkpoint_hold_reward=config.checkpoint_hold_reward,
             safe_hole_margin=config.safe_hole_margin,
             checkpoint_speed_ema_alpha=config.checkpoint_speed_ema_alpha,
+            checkpoint_include_corridors=getattr(config, "checkpoint_include_corridors", True),
             prior_mode=getattr(config, "prior_mode", False),
             prior_start_waypoint_window=getattr(config, "prior_start_waypoint_window", 3),
             prior_init_ball_speed=getattr(config, "prior_init_ball_speed", 0.0),
             prior_init_tilt_frac=getattr(config, "prior_init_tilt_frac", 0.0),
             prior_min_checkpoint_start_dist=getattr(config, "prior_min_checkpoint_start_dist", 0.02),
             prior_max_checkpoint_start_dist=getattr(config, "prior_max_checkpoint_start_dist", 0.12),
+            prior_spawn_min_hole_margin=getattr(config, "prior_spawn_min_hole_margin", 0.02),
             checkpoint_progress_reward_scale=getattr(config, "checkpoint_progress_reward_scale", 20.0),
             terminate_on_checkpoint_stabilized=getattr(config, "terminate_on_checkpoint_stabilized", False),
         )

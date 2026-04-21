@@ -332,18 +332,22 @@ def select_safe_checkpoints(
     walls_h: np.ndarray,
     walls_v: np.ndarray,
     reward_every_n_waypoints: int,
+    include_corridors: bool = True,
     grid_res: float = 0.002,
 ) -> np.ndarray:
     """Pick geometrically safe checkpoints where the ball can physically stabilize.
 
-    A point qualifies as safe iff it is a corner: there is both a horizontal AND a
-    vertical surface (wall or board edge) within ``corner_slack`` of the touching
-    distance, so gravity can be balanced by two perpendicular supports. Hole clearance
-    is a hard filter. The result is deduplicated within ``min_sep`` in both Euclidean
-    and path-progress space and ordered along the path.
+    Two classes qualify:
+    - Corner: close to both a horizontal AND a vertical surface (two perpendicular supports).
+    - Single-wall: close to exactly one surface family, not sandwiched on the same axis.
+      The policy can hold the ball against a single wall with a slight tilt.
+    Corridor midpoints (sandwiched on either axis) are excluded. Hole clearance is a
+    hard filter with wall-blocked line-of-sight. Result is deduplicated and path-ordered.
+    Setting ``include_corridors=False`` keeps only true corner basins.
     """
-    corner_slack   = 0.003  # 3 mm: wall must be this close to touching to count as support
-    corridor_slack = 0.010  # 10 mm: if walls within this on BOTH sides of same axis → corridor
+    corner_slack      = 0.003   # 3 mm: wall must be this close to touching (corner)
+    single_wall_slack = 0.0015  # 1.5 mm: must be nearly touching for single-wall support
+    corridor_slack    = 0.010   # 10 mm: if walls within this on BOTH sides of same axis → corridor
     touch_wall = WALL_RADIUS + MARBLE_RADIUS
     touch_edge = MARBLE_RADIUS
 
@@ -396,6 +400,16 @@ def select_safe_checkpoints(
         (close_up | close_down) & (close_right | close_left)
         & ~in_h_corridor & ~in_v_corridor
     )
+    # Single-wall: nearly touching exactly one wall family (H or V), not sandwiched
+    sw_up    = gap_up    < single_wall_slack
+    sw_down  = gap_down  < single_wall_slack
+    sw_right = gap_right < single_wall_slack
+    sw_left  = gap_left  < single_wall_slack
+    is_single_wall = (
+        ((sw_up | sw_down) & ~(close_right | close_left) & ~in_h_corridor)
+        | ((sw_right | sw_left) & ~(close_up | close_down) & ~in_v_corridor)
+    )
+    is_safe = is_corner | (is_single_wall if include_corridors else False)
 
     # Wall clearance for validity (use _segment_distance_matrix — fine for overlap check)
     h_starts = np.stack([walls_h[:, 0], walls_h[:, 2]], axis=1)
@@ -410,6 +424,7 @@ def select_safe_checkpoints(
     # A hole only threatens a candidate if there is no wall between them.
     # Tight wall-supported corners can safely tolerate a slightly smaller extra
     # restart margin than generic free-space points.
+    # Corners: tight margin (two supports). Single-wall: larger margin (less constrained).
     clearance_margin = HOLE_RADIUS + MARBLE_RADIUS + np.where(is_corner, 0.006, 0.010)
     hole_dist_mat = np.linalg.norm(candidates[:, None, :] - holes[None, :, :], axis=-1)  # (N, H)
     # Start with simple distance; candidates that are far enough are trivially safe.
@@ -442,11 +457,12 @@ def select_safe_checkpoints(
         & (wall_clearance >= -1e-6)
         & (edge_clearance >= -1e-6)
         & (path_offset < max_path_offset)
-        & is_corner
+        & is_safe
     )
     if not np.any(valid):
         return np.zeros((0, 2), dtype=np.float32)
 
+    is_corner_v = is_corner[valid]
     candidates = candidates[valid]
     progress = progress[valid]
     hole_clearance = hole_clearance[valid]
@@ -454,28 +470,49 @@ def select_safe_checkpoints(
     gap_down_v  = gap_down[valid]
     gap_left_v  = gap_left[valid]
     gap_right_v = gap_right[valid]
-    # Tightness: how snugly the corner is pressed (max of the 2 closest directions)
-    best_h = np.minimum(gap_up_v, gap_down_v)
-    best_v = np.minimum(gap_left_v, gap_right_v)
-    touch_score = np.maximum(best_h, best_v)
-
+    touch_score = np.minimum.reduce([gap_up_v, gap_down_v, gap_left_v, gap_right_v])
     quality = 0.5 * hole_clearance - 10.0 * touch_score
 
-    # Keep every distinct stoppable corner basin, but avoid reintroducing the bad
-    # "corridor center" behavior from older versions. The strict ``is_corner`` test
-    # above already rejects corridor-centre points, so here we only need spatial
-    # non-maximum suppression over quality-ranked corner candidates.
-    min_sep = max(0.010, 0.018 - 0.001 * float(reward_every_n_waypoints))
-    quality_order = np.argsort(-quality)
+    # Wall endpoints: single-wall points must be near one to avoid mid-corridor placement.
+    h_ep = np.vstack([
+        np.stack([walls_h[:, 0], walls_h[:, 2]], axis=1),
+        np.stack([walls_h[:, 1], walls_h[:, 2]], axis=1),
+    ])
+    v_ep = np.vstack([
+        np.stack([walls_v[:, 2], walls_v[:, 0]], axis=1),
+        np.stack([walls_v[:, 2], walls_v[:, 1]], axis=1),
+    ])
+    endpoints = np.vstack([h_ep, v_ep])  # (E, 2)
+    dist_to_ep = np.linalg.norm(candidates[:, None, :] - endpoints[None, :, :], axis=-1).min(axis=1)
+    max_ep_dist = 0.025  # single-wall must be within 2.5 cm of a wall junction/endpoint
+
+    # Two-pass greedy NMS
+    # Pass 1: corners only, original spacing (preserves all previously selected corners)
+    min_sep_c  = max(0.010, 0.018 - 0.001 * float(reward_every_n_waypoints))
+    # Pass 2: single-wall fills gaps, wider spacing to stay sparse
+    min_sep_sw = 0.030
+
     selected_idx: list[int] = []
-    for idx in quality_order:
+
+    def _nms_add(idx: int, min_sep: float) -> bool:
         cand = candidates[idx]
         if not selected_idx:
-            selected_idx.append(int(idx))
-            continue
-        selected_points = candidates[np.asarray(selected_idx)]
-        if np.all(np.linalg.norm(selected_points - cand, axis=1) >= min_sep):
-            selected_idx.append(int(idx))
+            selected_idx.append(idx)
+            return True
+        sel = candidates[np.asarray(selected_idx)]
+        if np.all(np.linalg.norm(sel - cand, axis=1) >= min_sep):
+            selected_idx.append(idx)
+            return True
+        return False
+
+    corner_idxs = np.where(is_corner_v)[0]
+    for idx in corner_idxs[np.argsort(-quality[corner_idxs])]:
+        _nms_add(int(idx), min_sep_c)
+
+    if include_corridors:
+        sw_idxs = np.where(~is_corner_v & (dist_to_ep < max_ep_dist))[0]
+        for idx in sw_idxs[np.argsort(-quality[sw_idxs])]:
+            _nms_add(int(idx), min_sep_sw)
 
     selected_idx_arr = np.asarray(selected_idx, dtype=np.int32)
     progress_order = np.argsort(progress[selected_idx_arr])
@@ -1096,12 +1133,14 @@ class CyberRunnerEnv(gym.Env):
         checkpoint_hold_reward: float = 0.02,
         safe_hole_margin: float = 0.004,
         checkpoint_speed_ema_alpha: float = 0.8,
+        checkpoint_include_corridors: bool = True,
         prior_mode: bool = False,
         prior_start_waypoint_window: int = 3,
         prior_init_ball_speed: float = 0.0,
         prior_init_tilt_frac: float = 0.0,
         prior_min_checkpoint_start_dist: float = 0.02,
         prior_max_checkpoint_start_dist: float = 0.12,
+        prior_spawn_min_hole_margin: float = 0.02,
         checkpoint_progress_reward_scale: float = 20.0,
         terminate_on_checkpoint_stabilized: bool = False,
     ):
@@ -1121,12 +1160,14 @@ class CyberRunnerEnv(gym.Env):
         self.checkpoint_hold_reward = checkpoint_hold_reward
         self.safe_hole_margin = safe_hole_margin
         self.checkpoint_speed_ema_alpha = checkpoint_speed_ema_alpha
+        self.checkpoint_include_corridors = checkpoint_include_corridors
         self.prior_mode = prior_mode
         self.prior_start_waypoint_window = prior_start_waypoint_window
         self.prior_init_ball_speed = prior_init_ball_speed
         self.prior_init_tilt_frac = prior_init_tilt_frac
         self.prior_min_checkpoint_start_dist = prior_min_checkpoint_start_dist
         self.prior_max_checkpoint_start_dist = prior_max_checkpoint_start_dist
+        self.prior_spawn_min_hole_margin = prior_spawn_min_hole_margin
         self.checkpoint_progress_reward_scale = checkpoint_progress_reward_scale
         self.terminate_on_checkpoint_stabilized = terminate_on_checkpoint_stabilized
 
@@ -1138,6 +1179,7 @@ class CyberRunnerEnv(gym.Env):
             self.walls_h,
             self.walls_v,
             self.reward_every_n_waypoints,
+            include_corridors=self.checkpoint_include_corridors,
         )
 
         # Precompute path data
@@ -1231,13 +1273,26 @@ class CyberRunnerEnv(gym.Env):
                 dists = np.linalg.norm(self.checkpoint_points - candidate_pos[None], axis=1)
                 nearest_idx = int(np.argmin(dists))
                 nearest_dist = float(dists[nearest_idx])
-                if self.prior_min_checkpoint_start_dist <= nearest_dist <= self.prior_max_checkpoint_start_dist:
+                min_hole_dist = self._compute_min_hole_distance(candidate_pos)
+                recoverable_from_holes = (
+                    min_hole_dist > (HOLE_RADIUS + self.prior_spawn_min_hole_margin)
+                )
+                if (
+                    self.prior_min_checkpoint_start_dist <= nearest_dist <= self.prior_max_checkpoint_start_dist
+                    and recoverable_from_holes
+                ):
                     init_pos = candidate_pos
                     chosen_checkpoint_idx = nearest_idx
                     break
 
             if init_pos is None:
-                fallback_idx = int(sampled_waypoints[0])
+                safe_candidates = []
+                for idx in sampled_waypoints:
+                    candidate_pos = self.waypoints[int(idx)]
+                    min_hole_dist = self._compute_min_hole_distance(candidate_pos)
+                    if min_hole_dist > (HOLE_RADIUS + self.prior_spawn_min_hole_margin):
+                        safe_candidates.append(int(idx))
+                fallback_idx = safe_candidates[0] if safe_candidates else int(sampled_waypoints[0])
                 init_pos = self.waypoints[fallback_idx]
                 dists = np.linalg.norm(self.checkpoint_points - init_pos[None], axis=1)
                 chosen_checkpoint_idx = int(np.argmin(dists))
@@ -1363,6 +1418,19 @@ class CyberRunnerEnv(gym.Env):
     def _compute_min_hole_distance(self, ball_pos: np.ndarray) -> float:
         hole_distances = np.linalg.norm(self.holes - ball_pos, axis=1)
         return float(np.min(hole_distances))
+
+    def _min_wall_distance(self, ball_pos: np.ndarray) -> float:
+        """Closest distance from ball center to any wall segment or board edge."""
+        h_starts = np.stack([self.walls_h[:, 0], self.walls_h[:, 2]], axis=1)
+        h_ends   = np.stack([self.walls_h[:, 1], self.walls_h[:, 2]], axis=1)
+        v_starts = np.stack([self.walls_v[:, 2], self.walls_v[:, 0]], axis=1)
+        v_ends   = np.stack([self.walls_v[:, 2], self.walls_v[:, 1]], axis=1)
+        starts = np.vstack([h_starts, v_starts])
+        ends   = np.vstack([h_ends,   v_ends])
+        wall_d = float(_point_to_segment_distance(ball_pos[None, :], starts, ends).min())
+        edge_d = float(min(ball_pos[0], BOARD_WIDTH - ball_pos[0],
+                           ball_pos[1], BOARD_HEIGHT - ball_pos[1])) + WALL_RADIUS
+        return min(wall_d, edge_d)
 
     def _get_active_checkpoint_waypoint(self) -> np.ndarray | None:
         if self._active_checkpoint_idx >= len(self.checkpoint_points):
@@ -1490,21 +1558,33 @@ class CyberRunnerEnv(gym.Env):
 
         if active_checkpoint is not None and curr_progress >= 0:
             checkpoint_dist = float(np.linalg.norm(ball_pos - active_checkpoint))
-            if self.prior_mode and np.isfinite(self._prev_checkpoint_dist):
-                checkpoint_reward += self.checkpoint_progress_reward_scale * (
-                    self._prev_checkpoint_dist - checkpoint_dist
-                )
+            if self.prior_mode:
+                # Asymmetric shaping: reward progress toward, don't penalize moving away
+                # (avoids the "stop anywhere" local optimum).
+                if np.isfinite(self._prev_checkpoint_dist):
+                    progress_delta = self._prev_checkpoint_dist - checkpoint_dist
+                    checkpoint_reward += self.checkpoint_progress_reward_scale * max(progress_delta, 0.0)
+                # Dense distance penalty: always pay for being far → "stop at checkpoint"
+                # is strictly better than "stop anywhere else".
+                checkpoint_reward -= 0.1 * checkpoint_dist
             in_checkpoint = checkpoint_dist < self.checkpoint_radius
+            # Wall-contact: ball must be pressed against at least one wall to truly
+            # stabilize (safe checkpoints are defined at wall-contact positions).
+            wall_contact_dist = self._min_wall_distance(ball_pos)
+            touching_wall = wall_contact_dist < (WALL_RADIUS + MARBLE_RADIUS + 0.002)
             stable_here = (
                 in_checkpoint
+                and touching_wall
                 and self._ball_speed < self.checkpoint_speed_threshold
                 and self._min_hole_distance > (HOLE_RADIUS + self.safe_hole_margin)
             )
-            if in_checkpoint and not self._in_checkpoint_prev:
+            if in_checkpoint and not self._in_checkpoint_prev and not self.prior_mode:
                 checkpoint_reward += self.checkpoint_arrival_reward
             if stable_here:
                 self._stable_steps += 1
-                checkpoint_reward += self.checkpoint_hold_reward
+                # Hold reward scaled by closeness to center (1.0 at center, ~0.5 at edge)
+                closeness = 1.0 - 0.5 * (checkpoint_dist / self.checkpoint_radius)
+                checkpoint_reward += self.checkpoint_hold_reward * closeness
             else:
                 self._stable_steps = 0
 
@@ -1625,12 +1705,14 @@ class CyberRunner(gym.Env):
         checkpoint_hold_reward=0.02,
         safe_hole_margin=0.004,
         checkpoint_speed_ema_alpha=0.8,
+        checkpoint_include_corridors=True,
         prior_mode=False,
         prior_start_waypoint_window=3,
         prior_init_ball_speed=0.0,
         prior_init_tilt_frac=0.0,
         prior_min_checkpoint_start_dist=0.02,
         prior_max_checkpoint_start_dist=0.12,
+        prior_spawn_min_hole_margin=0.02,
         checkpoint_progress_reward_scale=20.0,
         terminate_on_checkpoint_stabilized=False,
     ):
@@ -1650,12 +1732,14 @@ class CyberRunner(gym.Env):
             checkpoint_hold_reward=checkpoint_hold_reward,
             safe_hole_margin=safe_hole_margin,
             checkpoint_speed_ema_alpha=checkpoint_speed_ema_alpha,
+            checkpoint_include_corridors=checkpoint_include_corridors,
             prior_mode=prior_mode,
             prior_start_waypoint_window=prior_start_waypoint_window,
             prior_init_ball_speed=prior_init_ball_speed,
             prior_init_tilt_frac=prior_init_tilt_frac,
             prior_min_checkpoint_start_dist=prior_min_checkpoint_start_dist,
             prior_max_checkpoint_start_dist=prior_max_checkpoint_start_dist,
+            prior_spawn_min_hole_margin=prior_spawn_min_hole_margin,
             checkpoint_progress_reward_scale=checkpoint_progress_reward_scale,
             terminate_on_checkpoint_stabilized=terminate_on_checkpoint_stabilized,
         )
