@@ -1,6 +1,7 @@
 """PPO training for the CyberRunner prior (stabilization) task using stable-baselines3."""
 import argparse
 import pathlib
+from collections import deque
 
 import gymnasium as gym
 import numpy as np
@@ -43,8 +44,9 @@ def make_prior_env(
         prior_init_tilt_frac=0.2,
         prior_min_checkpoint_start_dist=0.02,
         prior_max_checkpoint_start_dist=0.12,
-        prior_spawn_min_hole_margin=0.015,
+        prior_spawn_min_hole_margin=0.012,
         prior_start_point_spacing=0.01,
+        prior_spawn_merge_radius=0.02,
         checkpoint_progress_reward_scale=progress_scale,
         terminate_on_checkpoint_stabilized=True,
     )
@@ -90,6 +92,9 @@ def main():
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_log_every", type=int, default=10_000)
+    parser.add_argument("--robust_eval_every", type=int, default=50_000)
+    parser.add_argument("--robust_eval_repeats", type=int, default=3)
+    parser.add_argument("--robust_eval_max_spawns", type=int, default=32)
     args = parser.parse_args()
 
     logdir = pathlib.Path(args.logdir)
@@ -158,15 +163,26 @@ def main():
                     if self._ep_rewards:
                         mean_reward = float(np.mean(self._ep_rewards))
                         mean_length = float(np.mean(self._ep_lengths))
+                        mean_success = float(np.mean(self._ep_success))
+                        mean_stable = float(np.mean(self._ep_stable_steps))
                         payload.update({
                             "episode/mean_reward": mean_reward,
                             "episode/mean_length": mean_length,
-                            "episode/success_rate": float(np.mean(self._ep_success)),
-                            "episode/mean_stable_steps": float(np.mean(self._ep_stable_steps)),
+                            "episode/success_rate": mean_success,
+                            "episode/mean_stable_steps": mean_stable,
                             "rollout/ep_rew_mean": mean_reward,
                             "rollout/ep_len_mean": mean_length,
                             "rollout/episodes": len(self._ep_rewards),
                         })
+                        print(
+                            f"[step {self.num_timesteps}] "
+                            f"ep_rew_mean={mean_reward:.3f} "
+                            f"ep_len_mean={mean_length:.1f} "
+                            f"success_rate={mean_success:.3f} "
+                            f"stable_steps={mean_stable:.2f} "
+                            f"episodes={len(self._ep_rewards)}",
+                            flush=True,
+                        )
                         self._ep_rewards.clear()
                         self._ep_lengths.clear()
                         self._ep_success.clear()
@@ -221,6 +237,103 @@ def main():
                         }, step=self.num_timesteps)
                 return True
 
+        class WandbRobustEvalCallback(BaseCallback):
+            def __init__(self, eval_every: int, repeats: int, max_spawns: int):
+                super().__init__()
+                self._eval_every = int(eval_every)
+                self._repeats = int(repeats)
+                self._max_spawns = int(max_spawns)
+                self._last_eval_step = -eval_every
+                self._eval_env = make_prior_env(
+                    render_mode=None,
+                    progress_scale=args.progress_scale,
+                    include_corridors=args.checkpoint_mode == "corners_and_corridors",
+                )
+                raw_spawns = np.asarray(self._eval_env.unwrapped.prior_start_points, dtype=np.float32)
+                if len(raw_spawns) > self._max_spawns > 0:
+                    idxs = np.linspace(0, len(raw_spawns) - 1, self._max_spawns, dtype=int)
+                    self._spawn_bank = raw_spawns[idxs]
+                else:
+                    self._spawn_bank = raw_spawns
+
+            def _normalize(self, stacked_obs: np.ndarray) -> np.ndarray:
+                normed = (stacked_obs - vec_env.obs_rms.mean) / np.sqrt(vec_env.obs_rms.var + vec_env.epsilon)
+                return np.clip(normed, -vec_env.clip_obs, vec_env.clip_obs)
+
+            def _run_episode(self, spawn_point: np.ndarray, seed: int) -> dict[str, float]:
+                buf = deque([np.zeros(13, dtype=np.float32)] * args.n_stack, maxlen=args.n_stack)
+                raw_obs, _ = self._eval_env.reset(seed=seed, options={"spawn_point": spawn_point})
+                total_reward = 0.0
+                done = False
+                final_info = {}
+                while not done:
+                    buf.append(raw_obs)
+                    obs_in = self._normalize(np.concatenate(list(buf)))
+                    action, _ = self.model.predict(obs_in, deterministic=True)
+                    raw_obs, reward, terminated, truncated, info = self._eval_env.step(action)
+                    total_reward += float(reward)
+                    done = terminated or truncated
+                    final_info = info
+                return {
+                    "success": float(final_info.get("success", 0.0)),
+                    "stable_steps": float(final_info.get("stable_steps", 0.0)),
+                    "checkpoint_dist": float(final_info.get("checkpoint_dist", np.nan)),
+                    "reward": total_reward,
+                }
+
+            def _on_step(self) -> bool:
+                if self.num_timesteps - self._last_eval_step < self._eval_every:
+                    return True
+                self._last_eval_step = self.num_timesteps
+
+                per_spawn_success = []
+                per_spawn_reward = []
+                per_spawn_dist = []
+                per_spawn_stable = []
+                for spawn_idx, spawn_point in enumerate(self._spawn_bank):
+                    spawn_results = [
+                        self._run_episode(
+                            spawn_point=spawn_point,
+                            seed=int(self.num_timesteps + 1000 * spawn_idx + rep),
+                        )
+                        for rep in range(self._repeats)
+                    ]
+                    per_spawn_success.append(float(np.mean([r["success"] for r in spawn_results])))
+                    per_spawn_reward.append(float(np.mean([r["reward"] for r in spawn_results])))
+                    per_spawn_dist.append(float(np.mean([r["checkpoint_dist"] for r in spawn_results])))
+                    per_spawn_stable.append(float(np.mean([r["stable_steps"] for r in spawn_results])))
+
+                success_arr = np.asarray(per_spawn_success, dtype=np.float32)
+                reward_arr = np.asarray(per_spawn_reward, dtype=np.float32)
+                dist_arr = np.asarray(per_spawn_dist, dtype=np.float32)
+                stable_arr = np.asarray(per_spawn_stable, dtype=np.float32)
+                payload = {
+                    "train/step": self.num_timesteps,
+                    "eval/spawn_success_rate_mean": float(success_arr.mean()),
+                    "eval/spawn_success_rate_median": float(np.median(success_arr)),
+                    "eval/spawn_success_rate_p10": float(np.percentile(success_arr, 10)),
+                    "eval/spawn_success_rate_min": float(success_arr.min()),
+                    "eval/spawn_reward_mean": float(reward_arr.mean()),
+                    "eval/spawn_checkpoint_dist_mean": float(dist_arr.mean()),
+                    "eval/spawn_stable_steps_mean": float(stable_arr.mean()),
+                    "eval/spawn_count": int(len(success_arr)),
+                    "eval/episodes_per_spawn": int(self._repeats),
+                }
+                print(
+                    f"[step {self.num_timesteps}] "
+                    f"spawn_success_mean={payload['eval/spawn_success_rate_mean']:.3f} "
+                    f"spawn_success_p10={payload['eval/spawn_success_rate_p10']:.3f} "
+                    f"spawn_success_min={payload['eval/spawn_success_rate_min']:.3f} "
+                    f"spawn_reward_mean={payload['eval/spawn_reward_mean']:.3f} "
+                    f"spawn_count={payload['eval/spawn_count']}",
+                    flush=True,
+                )
+                wandb.log(payload, step=self.num_timesteps)
+                return True
+
+            def _on_training_end(self) -> None:
+                self._eval_env.close()
+
         wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity or None,
@@ -230,7 +343,16 @@ def main():
         wandb.define_metric("episode/*", step_metric="train/step")
         wandb.define_metric("rollout/*", step_metric="train/step")
         wandb.define_metric("eval/*", step_metric="train/step")
-        extra_callbacks = [WandbCallback(args.wandb_log_every), SyncNormCallback(), WandbVideoCallback(video_freq=50_000)]
+        extra_callbacks = [
+            WandbCallback(args.wandb_log_every),
+            SyncNormCallback(),
+            WandbVideoCallback(video_freq=50_000),
+            WandbRobustEvalCallback(
+                eval_every=args.robust_eval_every,
+                repeats=args.robust_eval_repeats,
+                max_spawns=args.robust_eval_max_spawns,
+            ),
+        ]
     else:
         extra_callbacks = []
 

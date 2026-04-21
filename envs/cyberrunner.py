@@ -1130,6 +1130,7 @@ class CyberRunnerEnv(gym.Env):
         prior_max_checkpoint_start_dist: float = 0.12,
         prior_spawn_min_hole_margin: float = 0.02,
         prior_start_point_spacing: float = 0.01,
+        prior_spawn_merge_radius: float = 0.0,
         checkpoint_progress_reward_scale: float = 20.0,
         terminate_on_checkpoint_stabilized: bool = False,
     ):
@@ -1158,6 +1159,7 @@ class CyberRunnerEnv(gym.Env):
         self.prior_max_checkpoint_start_dist = prior_max_checkpoint_start_dist
         self.prior_spawn_min_hole_margin = prior_spawn_min_hole_margin
         self.prior_start_point_spacing = prior_start_point_spacing
+        self.prior_spawn_merge_radius = prior_spawn_merge_radius
         self.checkpoint_progress_reward_scale = checkpoint_progress_reward_scale
         self.terminate_on_checkpoint_stabilized = terminate_on_checkpoint_stabilized
 
@@ -1282,18 +1284,39 @@ class CyberRunnerEnv(gym.Env):
             & (min_hole_dists > (HOLE_RADIUS + self.prior_spawn_min_hole_margin))
         )
         filtered = candidates[safe_mask]
-        return filtered if len(filtered) else candidates
+        if not len(filtered):
+            return candidates
+
+        merge_radius = float(self.prior_spawn_merge_radius)
+        if merge_radius <= 0.0 or len(filtered) <= 1:
+            return filtered
+
+        _, progresses = _project_points_to_path(filtered, self.waypoints)
+        order = np.argsort(progresses)
+        kept: list[np.ndarray] = []
+        merge_radius_sq = merge_radius * merge_radius
+        for idx in order:
+            point = filtered[idx]
+            if any(np.sum((point - prev) ** 2) < merge_radius_sq for prev in kept):
+                continue
+            kept.append(point)
+        return np.asarray(kept, dtype=np.float32)
 
     def reset(
         self, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[np.ndarray, dict[str, Any]]:
         super().reset(seed=seed)
+        options = options or {}
 
         # Reset MuJoCo
         mujoco.mj_resetData(self.model, self.data)
 
         # Set initial marble position
-        if self.prior_mode:
+        if self.prior_mode and "spawn_point" in options:
+            init_pos = np.asarray(options["spawn_point"], dtype=np.float32)
+            dists = np.linalg.norm(self.checkpoint_points - init_pos[None], axis=1)
+            self._active_checkpoint_idx = int(np.argmin(dists))
+        elif self.prior_mode:
             sampled_points = self.prior_start_points[self.np_random.permutation(len(self.prior_start_points))]
             init_pos = None
             chosen_checkpoint_idx = None
@@ -1737,6 +1760,7 @@ class CyberRunner(gym.Env):
         prior_max_checkpoint_start_dist=0.12,
         prior_spawn_min_hole_margin=0.02,
         prior_start_point_spacing=0.01,
+        prior_spawn_merge_radius=0.0,
         checkpoint_progress_reward_scale=20.0,
         terminate_on_checkpoint_stabilized=False,
     ):
@@ -1765,6 +1789,7 @@ class CyberRunner(gym.Env):
             prior_max_checkpoint_start_dist=prior_max_checkpoint_start_dist,
             prior_spawn_min_hole_margin=prior_spawn_min_hole_margin,
             prior_start_point_spacing=prior_start_point_spacing,
+            prior_spawn_merge_radius=prior_spawn_merge_radius,
             checkpoint_progress_reward_scale=checkpoint_progress_reward_scale,
             terminate_on_checkpoint_stabilized=terminate_on_checkpoint_stabilized,
         )
