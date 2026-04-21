@@ -751,7 +751,13 @@ def _generate_board_texture(
     waypoints: np.ndarray,
     checkpoint_points: np.ndarray | None = None,
 ):
-    """Generate a board texture image with holes, path, and checkpoint markers."""
+    """Generate the board texture used by the simulator.
+
+    Checkpoints are intentionally *not* baked into this texture so vision policies
+    do not observe synthetic green markers that do not exist on the real system.
+    The ``checkpoint_points`` argument is kept for API compatibility with older
+    call sites and offline visualization utilities.
+    """
     # Board floor geom spans -0.007 to 0.283 in x, -0.007 to 0.238 in y
     # (centered at [0.138, 0.1155] with half-size [0.145, 0.1225])
     # Maze coordinates start at 0, so offset by 0.007 to place them correctly.
@@ -777,24 +783,6 @@ def _generate_board_texture(
         p1 = (int((waypoints[i][0] + margin) * scale), int((waypoints[i][1] + margin) * scale))
         p2 = (int((waypoints[i + 1][0] + margin) * scale), int((waypoints[i + 1][1] + margin) * scale))
         draw.line([p1, p2], fill=(30, 30, 30), width=path_w)
-
-    # Draw checkpoint markers as green rings so they are visible in videos.
-    if checkpoint_points is not None and len(checkpoint_points):
-        outer_r = max(int(0.006 * scale), 1)
-        inner_r = max(int(0.0035 * scale), 1)
-        for checkpoint in checkpoint_points:
-            cx = int((checkpoint[0] + margin) * scale)
-            cy = int((checkpoint[1] + margin) * scale)
-            draw.ellipse(
-                [cx - outer_r, cy - outer_r, cx + outer_r, cy + outer_r],
-                fill=(60, 180, 75),
-                outline=(20, 90, 30),
-                width=max(int(0.0012 * scale), 1),
-            )
-            draw.ellipse(
-                [cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r],
-                fill=(204, 204, 204),
-            )
 
     # MuJoCo textures have origin at bottom-left
     return img.transpose(Image.FLIP_TOP_BOTTOM)
