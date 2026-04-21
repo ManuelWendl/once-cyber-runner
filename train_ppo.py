@@ -41,6 +41,10 @@ def make_prior_env(
         prior_start_waypoint_window=3,
         prior_init_ball_speed=0.15,
         prior_init_tilt_frac=0.2,
+        prior_min_checkpoint_start_dist=0.02,
+        prior_max_checkpoint_start_dist=0.12,
+        prior_spawn_min_hole_margin=0.015,
+        prior_start_point_spacing=0.01,
         checkpoint_progress_reward_scale=progress_scale,
         terminate_on_checkpoint_stabilized=True,
     )
@@ -85,6 +89,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_log_every", type=int, default=10_000)
     args = parser.parse_args()
 
     logdir = pathlib.Path(args.logdir)
@@ -130,22 +135,44 @@ def main():
         import wandb
 
         class WandbCallback(BaseCallback):
+            def __init__(self, log_every: int):
+                super().__init__()
+                self._log_every = int(log_every)
+                self._last_log_step = 0
+                self._ep_rewards = []
+                self._ep_lengths = []
+                self._ep_success = []
+                self._ep_stable_steps = []
+
             def _on_step(self) -> bool:
-                if self.n_calls % 1000 == 0:
-                    infos = self.locals.get("infos", [])
-                    ep_infos = [i for i in infos if "episode" in i]
-                    if ep_infos:
-                        mean_reward = float(np.mean([i["episode"]["r"] for i in ep_infos]))
-                        mean_length = float(np.mean([i["episode"]["l"] for i in ep_infos]))
-                        wandb.log({
-                            "episode/mean_reward":       mean_reward,
-                            "episode/mean_length":       mean_length,
-                            "rollout/ep_rew_mean":       mean_reward,
-                            "rollout/ep_len_mean":       mean_length,
-                            "episode/success_rate":      np.mean([i.get("success", 0.0) for i in ep_infos]),
-                            "episode/mean_stable_steps": np.mean([i.get("stable_steps", 0) for i in ep_infos]),
-                            "train/step": self.num_timesteps,
-                        }, step=self.num_timesteps)
+                infos = self.locals.get("infos", [])
+                ep_infos = [i for i in infos if "episode" in i]
+                for info in ep_infos:
+                    self._ep_rewards.append(float(info["episode"]["r"]))
+                    self._ep_lengths.append(float(info["episode"]["l"]))
+                    self._ep_success.append(float(info.get("success", 0.0)))
+                    self._ep_stable_steps.append(float(info.get("stable_steps", 0.0)))
+
+                if self.num_timesteps - self._last_log_step >= self._log_every:
+                    payload = {"train/step": self.num_timesteps}
+                    if self._ep_rewards:
+                        mean_reward = float(np.mean(self._ep_rewards))
+                        mean_length = float(np.mean(self._ep_lengths))
+                        payload.update({
+                            "episode/mean_reward": mean_reward,
+                            "episode/mean_length": mean_length,
+                            "episode/success_rate": float(np.mean(self._ep_success)),
+                            "episode/mean_stable_steps": float(np.mean(self._ep_stable_steps)),
+                            "rollout/ep_rew_mean": mean_reward,
+                            "rollout/ep_len_mean": mean_length,
+                            "rollout/episodes": len(self._ep_rewards),
+                        })
+                        self._ep_rewards.clear()
+                        self._ep_lengths.clear()
+                        self._ep_success.clear()
+                        self._ep_stable_steps.clear()
+                    wandb.log(payload, step=self.num_timesteps)
+                    self._last_log_step = self.num_timesteps
                 return True
 
         class SyncNormCallback(BaseCallback):
@@ -203,7 +230,7 @@ def main():
         wandb.define_metric("episode/*", step_metric="train/step")
         wandb.define_metric("rollout/*", step_metric="train/step")
         wandb.define_metric("eval/*", step_metric="train/step")
-        extra_callbacks = [WandbCallback(), SyncNormCallback(), WandbVideoCallback(video_freq=50_000)]
+        extra_callbacks = [WandbCallback(args.wandb_log_every), SyncNormCallback(), WandbVideoCallback(video_freq=50_000)]
     else:
         extra_callbacks = []
 

@@ -85,6 +85,7 @@ def make_env(config, id):
             prior_min_checkpoint_start_dist=getattr(config, "prior_min_checkpoint_start_dist", 0.02),
             prior_max_checkpoint_start_dist=getattr(config, "prior_max_checkpoint_start_dist", 0.12),
             prior_spawn_min_hole_margin=getattr(config, "prior_spawn_min_hole_margin", 0.02),
+            prior_start_point_spacing=getattr(config, "prior_start_point_spacing", 0.01),
             checkpoint_progress_reward_scale=getattr(config, "checkpoint_progress_reward_scale", 20.0),
             terminate_on_checkpoint_stabilized=getattr(config, "terminate_on_checkpoint_stabilized", False),
         )

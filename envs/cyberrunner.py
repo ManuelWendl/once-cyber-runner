@@ -1129,6 +1129,7 @@ class CyberRunnerEnv(gym.Env):
         prior_min_checkpoint_start_dist: float = 0.02,
         prior_max_checkpoint_start_dist: float = 0.12,
         prior_spawn_min_hole_margin: float = 0.02,
+        prior_start_point_spacing: float = 0.01,
         checkpoint_progress_reward_scale: float = 20.0,
         terminate_on_checkpoint_stabilized: bool = False,
     ):
@@ -1156,11 +1157,20 @@ class CyberRunnerEnv(gym.Env):
         self.prior_min_checkpoint_start_dist = prior_min_checkpoint_start_dist
         self.prior_max_checkpoint_start_dist = prior_max_checkpoint_start_dist
         self.prior_spawn_min_hole_margin = prior_spawn_min_hole_margin
+        self.prior_start_point_spacing = prior_start_point_spacing
         self.checkpoint_progress_reward_scale = checkpoint_progress_reward_scale
         self.terminate_on_checkpoint_stabilized = terminate_on_checkpoint_stabilized
 
         # Load maze layout
         self.walls_h, self.walls_v, self.holes, self.waypoints = get_hard_layout()
+        self._wall_starts = np.vstack([
+            np.stack([self.walls_h[:, 0], self.walls_h[:, 2]], axis=1),
+            np.stack([self.walls_v[:, 2], self.walls_v[:, 0]], axis=1),
+        ]).astype(np.float32)
+        self._wall_ends = np.vstack([
+            np.stack([self.walls_h[:, 1], self.walls_h[:, 2]], axis=1),
+            np.stack([self.walls_v[:, 2], self.walls_v[:, 1]], axis=1),
+        ]).astype(np.float32)
         self.checkpoint_points = select_safe_checkpoints(
             self.waypoints,
             self.holes,
@@ -1169,6 +1179,7 @@ class CyberRunnerEnv(gym.Env):
             self.reward_every_n_waypoints,
             include_corridors=self.checkpoint_include_corridors,
         )
+        self.prior_start_points = self._build_prior_start_points()
 
         # Precompute path data
         self.seg_lengths, self.cum_distances = compute_waypoint_distances(self.waypoints)
@@ -1241,6 +1252,38 @@ class CyberRunnerEnv(gym.Env):
         self._prev_checkpoint_dist = np.inf
         self._success = False
 
+    def _build_prior_start_points(self) -> np.ndarray:
+        """Dense set of recoverable start states for prior-mode resets."""
+        spacing = float(self.prior_start_point_spacing)
+        samples = [self.waypoints[0]]
+        for i in range(len(self.waypoints) - 1):
+            start = self.waypoints[i]
+            end = self.waypoints[i + 1]
+            seg = end - start
+            seg_len = float(np.linalg.norm(seg))
+            if seg_len < 1e-8:
+                continue
+            num = max(1, int(np.ceil(seg_len / spacing)))
+            ts = np.linspace(0.0, 1.0, num + 1, endpoint=False)[1:]
+            for t in ts:
+                samples.append((1.0 - t) * start + t * end)
+        samples.append(self.waypoints[-1])
+        candidates = np.asarray(samples, dtype=np.float32)
+
+        if len(self.checkpoint_points) == 0:
+            return candidates
+
+        dists = np.linalg.norm(candidates[:, None, :] - self.checkpoint_points[None, :, :], axis=2)
+        nearest_dists = dists.min(axis=1)
+        min_hole_dists = np.linalg.norm(candidates[:, None, :] - self.holes[None, :, :], axis=2).min(axis=1)
+        safe_mask = (
+            (nearest_dists >= self.prior_min_checkpoint_start_dist)
+            & (nearest_dists <= self.prior_max_checkpoint_start_dist)
+            & (min_hole_dists > (HOLE_RADIUS + self.prior_spawn_min_hole_margin))
+        )
+        filtered = candidates[safe_mask]
+        return filtered if len(filtered) else candidates
+
     def reset(
         self, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[np.ndarray, dict[str, Any]]:
@@ -1251,13 +1294,11 @@ class CyberRunnerEnv(gym.Env):
 
         # Set initial marble position
         if self.prior_mode:
-            all_waypoint_indices = np.arange(len(self.waypoints), dtype=np.int32)
-            sampled_waypoints = self.np_random.permutation(all_waypoint_indices)
+            sampled_points = self.prior_start_points[self.np_random.permutation(len(self.prior_start_points))]
             init_pos = None
             chosen_checkpoint_idx = None
 
-            for idx in sampled_waypoints:
-                candidate_pos = self.waypoints[int(idx)]
+            for candidate_pos in sampled_points:
                 dists = np.linalg.norm(self.checkpoint_points - candidate_pos[None], axis=1)
                 nearest_idx = int(np.argmin(dists))
                 nearest_dist = float(dists[nearest_idx])
@@ -1275,13 +1316,11 @@ class CyberRunnerEnv(gym.Env):
 
             if init_pos is None:
                 safe_candidates = []
-                for idx in sampled_waypoints:
-                    candidate_pos = self.waypoints[int(idx)]
+                for candidate_pos in sampled_points:
                     min_hole_dist = self._compute_min_hole_distance(candidate_pos)
                     if min_hole_dist > (HOLE_RADIUS + self.prior_spawn_min_hole_margin):
-                        safe_candidates.append(int(idx))
-                fallback_idx = safe_candidates[0] if safe_candidates else int(sampled_waypoints[0])
-                init_pos = self.waypoints[fallback_idx]
+                        safe_candidates.append(candidate_pos)
+                init_pos = safe_candidates[0] if safe_candidates else sampled_points[0]
                 dists = np.linalg.norm(self.checkpoint_points - init_pos[None], axis=1)
                 chosen_checkpoint_idx = int(np.argmin(dists))
 
@@ -1409,13 +1448,7 @@ class CyberRunnerEnv(gym.Env):
 
     def _min_wall_distance(self, ball_pos: np.ndarray) -> float:
         """Closest distance from ball center to any wall segment or board edge."""
-        h_starts = np.stack([self.walls_h[:, 0], self.walls_h[:, 2]], axis=1)
-        h_ends   = np.stack([self.walls_h[:, 1], self.walls_h[:, 2]], axis=1)
-        v_starts = np.stack([self.walls_v[:, 2], self.walls_v[:, 0]], axis=1)
-        v_ends   = np.stack([self.walls_v[:, 2], self.walls_v[:, 1]], axis=1)
-        starts = np.vstack([h_starts, v_starts])
-        ends   = np.vstack([h_ends,   v_ends])
-        wall_d = float(_point_to_segment_distance(ball_pos[None, :], starts, ends).min())
+        wall_d = float(_point_to_segment_distance(ball_pos[None, :], self._wall_starts, self._wall_ends).min())
         edge_d = float(min(ball_pos[0], BOARD_WIDTH - ball_pos[0],
                            ball_pos[1], BOARD_HEIGHT - ball_pos[1])) + WALL_RADIUS
         return min(wall_d, edge_d)
@@ -1556,10 +1589,12 @@ class CyberRunnerEnv(gym.Env):
                 # is strictly better than "stop anywhere else".
                 checkpoint_reward -= 0.1 * checkpoint_dist
             in_checkpoint = checkpoint_dist < self.checkpoint_radius
-            # Wall-contact: ball must be pressed against at least one wall to truly
-            # stabilize (safe checkpoints are defined at wall-contact positions).
-            wall_contact_dist = self._min_wall_distance(ball_pos)
-            touching_wall = wall_contact_dist < (WALL_RADIUS + MARBLE_RADIUS + 0.002)
+            # Wall-contact is only relevant once the ball is actually inside the
+            # checkpoint basin. Avoid the expensive wall-distance query elsewhere.
+            touching_wall = False
+            if in_checkpoint:
+                wall_contact_dist = self._min_wall_distance(ball_pos)
+                touching_wall = wall_contact_dist < (WALL_RADIUS + MARBLE_RADIUS + 0.002)
             stable_here = (
                 in_checkpoint
                 and touching_wall
@@ -1701,6 +1736,7 @@ class CyberRunner(gym.Env):
         prior_min_checkpoint_start_dist=0.02,
         prior_max_checkpoint_start_dist=0.12,
         prior_spawn_min_hole_margin=0.02,
+        prior_start_point_spacing=0.01,
         checkpoint_progress_reward_scale=20.0,
         terminate_on_checkpoint_stabilized=False,
     ):
@@ -1728,6 +1764,7 @@ class CyberRunner(gym.Env):
             prior_min_checkpoint_start_dist=prior_min_checkpoint_start_dist,
             prior_max_checkpoint_start_dist=prior_max_checkpoint_start_dist,
             prior_spawn_min_hole_margin=prior_spawn_min_hole_margin,
+            prior_start_point_spacing=prior_start_point_spacing,
             checkpoint_progress_reward_scale=checkpoint_progress_reward_scale,
             terminate_on_checkpoint_stabilized=terminate_on_checkpoint_stabilized,
         )
