@@ -9,20 +9,22 @@ train_ratio: 512
 time_limit: 500
 
 reward_every_n_waypoints: 3
-hole_penalty: 0.0
+hole_penalty: 3.0
 checkpoint_radius: 0.015
 checkpoint_hold_steps: 6
 checkpoint_speed_threshold: 0.05
 checkpoint_arrival_reward: 0.2
-checkpoint_stabilize_reward: 3.0
-checkpoint_hold_reward: 1.5
+checkpoint_stabilize_reward: 6.0
+checkpoint_hold_reward: 1.0
 safe_hole_margin: 0.004
 checkpoint_speed_ema_alpha: 0.8
 checkpoint_include_corridors: true
 prior_mode: true
+prior_task: stabilize
+prior_spawn_source: waypoints
 prior_start_waypoint_window: 3
-prior_init_ball_speed: 0.15
-prior_init_tilt_frac: 0.2
+prior_init_ball_speed: 0.2
+prior_init_tilt_frac: 0.25
 prior_min_checkpoint_start_dist: 0.02
 prior_max_checkpoint_start_dist: 0.12
 prior_spawn_min_hole_margin: 0.012

@@ -79,6 +79,8 @@ def make_env(config, id):
             checkpoint_speed_ema_alpha=config.checkpoint_speed_ema_alpha,
             checkpoint_include_corridors=getattr(config, "checkpoint_include_corridors", True),
             prior_mode=getattr(config, "prior_mode", False),
+            prior_task=getattr(config, "prior_task", "checkpoint"),
+            prior_spawn_source=getattr(config, "prior_spawn_source", "dense_path"),
             prior_start_waypoint_window=getattr(config, "prior_start_waypoint_window", 3),
             prior_init_ball_speed=getattr(config, "prior_init_ball_speed", 0.0),
             prior_init_tilt_frac=getattr(config, "prior_init_tilt_frac", 0.0),

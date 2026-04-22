@@ -1,0 +1,122 @@
+_wandb:
+    value:
+        cli_version: 0.25.1
+        e:
+            0i2d54mr1rplq4kocqkpfgfq1cfclsvn:
+                apple:
+                    ecpuCores: 4
+                    gpuCores: 10
+                    memoryGb: 8
+                    name: Apple M2
+                    pcpuCores: 4
+                    ramTotalBytes: "8589934592"
+                    swapTotalBytes: "7516192768"
+                args:
+                    - --logdir
+                    - logdir/ppo_prior_stabilize
+                    - --steps
+                    - "6000000"
+                    - --wandb_project
+                    - cyberrunner-safe-exploration
+                    - --wandb_entity
+                    - filippostaffoni-eth-z-rich
+                    - --checkpoint_mode
+                    - corners
+                    - --prior_task
+                    - stabilize
+                    - --prior_spawn_source
+                    - waypoints
+                    - --wandb_log_every
+                    - "10000"
+                    - --robust_eval_every
+                    - "50000"
+                    - --robust_eval_repeats
+                    - "3"
+                    - --robust_eval_max_spawns
+                    - "32"
+                codePath: train_ppo.py
+                codePathLocal: train_ppo.py
+                cpu_count: 8
+                cpu_count_logical: 8
+                disk:
+                    /:
+                        total: "494384795648"
+                        used: "478783463424"
+                email: Filippostaffoni@hotmail.it
+                executable: /opt/anaconda3/envs/cyberrunner/bin/python
+                git:
+                    commit: 4cdbbdd3a6302174e9a2290028692555d14ea494
+                    remote: https://github.com/danielerussica/efficient-exploration-for-cyberrunner-pmlr.git
+                host: student-net-lee-3262.intern.ethz.ch
+                memory:
+                    total: "8589934592"
+                os: macOS-15.6.1-arm64-arm-64bit
+                program: /Users/filippostaffoni/Documents/efficient-exploration-for-cyberrunner-pmlr/train_ppo.py
+                python: CPython 3.11.15
+                root: /Users/filippostaffoni/Documents/efficient-exploration-for-cyberrunner-pmlr
+                startedAt: "2026-04-21T16:29:04.391361Z"
+                writerId: 0i2d54mr1rplq4kocqkpfgfq1cfclsvn
+        m:
+            - "1": train/step
+              "6":
+                - 3
+              "7": []
+            - "2": episode/*
+              "5": 1
+              "6":
+                - 1
+              "7": []
+            - "2": rollout/*
+              "5": 1
+              "6":
+                - 1
+              "7": []
+            - "2": eval/*
+              "5": 1
+              "6":
+                - 1
+              "7": []
+        python_version: 3.11.15
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 7
+                - 16
+                - 61
+            "4": 3.11.15
+            "5": 0.25.1
+            "12": 0.25.1
+            "13": darwin-arm64
+checkpoint_mode:
+    value: corners
+logdir:
+    value: logdir/ppo_prior_stabilize
+n_envs:
+    value: 16
+n_stack:
+    value: 4
+prior_spawn_source:
+    value: waypoints
+prior_task:
+    value: stabilize
+progress_scale:
+    value: 2
+robust_eval_every:
+    value: 50000
+robust_eval_max_spawns:
+    value: 32
+robust_eval_repeats:
+    value: 3
+seed:
+    value: 0
+steps:
+    value: 6000000
+wandb_entity:
+    value: filippostaffoni-eth-z-rich
+wandb_log_every:
+    value: 10000
+wandb_project:
+    value: cyberrunner-safe-exploration

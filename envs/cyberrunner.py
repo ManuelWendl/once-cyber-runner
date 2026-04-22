@@ -1123,6 +1123,8 @@ class CyberRunnerEnv(gym.Env):
         checkpoint_speed_ema_alpha: float = 0.8,
         checkpoint_include_corridors: bool = True,
         prior_mode: bool = False,
+        prior_task: str = "checkpoint",
+        prior_spawn_source: str = "dense_path",
         prior_start_waypoint_window: int = 3,
         prior_init_ball_speed: float = 0.0,
         prior_init_tilt_frac: float = 0.0,
@@ -1152,6 +1154,8 @@ class CyberRunnerEnv(gym.Env):
         self.checkpoint_speed_ema_alpha = checkpoint_speed_ema_alpha
         self.checkpoint_include_corridors = checkpoint_include_corridors
         self.prior_mode = prior_mode
+        self.prior_task = prior_task
+        self.prior_spawn_source = prior_spawn_source
         self.prior_start_waypoint_window = prior_start_waypoint_window
         self.prior_init_ball_speed = prior_init_ball_speed
         self.prior_init_tilt_frac = prior_init_tilt_frac
@@ -1255,34 +1259,38 @@ class CyberRunnerEnv(gym.Env):
         self._success = False
 
     def _build_prior_start_points(self) -> np.ndarray:
-        """Dense set of recoverable start states for prior-mode resets."""
-        spacing = float(self.prior_start_point_spacing)
-        samples = [self.waypoints[0]]
-        for i in range(len(self.waypoints) - 1):
-            start = self.waypoints[i]
-            end = self.waypoints[i + 1]
-            seg = end - start
-            seg_len = float(np.linalg.norm(seg))
-            if seg_len < 1e-8:
-                continue
-            num = max(1, int(np.ceil(seg_len / spacing)))
-            ts = np.linspace(0.0, 1.0, num + 1, endpoint=False)[1:]
-            for t in ts:
-                samples.append((1.0 - t) * start + t * end)
-        samples.append(self.waypoints[-1])
-        candidates = np.asarray(samples, dtype=np.float32)
+        """Recoverable start states for prior-mode resets."""
+        if self.prior_spawn_source == "waypoints":
+            candidates = np.asarray(self.waypoints, dtype=np.float32)
+        else:
+            spacing = float(self.prior_start_point_spacing)
+            samples = [self.waypoints[0]]
+            for i in range(len(self.waypoints) - 1):
+                start = self.waypoints[i]
+                end = self.waypoints[i + 1]
+                seg = end - start
+                seg_len = float(np.linalg.norm(seg))
+                if seg_len < 1e-8:
+                    continue
+                num = max(1, int(np.ceil(seg_len / spacing)))
+                ts = np.linspace(0.0, 1.0, num + 1, endpoint=False)[1:]
+                for t in ts:
+                    samples.append((1.0 - t) * start + t * end)
+            samples.append(self.waypoints[-1])
+            candidates = np.asarray(samples, dtype=np.float32)
 
         if len(self.checkpoint_points) == 0:
             return candidates
 
-        dists = np.linalg.norm(candidates[:, None, :] - self.checkpoint_points[None, :, :], axis=2)
-        nearest_dists = dists.min(axis=1)
         min_hole_dists = np.linalg.norm(candidates[:, None, :] - self.holes[None, :, :], axis=2).min(axis=1)
-        safe_mask = (
-            (nearest_dists >= self.prior_min_checkpoint_start_dist)
-            & (nearest_dists <= self.prior_max_checkpoint_start_dist)
-            & (min_hole_dists > (HOLE_RADIUS + self.prior_spawn_min_hole_margin))
-        )
+        safe_mask = min_hole_dists > (HOLE_RADIUS + self.prior_spawn_min_hole_margin)
+        if self.prior_task == "checkpoint":
+            dists = np.linalg.norm(candidates[:, None, :] - self.checkpoint_points[None, :, :], axis=2)
+            nearest_dists = dists.min(axis=1)
+            safe_mask &= (
+                (nearest_dists >= self.prior_min_checkpoint_start_dist)
+                & (nearest_dists <= self.prior_max_checkpoint_start_dist)
+            )
         filtered = candidates[safe_mask]
         if not len(filtered):
             return candidates
@@ -1329,6 +1337,10 @@ class CyberRunnerEnv(gym.Env):
                 recoverable_from_holes = (
                     min_hole_dist > (HOLE_RADIUS + self.prior_spawn_min_hole_margin)
                 )
+                if self.prior_task != "checkpoint":
+                    init_pos = candidate_pos
+                    chosen_checkpoint_idx = nearest_idx
+                    break
                 if (
                     self.prior_min_checkpoint_start_dist <= nearest_dist <= self.prior_max_checkpoint_start_dist
                     and recoverable_from_holes
@@ -1572,6 +1584,9 @@ class CyberRunnerEnv(gym.Env):
         if active_checkpoint is None:
             checkpoint_vec = np.zeros(2, dtype=np.float32)
             checkpoint_dist = 0.0
+        elif self.prior_mode and self.prior_task == "stabilize":
+            checkpoint_vec = np.zeros(2, dtype=np.float32)
+            checkpoint_dist = 0.0
         else:
             checkpoint_vec = active_checkpoint - ball_pos_noisy
             checkpoint_dist = float(np.linalg.norm(checkpoint_vec))
@@ -1596,6 +1611,31 @@ class CyberRunnerEnv(gym.Env):
 
     def _compute_reward(self, ball_pos: np.ndarray, curr_progress: float, seg_idx: int) -> float:
         """Stabilized frontier checkpoints + goal bonus + hole penalty."""
+        if self.prior_mode and self.prior_task == "stabilize":
+            touching_wall = self._min_wall_distance(ball_pos) < (WALL_RADIUS + MARBLE_RADIUS + 0.002)
+            safe_enough = self._min_hole_distance > (HOLE_RADIUS + self.safe_hole_margin)
+            stable_here = touching_wall and safe_enough and self._ball_speed < self.checkpoint_speed_threshold
+            safe_margin = max(self._min_hole_distance - (HOLE_RADIUS + self.safe_hole_margin), 0.0)
+
+            reward = -0.05 * self._ball_speed + 2.0 * min(safe_margin, 0.02)
+            if touching_wall:
+                reward += 0.05
+            if stable_here:
+                self._stable_steps += 1
+                reward += self.checkpoint_hold_reward
+            else:
+                self._stable_steps = 0
+
+            if self._stable_steps >= self.checkpoint_hold_steps:
+                reward += self.checkpoint_stabilize_reward
+                self._success = True
+                self._stable_steps = 0
+
+            hole_reward = -self.hole_penalty if self._min_hole_distance < HOLE_RADIUS else 0.0
+            self._in_checkpoint_prev = False
+            self._prev_checkpoint_dist = np.inf
+            return reward + hole_reward
+
         checkpoint_reward = 0.0
         active_checkpoint = self._get_active_checkpoint_waypoint()
         in_checkpoint = False
@@ -1677,7 +1717,9 @@ class CyberRunnerEnv(gym.Env):
 
         if self.terminate_on_checkpoint_stabilized and self._success:
             terminated = True
-            info["termination_reason"] = "checkpoint"
+            info["termination_reason"] = (
+                "stabilized" if self.prior_mode and self.prior_task == "stabilize" else "checkpoint"
+            )
 
         # Check timeout
         if self._step_count >= self.episode_length:
@@ -1753,6 +1795,8 @@ class CyberRunner(gym.Env):
         checkpoint_speed_ema_alpha=0.8,
         checkpoint_include_corridors=True,
         prior_mode=False,
+        prior_task="checkpoint",
+        prior_spawn_source="dense_path",
         prior_start_waypoint_window=3,
         prior_init_ball_speed=0.0,
         prior_init_tilt_frac=0.0,
@@ -1782,6 +1826,8 @@ class CyberRunner(gym.Env):
             checkpoint_speed_ema_alpha=checkpoint_speed_ema_alpha,
             checkpoint_include_corridors=checkpoint_include_corridors,
             prior_mode=prior_mode,
+            prior_task=prior_task,
+            prior_spawn_source=prior_spawn_source,
             prior_start_waypoint_window=prior_start_waypoint_window,
             prior_init_ball_speed=prior_init_ball_speed,
             prior_init_tilt_frac=prior_init_tilt_frac,

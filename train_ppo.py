@@ -19,6 +19,8 @@ def make_prior_env(
     render_mode: str | None = None,
     progress_scale: float = 2.0,
     include_corridors: bool = True,
+    prior_task: str = "stabilize",
+    prior_spawn_source: str = "waypoints",
 ):
     from envs.cyberrunner import CyberRunnerEnv
 
@@ -28,20 +30,22 @@ def make_prior_env(
         randomize_init_pos=False,
         include_vision=False,
         reward_every_n_waypoints=3,
-        hole_penalty=0.0,
+        hole_penalty=3.0,
         checkpoint_radius=0.015,
         checkpoint_hold_steps=6,
         checkpoint_speed_threshold=0.05,
         checkpoint_arrival_reward=0.0,
-        checkpoint_stabilize_reward=3.0,
-        checkpoint_hold_reward=1.5,
+        checkpoint_stabilize_reward=6.0,
+        checkpoint_hold_reward=1.0,
         safe_hole_margin=0.004,
         checkpoint_speed_ema_alpha=0.8,
         checkpoint_include_corridors=include_corridors,
         prior_mode=True,
+        prior_task=prior_task,
+        prior_spawn_source=prior_spawn_source,
         prior_start_waypoint_window=3,
-        prior_init_ball_speed=0.15,
-        prior_init_tilt_frac=0.2,
+        prior_init_ball_speed=0.2,
+        prior_init_tilt_frac=0.25,
         prior_min_checkpoint_start_dist=0.02,
         prior_max_checkpoint_start_dist=0.12,
         prior_spawn_min_hole_margin=0.012,
@@ -88,6 +92,18 @@ def main():
         default="corners_and_corridors",
         choices=["corners", "corners_and_corridors"],
     )
+    parser.add_argument(
+        "--prior_task",
+        type=str,
+        default="stabilize",
+        choices=["checkpoint", "stabilize"],
+    )
+    parser.add_argument(
+        "--prior_spawn_source",
+        type=str,
+        default="waypoints",
+        choices=["waypoints", "dense_path"],
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_entity", type=str, default=None)
@@ -118,6 +134,8 @@ def main():
     env_kwargs = {
         "progress_scale": args.progress_scale,
         "include_corridors": args.checkpoint_mode == "corners_and_corridors",
+        "prior_task": args.prior_task,
+        "prior_spawn_source": args.prior_spawn_source,
     }
 
     vec_env = VecNormalize(
@@ -148,6 +166,17 @@ def main():
                 self._ep_lengths = []
                 self._ep_success = []
                 self._ep_stable_steps = []
+                self._ep_checkpoint_dist = []
+                self._ep_ball_speed = []
+                self._ep_safe_hole_margin = []
+                self._termination_counts = {
+                    "stabilized": 0,
+                    "checkpoint": 0,
+                    "hole": 0,
+                    "timeout": 0,
+                    "goal": 0,
+                    "other": 0,
+                }
 
             def _on_step(self) -> bool:
                 infos = self.locals.get("infos", [])
@@ -157,6 +186,13 @@ def main():
                     self._ep_lengths.append(float(info["episode"]["l"]))
                     self._ep_success.append(float(info.get("success", 0.0)))
                     self._ep_stable_steps.append(float(info.get("stable_steps", 0.0)))
+                    self._ep_checkpoint_dist.append(float(info.get("checkpoint_dist", np.nan)))
+                    self._ep_ball_speed.append(float(info.get("ball_speed", np.nan)))
+                    self._ep_safe_hole_margin.append(float(info.get("safe_hole_margin", np.nan)))
+                    reason = str(info.get("termination_reason", "other"))
+                    if reason not in self._termination_counts:
+                        reason = "other"
+                    self._termination_counts[reason] += 1
 
                 if self.num_timesteps - self._last_log_step >= self._log_every:
                     payload = {"train/step": self.num_timesteps}
@@ -165,28 +201,47 @@ def main():
                         mean_length = float(np.mean(self._ep_lengths))
                         mean_success = float(np.mean(self._ep_success))
                         mean_stable = float(np.mean(self._ep_stable_steps))
+                        mean_checkpoint_dist = float(np.nanmean(self._ep_checkpoint_dist))
+                        mean_ball_speed = float(np.nanmean(self._ep_ball_speed))
+                        mean_safe_margin = float(np.nanmean(self._ep_safe_hole_margin))
+                        total_eps = len(self._ep_rewards)
                         payload.update({
                             "episode/mean_reward": mean_reward,
                             "episode/mean_length": mean_length,
                             "episode/success_rate": mean_success,
                             "episode/mean_stable_steps": mean_stable,
+                            "episode/mean_checkpoint_dist": mean_checkpoint_dist,
+                            "episode/mean_ball_speed": mean_ball_speed,
+                            "episode/mean_safe_hole_margin": mean_safe_margin,
                             "rollout/ep_rew_mean": mean_reward,
                             "rollout/ep_len_mean": mean_length,
-                            "rollout/episodes": len(self._ep_rewards),
+                            "rollout/episodes": total_eps,
+                            "rollout/final_checkpoint_dist_mean": mean_checkpoint_dist,
+                            "rollout/final_ball_speed_mean": mean_ball_speed,
+                            "rollout/final_safe_hole_margin_mean": mean_safe_margin,
                         })
+                        for reason, count in self._termination_counts.items():
+                            payload[f"episode/termination_{reason}_rate"] = float(count / max(total_eps, 1))
                         print(
                             f"[step {self.num_timesteps}] "
                             f"ep_rew_mean={mean_reward:.3f} "
                             f"ep_len_mean={mean_length:.1f} "
                             f"success_rate={mean_success:.3f} "
                             f"stable_steps={mean_stable:.2f} "
-                            f"episodes={len(self._ep_rewards)}",
+                            f"final_ball_speed={mean_ball_speed:.3f} "
+                            f"final_safe_margin={mean_safe_margin:.3f} "
+                            f"episodes={total_eps}",
                             flush=True,
                         )
                         self._ep_rewards.clear()
                         self._ep_lengths.clear()
                         self._ep_success.clear()
                         self._ep_stable_steps.clear()
+                        self._ep_checkpoint_dist.clear()
+                        self._ep_ball_speed.clear()
+                        self._ep_safe_hole_margin.clear()
+                        for key in self._termination_counts:
+                            self._termination_counts[key] = 0
                     wandb.log(payload, step=self.num_timesteps)
                     self._last_log_step = self.num_timesteps
                 return True
@@ -215,6 +270,7 @@ def main():
                         render_mode="rgb_array",
                         progress_scale=args.progress_scale,
                         include_corridors=args.checkpoint_mode == "corners_and_corridors",
+                        prior_task=args.prior_task,
                     )
                     buf = deque([np.zeros(13, dtype=np.float32)] * args.n_stack, maxlen=args.n_stack)
                     raw_obs, _ = env.reset(seed=self.num_timesteps)
@@ -248,6 +304,7 @@ def main():
                     render_mode=None,
                     progress_scale=args.progress_scale,
                     include_corridors=args.checkpoint_mode == "corners_and_corridors",
+                    prior_task=args.prior_task,
                 )
                 raw_spawns = np.asarray(self._eval_env.unwrapped.prior_start_points, dtype=np.float32)
                 if len(raw_spawns) > self._max_spawns > 0:
@@ -278,6 +335,8 @@ def main():
                     "success": float(final_info.get("success", 0.0)),
                     "stable_steps": float(final_info.get("stable_steps", 0.0)),
                     "checkpoint_dist": float(final_info.get("checkpoint_dist", np.nan)),
+                    "ball_speed": float(final_info.get("ball_speed", np.nan)),
+                    "safe_hole_margin": float(final_info.get("safe_hole_margin", np.nan)),
                     "reward": total_reward,
                 }
 
@@ -290,6 +349,8 @@ def main():
                 per_spawn_reward = []
                 per_spawn_dist = []
                 per_spawn_stable = []
+                per_spawn_speed = []
+                per_spawn_margin = []
                 for spawn_idx, spawn_point in enumerate(self._spawn_bank):
                     spawn_results = [
                         self._run_episode(
@@ -302,11 +363,15 @@ def main():
                     per_spawn_reward.append(float(np.mean([r["reward"] for r in spawn_results])))
                     per_spawn_dist.append(float(np.mean([r["checkpoint_dist"] for r in spawn_results])))
                     per_spawn_stable.append(float(np.mean([r["stable_steps"] for r in spawn_results])))
+                    per_spawn_speed.append(float(np.mean([r["ball_speed"] for r in spawn_results])))
+                    per_spawn_margin.append(float(np.mean([r["safe_hole_margin"] for r in spawn_results])))
 
                 success_arr = np.asarray(per_spawn_success, dtype=np.float32)
                 reward_arr = np.asarray(per_spawn_reward, dtype=np.float32)
                 dist_arr = np.asarray(per_spawn_dist, dtype=np.float32)
                 stable_arr = np.asarray(per_spawn_stable, dtype=np.float32)
+                speed_arr = np.asarray(per_spawn_speed, dtype=np.float32)
+                margin_arr = np.asarray(per_spawn_margin, dtype=np.float32)
                 payload = {
                     "train/step": self.num_timesteps,
                     "eval/spawn_success_rate_mean": float(success_arr.mean()),
@@ -316,6 +381,8 @@ def main():
                     "eval/spawn_reward_mean": float(reward_arr.mean()),
                     "eval/spawn_checkpoint_dist_mean": float(dist_arr.mean()),
                     "eval/spawn_stable_steps_mean": float(stable_arr.mean()),
+                    "eval/spawn_ball_speed_mean": float(speed_arr.mean()),
+                    "eval/spawn_safe_hole_margin_mean": float(margin_arr.mean()),
                     "eval/spawn_count": int(len(success_arr)),
                     "eval/episodes_per_spawn": int(self._repeats),
                 }
