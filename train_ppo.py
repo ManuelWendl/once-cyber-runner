@@ -30,12 +30,12 @@ def make_prior_env(
         randomize_init_pos=False,
         include_vision=False,
         reward_every_n_waypoints=3,
-        hole_penalty=3.0,
+        hole_penalty=10.0,
         checkpoint_radius=0.015,
         checkpoint_hold_steps=6,
         checkpoint_speed_threshold=0.05,
         checkpoint_arrival_reward=0.0,
-        checkpoint_stabilize_reward=6.0,
+        checkpoint_stabilize_reward=10.0,
         checkpoint_hold_reward=1.0,
         safe_hole_margin=0.004,
         checkpoint_speed_ema_alpha=0.8,
@@ -169,6 +169,7 @@ def main():
                 self._ep_checkpoint_dist = []
                 self._ep_ball_speed = []
                 self._ep_safe_hole_margin = []
+                self._ep_prior_target_dist = []
                 self._termination_counts = {
                     "stabilized": 0,
                     "checkpoint": 0,
@@ -189,6 +190,7 @@ def main():
                     self._ep_checkpoint_dist.append(float(info.get("checkpoint_dist", np.nan)))
                     self._ep_ball_speed.append(float(info.get("ball_speed", np.nan)))
                     self._ep_safe_hole_margin.append(float(info.get("safe_hole_margin", np.nan)))
+                    self._ep_prior_target_dist.append(float(info.get("prior_target_dist", np.nan)))
                     reason = str(info.get("termination_reason", "other"))
                     if reason not in self._termination_counts:
                         reason = "other"
@@ -204,6 +206,7 @@ def main():
                         mean_checkpoint_dist = float(np.nanmean(self._ep_checkpoint_dist))
                         mean_ball_speed = float(np.nanmean(self._ep_ball_speed))
                         mean_safe_margin = float(np.nanmean(self._ep_safe_hole_margin))
+                        mean_prior_target_dist = float(np.nanmean(self._ep_prior_target_dist))
                         total_eps = len(self._ep_rewards)
                         payload.update({
                             "episode/mean_reward": mean_reward,
@@ -213,12 +216,14 @@ def main():
                             "episode/mean_checkpoint_dist": mean_checkpoint_dist,
                             "episode/mean_ball_speed": mean_ball_speed,
                             "episode/mean_safe_hole_margin": mean_safe_margin,
+                            "episode/mean_prior_target_dist": mean_prior_target_dist,
                             "rollout/ep_rew_mean": mean_reward,
                             "rollout/ep_len_mean": mean_length,
                             "rollout/episodes": total_eps,
                             "rollout/final_checkpoint_dist_mean": mean_checkpoint_dist,
                             "rollout/final_ball_speed_mean": mean_ball_speed,
                             "rollout/final_safe_hole_margin_mean": mean_safe_margin,
+                            "rollout/final_prior_target_dist_mean": mean_prior_target_dist,
                         })
                         for reason, count in self._termination_counts.items():
                             payload[f"episode/termination_{reason}_rate"] = float(count / max(total_eps, 1))
@@ -240,6 +245,7 @@ def main():
                         self._ep_checkpoint_dist.clear()
                         self._ep_ball_speed.clear()
                         self._ep_safe_hole_margin.clear()
+                        self._ep_prior_target_dist.clear()
                         for key in self._termination_counts:
                             self._termination_counts[key] = 0
                     wandb.log(payload, step=self.num_timesteps)

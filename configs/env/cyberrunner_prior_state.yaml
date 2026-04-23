@@ -9,12 +9,12 @@ train_ratio: 512
 time_limit: 500
 
 reward_every_n_waypoints: 3
-hole_penalty: 3.0
+hole_penalty: 10.0
 checkpoint_radius: 0.015
 checkpoint_hold_steps: 6
 checkpoint_speed_threshold: 0.05
 checkpoint_arrival_reward: 0.2
-checkpoint_stabilize_reward: 6.0
+checkpoint_stabilize_reward: 10.0
 checkpoint_hold_reward: 1.0
 safe_hole_margin: 0.004
 checkpoint_speed_ema_alpha: 0.8

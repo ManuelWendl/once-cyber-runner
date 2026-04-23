@@ -1,0 +1,14 @@
+# Additional GPU dependencies on top of the shared r2dreamer_env.
+# Install into a PERSONAL conda env cloned from the team env:
+#   conda create -p $HOME/envs/cyberrunner_gpu \
+#       --clone /cluster/courses/pmlr/teams/team06/r2dreamer_env
+#   conda activate $HOME/envs/cyberrunner_gpu
+#   pip install -r requirements-gpu.txt
+#
+# Do NOT install these into the shared team env.
+
+jax[cuda12]>=0.4.30
+mujoco-mjx>=3.3.0
+brax>=0.10.5
+flax>=0.8.0
+optax>=0.2.0

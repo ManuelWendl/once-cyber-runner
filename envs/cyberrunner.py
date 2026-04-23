@@ -398,7 +398,7 @@ def select_safe_checkpoints(
 
     is_corner = (
         (close_up | close_down) & (close_right | close_left)
-        & ~in_h_corridor & ~in_v_corridor
+        & ~(in_h_corridor & in_v_corridor)
     )
     # Single-wall: nearly touching exactly one wall family (H or V), not sandwiched
     sw_up    = gap_up    < single_wall_slack
@@ -1185,6 +1185,23 @@ class CyberRunnerEnv(gym.Env):
             self.reward_every_n_waypoints,
             include_corridors=self.checkpoint_include_corridors,
         )
+        # Corner-only safe checkpoints for the prior's stabilization target.
+        # Strict corners (two perpendicular wall supports) only — no single-wall
+        # or corridor fallbacks — so the target is always a geometrically robust
+        # resting spot.
+        self._corner_points = select_safe_checkpoints(
+            self.waypoints,
+            self.holes,
+            self.walls_h,
+            self.walls_v,
+            self.reward_every_n_waypoints,
+            include_corridors=False,
+        )
+        if len(self._corner_points) == 0:
+            # Fallback so the prior target assignment never crashes.
+            self._corner_points = self.checkpoint_points
+        corner_progress_raw, _ = _project_points_to_path(self._corner_points, self.waypoints)
+        self._corner_progresses = corner_progress_raw.astype(np.float32) * 10.0
         self.prior_start_points = self._build_prior_start_points()
 
         # Precompute path data
@@ -1257,6 +1274,8 @@ class CyberRunnerEnv(gym.Env):
         self._prev_ball_pos_noisy = np.zeros(2, dtype=np.float32)
         self._prev_checkpoint_dist = np.inf
         self._success = False
+        self._prior_target = np.zeros(2, dtype=np.float32)
+        self._prior_phi_prev = 0.0
 
     def _build_prior_start_points(self) -> np.ndarray:
         """Recoverable start states for prior-mode resets."""
@@ -1428,6 +1447,29 @@ class CyberRunnerEnv(gym.Env):
         )
         self._path_detected = self._prev_progress >= 0
 
+        # Prior stabilize target: nearest strict corner at-or-behind the ball's
+        # spawn progress. Forward targets would let the prior advance the
+        # frontier (i.e. do exploration), which SOOPER reserves for Dreamer.
+        if self.prior_mode and self.prior_task == "stabilize":
+            ball_progress = float(self._prev_progress) if self._prev_progress >= 0 else 0.0
+            eps = 0.005  # float tolerance for "at current progress"
+            backward_mask = self._corner_progresses <= (ball_progress + eps)
+            if backward_mask.any():
+                candidates = self._corner_points[backward_mask]
+                candidate_progresses = self._corner_progresses[backward_mask]
+                progress_gap = ball_progress - candidate_progresses
+            else:
+                candidates = self._corner_points
+                progress_gap = np.abs(self._corner_progresses - ball_progress)
+            self._prior_target = candidates[int(np.argmin(progress_gap))].astype(np.float32)
+            self._prior_phi_prev = float(
+                -5.0 * float(np.linalg.norm(ball_pos - self._prior_target))
+                - 0.5 * self._ball_speed
+            )
+        else:
+            self._prior_target = np.zeros(2, dtype=np.float32)
+            self._prior_phi_prev = 0.0
+
         obs = self._get_obs()
         info = self._build_info(ball_pos, self._prev_progress)
 
@@ -1500,6 +1542,10 @@ class CyberRunnerEnv(gym.Env):
             if active_checkpoint is not None
             else np.inf
         )
+        if self.prior_mode and self.prior_task == "stabilize":
+            prior_target_dist = float(np.linalg.norm(ball_pos - self._prior_target))
+        else:
+            prior_target_dist = float("nan")
         return {
             "path_progress": float(curr_progress),
             "checkpoint_dist": checkpoint_dist,
@@ -1511,6 +1557,7 @@ class CyberRunnerEnv(gym.Env):
             "unlocked_checkpoint_idx": int(self._max_checkpoint_reached),
             "stable_steps": int(self._stable_steps),
             "success": float(self._success),
+            "prior_target_dist": prior_target_dist,
             "log_path_progress": np.array([curr_progress], dtype=np.float32),
             "log_checkpoint_dist": np.array([checkpoint_dist], dtype=np.float32),
             "log_ball_speed": np.array([self._ball_speed], dtype=np.float32),
@@ -1521,6 +1568,7 @@ class CyberRunnerEnv(gym.Env):
             "log_unlocked_checkpoint_idx": np.array([self._max_checkpoint_reached], dtype=np.float32),
             "log_stable_steps": np.array([self._stable_steps], dtype=np.float32),
             "log_success": np.array([float(self._success)], dtype=np.float32),
+            "log_prior_target_dist": np.array([prior_target_dist], dtype=np.float32),
         }
 
     def _get_ball_pos_board_frame(self) -> np.ndarray:
@@ -1581,10 +1629,10 @@ class CyberRunnerEnv(gym.Env):
         ).astype(np.float32)
 
         active_checkpoint = self._get_active_checkpoint_waypoint()
-        if active_checkpoint is None:
-            checkpoint_vec = np.zeros(2, dtype=np.float32)
-            checkpoint_dist = 0.0
-        elif self.prior_mode and self.prior_task == "stabilize":
+        if self.prior_mode and self.prior_task == "stabilize":
+            checkpoint_vec = self._prior_target - ball_pos_noisy
+            checkpoint_dist = float(np.linalg.norm(checkpoint_vec))
+        elif active_checkpoint is None:
             checkpoint_vec = np.zeros(2, dtype=np.float32)
             checkpoint_dist = 0.0
         else:
@@ -1612,17 +1660,23 @@ class CyberRunnerEnv(gym.Env):
     def _compute_reward(self, ball_pos: np.ndarray, curr_progress: float, seg_idx: int) -> float:
         """Stabilized frontier checkpoints + goal bonus + hole penalty."""
         if self.prior_mode and self.prior_task == "stabilize":
+            # Potential-based shaping: φ(s) = −k_d·‖ball − target‖ − k_v·speed.
+            # Δφ is policy-invariant so dense terms cannot accumulate into a
+            # free positive return (the bug of the previous reward design).
+            k_d, k_v = 5.0, 0.5
+            dist_to_target = float(np.linalg.norm(ball_pos - self._prior_target))
+            phi = -k_d * dist_to_target - k_v * self._ball_speed
+            delta_phi = phi - self._prior_phi_prev
+            self._prior_phi_prev = phi
+
             touching_wall = self._min_wall_distance(ball_pos) < (WALL_RADIUS + MARBLE_RADIUS + 0.002)
             safe_enough = self._min_hole_distance > (HOLE_RADIUS + self.safe_hole_margin)
             stable_here = touching_wall and safe_enough and self._ball_speed < self.checkpoint_speed_threshold
-            safe_margin = max(self._min_hole_distance - (HOLE_RADIUS + self.safe_hole_margin), 0.0)
 
-            reward = -0.05 * self._ball_speed + 2.0 * min(safe_margin, 0.02)
-            if touching_wall:
-                reward += 0.05
+            reward = -0.01 + delta_phi  # time cost + shaping
+
             if stable_here:
                 self._stable_steps += 1
-                reward += self.checkpoint_hold_reward
             else:
                 self._stable_steps = 0
 

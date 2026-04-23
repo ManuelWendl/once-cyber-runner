@@ -7,6 +7,19 @@ models/
 out/
 *.db
 
+# Weights & Biases
+wandb/
+*.wandb
+
+# Visualizations / generated figures
+visualizations/*.png
+visualizations/*.pdf
+visualizations/*.mp4
+visualizations/*.heic*
+visualizations/unc_heatmaps/
+eval_videos/
+nohup.out
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
