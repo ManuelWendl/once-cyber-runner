@@ -86,14 +86,36 @@ def main() -> None:
         eval_counter["n"] += 1
         flat = {k: float(v) for k, v in metrics.items() if _is_scalar(v)}
 
-        # Human summary on stdout (concise).
         def _get(k: str, d: float = float("nan")) -> float:
             return flat.get(k, d)
+
+        # Brax's EpisodeWrapper reports per-step metrics SUMMED over the
+        # episode. Convert to interpretable fractions/averages using the
+        # average episode length.
+        ep_len = _get("eval/avg_episode_length")
+        ep_len_safe = ep_len if (ep_len and ep_len > 0) else float("nan")
+        ep_len_cap = float(args.episode_length)
+
+        reward_sum = _get("eval/episode_reward")
+        success_sum = _get("eval/episode_success")
+        stable_sum = _get("eval/episode_stable_steps")
+
+        # Per-step reward (max achievable ~ k_v·v_max + k_m·m_max = 1.5).
+        reward_per_step = reward_sum / ep_len_safe
+        # Fraction of episode spent in success (sticky flag) state.
+        success_frac = success_sum / ep_len_safe
+        # Avg value of the running stable_steps counter during the episode.
+        stable_avg = stable_sum / ep_len_safe
+        # Fraction of max episode length actually survived. Rises toward 1.0
+        # once the agent stops falling in holes.
+        length_frac = ep_len / ep_len_cap if ep_len == ep_len else float("nan")
+
+        # Human summary on stdout (interpretable, not raw Brax sums).
         summary = (
-            f"reward={_get('eval/episode_reward'):.2f} "
-            f"success={_get('eval/episode_success'):.3f} "
-            f"stable={_get('eval/episode_stable_steps'):.1f} "
-            f"len={_get('eval/avg_episode_length'):.1f} "
+            f"len={ep_len:.1f}/{int(ep_len_cap)} ({length_frac:.0%}) "
+            f"success_frac={success_frac:.3f} "
+            f"stable_avg={stable_avg:.1f} "
+            f"reward/step={reward_per_step:.3f} "
             f"sps={_get('training/sps'):.0f}"
         )
         print(f"[step {num_steps}] eval#{eval_counter['n']} {summary}", flush=True)
@@ -105,15 +127,15 @@ def main() -> None:
             # Pass through every scalar Brax gives us (eval/*, training/*).
             for k, v in flat.items():
                 payload[k] = v
-            # Derived/useful scalars for dashboard-at-a-glance.
+            # ---- Interpretable derived metrics (what to watch) ----
             payload["perf/walltime_s"] = elapsed
             payload["perf/sps_overall"] = num_steps / max(elapsed, 1e-6)
-            if "eval/episode_reward" in flat:
-                payload["reward/episode_reward"] = flat["eval/episode_reward"]
-            if "eval/episode_success" in flat:
-                payload["reward/success_rate"] = flat["eval/episode_success"]
-            if "eval/episode_stable_steps" in flat:
-                payload["reward/stable_steps"] = flat["eval/episode_stable_steps"]
+            payload["eval_norm/length_frac"] = length_frac
+            payload["eval_norm/success_frac"] = success_frac
+            payload["eval_norm/stable_avg"] = stable_avg
+            payload["eval_norm/reward_per_step"] = reward_per_step
+            # Composite "health": episode survives AND is mostly in success.
+            payload["eval_norm/deployment_score"] = length_frac * success_frac
             wandb.log(payload, step=int(num_steps))
 
         # Periodic checkpointing to survive crashes.
