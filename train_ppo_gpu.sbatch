@@ -12,8 +12,11 @@ set -e
 STEPS=${STEPS:-20000000}
 NUM_ENVS=${NUM_ENVS:-4096}
 UNROLL_LENGTH=${UNROLL_LENGTH:-20}
+# Invariant for STEPS to be respected:
+#   batch_size * num_minibatches == num_envs
+# → env_step_per_training_step = num_envs * unroll_length = 1 full rollout.
 BATCH_SIZE=${BATCH_SIZE:-1024}
-NUM_MINIBATCHES=${NUM_MINIBATCHES:-20}
+NUM_MINIBATCHES=${NUM_MINIBATCHES:-4}
 NUM_UPDATES_PER_BATCH=${NUM_UPDATES_PER_BATCH:-4}
 SEED=${SEED:-0}
 INIT_BALL_SPEED=${INIT_BALL_SPEED:-0.05}
