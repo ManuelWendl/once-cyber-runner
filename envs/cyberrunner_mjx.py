@@ -256,11 +256,12 @@ class CyberRunnerMJXEnv(PipelineEnv):
         )
         obs = self._obs(pipeline_state, ball_pos, ball_vel)
         prev_ep_reward = state.metrics.get("episode_reward", jnp.asarray(0.0, dtype=jnp.float32))
-        metrics = {
+        metrics = dict(state.metrics)
+        metrics.update({
             "success": success,
             "stable_steps": stable_steps.astype(jnp.float32),
             "episode_reward": prev_ep_reward + reward,
-        }
+        })
         info = {**state.info, "stats": new_stats}
         return state.replace(
             pipeline_state=pipeline_state, obs=obs, reward=reward, done=done,
