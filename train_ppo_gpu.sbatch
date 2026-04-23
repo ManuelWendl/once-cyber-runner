@@ -10,10 +10,11 @@ set -e
 
 # ==== Configurable settings ====
 STEPS=${STEPS:-20000000}
-NUM_ENVS=${NUM_ENVS:-4096}
+NUM_ENVS=${NUM_ENVS:-2048}
 UNROLL_LENGTH=${UNROLL_LENGTH:-20}
 BATCH_SIZE=${BATCH_SIZE:-512}
-NUM_MINIBATCHES=${NUM_MINIBATCHES:-32}
+NUM_MINIBATCHES=${NUM_MINIBATCHES:-20}
+NUM_UPDATES_PER_BATCH=${NUM_UPDATES_PER_BATCH:-4}
 SEED=${SEED:-0}
 INIT_BALL_SPEED=${INIT_BALL_SPEED:-0.05}
 INIT_TILT_FRAC=${INIT_TILT_FRAC:-0.05}
@@ -79,6 +80,7 @@ python train_ppo_gpu.py \
   --unroll_length $UNROLL_LENGTH \
   --batch_size $BATCH_SIZE \
   --num_minibatches $NUM_MINIBATCHES \
+  --num_updates_per_batch $NUM_UPDATES_PER_BATCH \
   --num_evals $NUM_EVALS \
   --seed $SEED \
   --init_ball_speed $INIT_BALL_SPEED \
