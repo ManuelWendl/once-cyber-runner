@@ -10,9 +10,11 @@
 # API (scalar damping, etc.). Newer mujoco breaks that call site.
 # brax 0.10.x is the last series built against mujoco 3.3.x.
 
+numpy<2.0
 mujoco==3.3.0
 mujoco-mjx==3.3.0
-jax[cuda12]>=0.4.30,<0.5
-brax>=0.10.5,<0.11
-flax>=0.8.0,<0.10
-optax>=0.2.0
+jax[cuda12]==0.4.30
+jaxlib==0.4.30
+brax==0.10.5
+flax==0.8.5
+optax==0.2.3
