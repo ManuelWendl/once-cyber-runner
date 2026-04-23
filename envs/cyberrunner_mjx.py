@@ -83,7 +83,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
         k_a: float = 0.01,
         b_stable: float = 10.0,
         p_hole: float = 10.0,
-        hold_steps: int = 30,
+        hold_steps: int = 90,
         v_th: float = 0.03,
     ):
         walls_h, walls_v, holes, waypoints = get_hard_layout()
@@ -235,16 +235,19 @@ class CyberRunnerMJXEnv(PipelineEnv):
         stable_here = slow & safe
         stable_steps = jnp.where(stable_here, stats.stable_steps + 1, jnp.int32(0))
         stabilized = stable_steps >= self._hold_steps
+        # Fire the one-shot +b_stable bonus exactly when we cross the
+        # threshold, so the episode can keep running without reward inflation.
+        crossed = (stats.stable_steps < self._hold_steps) & stabilized
 
         reward = (
             r_speed + r_margin + r_action
-            + jnp.where(stabilized, self._b_stable, 0.0)
+            + jnp.where(crossed, self._b_stable, 0.0)
             - jnp.where(in_hole, self._p_hole, 0.0)
         )
 
         step_count = stats.step_count + 1
         timeout = step_count >= self._episode_length
-        done = (in_hole | stabilized | timeout).astype(jnp.float32)
+        done = (in_hole | timeout).astype(jnp.float32)
         success = jnp.where(stabilized, 1.0, stats.success)
 
         new_stats = _EpStats(
