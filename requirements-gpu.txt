@@ -1,14 +1,18 @@
 # Additional GPU dependencies on top of the shared r2dreamer_env.
 # Install into a PERSONAL conda env cloned from the team env:
-#   conda create -p $HOME/envs/cyberrunner_gpu \
+#   conda create -y -p $HOME/envs/cyberrunner_gpu \
 #       --clone /cluster/courses/pmlr/teams/team06/r2dreamer_env
 #   conda activate $HOME/envs/cyberrunner_gpu
 #   pip install -r requirements-gpu.txt
 #
-# Do NOT install these into the shared team env.
+# Pins: mujoco / mujoco-mjx are locked to 3.3.0 because the existing CPU
+# env code (envs/cyberrunner.py::build_model) uses the mujoco 3.3 MjSpec
+# API (scalar damping, etc.). Newer mujoco breaks that call site.
+# brax 0.10.x is the last series built against mujoco 3.3.x.
 
-jax[cuda12]>=0.4.30
-mujoco-mjx>=3.3.0
-brax>=0.10.5
-flax>=0.8.0
+mujoco==3.3.0
+mujoco-mjx==3.3.0
+jax[cuda12]>=0.4.30,<0.5
+brax>=0.10.5,<0.11
+flax>=0.8.0,<0.10
 optax>=0.2.0

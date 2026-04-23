@@ -2,6 +2,7 @@
 
 #SBATCH --job-name=ppo_prior_gpu
 #SBATCH --account=pmlr_jobs
+#SBATCH --gres=gpu:2080ti:1
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #SBATCH --output=logs/slurm_%j.out
