@@ -38,8 +38,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--init_ball_speed", type=float, default=0.05)
     parser.add_argument("--init_tilt_frac", type=float, default=0.05)
-    parser.add_argument("--num_evals", type=int, default=20)
-    parser.add_argument("--save_every_evals", type=int, default=5)
+    parser.add_argument("--num_evals", type=int, default=100)
+    parser.add_argument("--save_every_evals", type=int, default=10)
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_entity", type=str, default=None)
     return parser.parse_args()
@@ -67,29 +67,67 @@ def main() -> None:
             entity=args.wandb_entity or None,
             config=vars(args),
         )
+        # Use env steps as the global x-axis.
         wandb.define_metric("train/step")
-        wandb.define_metric("eval/*", step_metric="train/step")
-        wandb.define_metric("training/*", step_metric="train/step")
+        wandb.define_metric("*", step_metric="train/step")
+        # Explicit groupings so the UI auto-charts them together.
+        for prefix in ("eval/", "training/", "perf/", "reward/"):
+            wandb.define_metric(f"{prefix}*", step_metric="train/step")
         (logdir / "wandb_run_id.txt").write_text(str(wandb_run.id))
 
     eval_counter = {"n": 0}
+    t_start = time.time()
+    _latest_params = {"p": None}
+
+    def policy_params_fn(current_step, make_policy, params):
+        _latest_params["p"] = params
 
     def progress_fn(num_steps: int, metrics: dict) -> None:
         eval_counter["n"] += 1
         flat = {k: float(v) for k, v in metrics.items() if _is_scalar(v)}
-        summary = " ".join(
-            f"{k.split('/')[-1]}={v:.3f}"
-            for k, v in flat.items()
-            if k.startswith("eval/")
+
+        # Human summary on stdout (concise).
+        def _get(k: str, d: float = float("nan")) -> float:
+            return flat.get(k, d)
+        summary = (
+            f"reward={_get('eval/episode_reward'):.2f} "
+            f"success={_get('eval/episode_success'):.3f} "
+            f"stable={_get('eval/episode_stable_steps'):.1f} "
+            f"len={_get('eval/avg_episode_length'):.1f} "
+            f"sps={_get('training/sps'):.0f}"
         )
-        print(f"[step {num_steps}] {summary}", flush=True)
+        print(f"[step {num_steps}] eval#{eval_counter['n']} {summary}", flush=True)
 
         if wandb_run is not None:
             import wandb
+            elapsed = time.time() - t_start
             payload = {"train/step": int(num_steps)}
+            # Pass through every scalar Brax gives us (eval/*, training/*).
             for k, v in flat.items():
                 payload[k] = v
+            # Derived/useful scalars for dashboard-at-a-glance.
+            payload["perf/walltime_s"] = elapsed
+            payload["perf/sps_overall"] = num_steps / max(elapsed, 1e-6)
+            if "eval/episode_reward" in flat:
+                payload["reward/episode_reward"] = flat["eval/episode_reward"]
+            if "eval/episode_success" in flat:
+                payload["reward/success_rate"] = flat["eval/episode_success"]
+            if "eval/episode_stable_steps" in flat:
+                payload["reward/stable_steps"] = flat["eval/episode_stable_steps"]
             wandb.log(payload, step=int(num_steps))
+
+        # Periodic checkpointing to survive crashes.
+        if args.save_every_evals > 0 and eval_counter["n"] % args.save_every_evals == 0:
+            try:
+                ckpt_path = logdir / f"brax_ppo_params_step{int(num_steps)}.pkl"
+                with open(ckpt_path, "wb") as f:
+                    pickle.dump(
+                        {"step": int(num_steps), "params": _latest_params["p"]},
+                        f,
+                    )
+                print(f"[gpu-train] ckpt → {ckpt_path}", flush=True)
+            except Exception as e:
+                print(f"[gpu-train] ckpt failed: {e}", flush=True)
 
     # Import here so the module-load cost is not paid unless this script is run.
     from brax.training.agents.ppo import train as ppo_train
@@ -116,6 +154,7 @@ def main() -> None:
         gae_lambda=args.gae_lambda,
         seed=args.seed,
         progress_fn=progress_fn,
+        policy_params_fn=policy_params_fn,
     )
     print(f"[gpu-train] done in {time.time() - t0:.1f}s", flush=True)
 

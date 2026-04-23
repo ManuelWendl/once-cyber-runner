@@ -202,7 +202,6 @@ class CyberRunnerMJXEnv(PipelineEnv):
         metrics = {
             "success": stats.success,
             "stable_steps": stats.stable_steps.astype(jnp.float32),
-            "episode_reward": jnp.asarray(0.0, dtype=jnp.float32),
         }
         info = {"stats": stats, "rng": rng}
         return State(pipeline_state, obs, jnp.asarray(0.0, dtype=jnp.float32),
@@ -255,12 +254,10 @@ class CyberRunnerMJXEnv(PipelineEnv):
             success=success,
         )
         obs = self._obs(pipeline_state, ball_pos, ball_vel)
-        prev_ep_reward = state.metrics.get("episode_reward", jnp.asarray(0.0, dtype=jnp.float32))
         metrics = dict(state.metrics)
         metrics.update({
             "success": success,
             "stable_steps": stable_steps.astype(jnp.float32),
-            "episode_reward": prev_ep_reward + reward,
         })
         info = {**state.info, "stats": new_stats}
         return state.replace(

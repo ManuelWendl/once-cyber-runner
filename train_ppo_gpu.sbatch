@@ -14,6 +14,7 @@ NUM_ENVS=${NUM_ENVS:-2048}
 SEED=${SEED:-0}
 INIT_BALL_SPEED=${INIT_BALL_SPEED:-0.05}
 INIT_TILT_FRAC=${INIT_TILT_FRAC:-0.05}
+NUM_EVALS=${NUM_EVALS:-100}
 MAX_VIDEO_SPAWNS=${MAX_VIDEO_SPAWNS:-32}
 WANDB_PROJECT=${WANDB_PROJECT:-cyberrunner-prior-gpu}
 WANDB_ENTITY=${WANDB_ENTITY:-filippostaffoni-eth-z-rich}
@@ -72,6 +73,7 @@ python train_ppo_gpu.py \
   --logdir $SCRATCH_DIR \
   --steps $STEPS \
   --num_envs $NUM_ENVS \
+  --num_evals $NUM_EVALS \
   --seed $SEED \
   --init_ball_speed $INIT_BALL_SPEED \
   --init_tilt_frac $INIT_TILT_FRAC \
