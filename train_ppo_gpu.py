@@ -154,11 +154,39 @@ def main() -> None:
     # Import here so the module-load cost is not paid unless this script is run.
     from brax.training.agents.ppo import train as ppo_train
 
+    # Auto-tune num_evals so `args.steps` is honored faithfully.
+    #
+    # Brax's PPO does exactly one "training step" worth of env collection per
+    # training step, where
+    #   env_step_per_ts = batch_size * unroll_length * num_minibatches
+    # and the number of env steps it runs in total is
+    #   actual = (num_evals - 1) * steps_per_epoch * env_step_per_ts
+    # with `steps_per_epoch = ceil(num_timesteps / ((num_evals - 1) * env_step_per_ts))`.
+    #
+    # If we pick steps_per_epoch=1 and choose num_evals to absorb the count,
+    # the math collapses to `actual = (num_evals - 1) * env_step_per_ts`,
+    # which we can match to `args.steps` within ±½ of env_step_per_ts.
+    _env_step_per_ts = (
+        args.batch_size * args.unroll_length * args.num_minibatches
+    )
+    _evals_after_init = max(1, round(args.steps / _env_step_per_ts))
+    _num_evals = _evals_after_init + 1
+    _actual_steps = _evals_after_init * _env_step_per_ts
+    _delta_pct = 100.0 * (_actual_steps / args.steps - 1.0)
+    print(
+        f"[gpu-train] STEPS auto-tune: requested={args.steps:,} "
+        f"→ running={_actual_steps:,} ({_delta_pct:+.2f}%)  "
+        f"env_step/ts={_env_step_per_ts:,}  "
+        f"num_evals: {args.num_evals} → {_num_evals} "
+        f"(eval every {_env_step_per_ts:,} steps)",
+        flush=True,
+    )
+
     t0 = time.time()
     make_inference_fn, params, _ = ppo_train.train(
         environment=env,
-        num_timesteps=args.steps,
-        num_evals=args.num_evals,
+        num_timesteps=_actual_steps,
+        num_evals=_num_evals,
         reward_scaling=1.0,
         episode_length=args.episode_length,
         normalize_observations=True,
