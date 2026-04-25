@@ -286,10 +286,10 @@ class CyberRunnerMJXEnv(PipelineEnv):
         step_count = stats.step_count + 1
         timeout = step_count >= self._episode_length
         done = (in_hole | timeout).astype(jnp.float32)
-        # `success` accumulates per-step sweet-spot count; the Brax episode
-        # wrapper will sum it — interpret `success / ep_len` as
-        # "fraction of episode in a safe basin."
-        success = stats.success + in_sweet.astype(jnp.float32)
+        # `success` is a PER-STEP indicator (0/1). Brax's EpisodeWrapper sums
+        # it across the rollout, so `success_sum / ep_len` is the fraction of
+        # the episode the ball spent in a safe basin (always in [0, 1]).
+        success = in_sweet.astype(jnp.float32)
 
         new_stats = _EpStats(
             prev_ball_pos=ball_pos,
