@@ -23,7 +23,7 @@ import numpy as np
 from stable_baselines3 import PPO
 
 # ── constants matching training ──────────────────────────────────────────────
-OBS_DIM = 13  # 10 states + 3 checkpoint
+OBS_DIM = 10  # 10 states (no checkpoint field — pure stabilization prior)
 DEFAULT_N_STACK = 4
 DEFAULT_LOGDIR = "logdir/ppo_prior_stabilize"
 VIDEO_FPS = 30

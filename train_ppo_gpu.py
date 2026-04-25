@@ -72,11 +72,13 @@ def main() -> None:
             entity=args.wandb_entity or None,
             config=vars(args),
         )
-        # Use env steps as the global x-axis.
+        # Use env steps as the global x-axis. Group keys to mirror the CPU
+        # PPO run (train_ppo.py) so panels overlay cleanly when both jobs
+        # share a wandb project.
         wandb.define_metric("train/step")
         wandb.define_metric("*", step_metric="train/step")
-        # Explicit groupings so the UI auto-charts them together.
-        for prefix in ("eval/", "training/", "perf/", "reward/"):
+        for prefix in ("episode/", "rollout/", "eval/", "training/",
+                       "perf/", "reward/", "eval_norm/"):
             wandb.define_metric(f"{prefix}*", step_metric="train/step")
         (logdir / "wandb_run_id.txt").write_text(str(wandb_run.id))
 
@@ -102,15 +104,24 @@ def main() -> None:
         ep_len_cap = float(args.episode_length)
 
         reward_sum = _get("eval/episode_reward")
-        success_sum = _get("eval/episode_success")
+        # `success` fires once per episode → wrapper-summed value is 0 or 1
+        # per episode → mean across episodes = success RATE ∈ [0, 1].
+        # Matches CPU `episode/success_rate` semantics.
+        success_rate = _get("eval/episode_success")
+        sweet_sum = _get("eval/episode_sweet_step")
         stable_sum = _get("eval/episode_stable_steps")
+        ball_speed_sum = _get("eval/episode_ball_speed")
+        safe_margin_sum = _get("eval/episode_safe_hole_margin")
 
-        # Per-step reward (max achievable ~ k_v·v_max + k_m·m_max = 1.5).
+        # Per-step reward (max achievable ~ w_shape·2 + w_sweet ≈ 2.0).
         reward_per_step = reward_sum / ep_len_safe
-        # Fraction of episode spent in success (sticky flag) state.
-        success_frac = success_sum / ep_len_safe
+        # Fraction of steps the ball spent in a sweet-spot state.
+        sweet_frac = sweet_sum / ep_len_safe
         # Avg value of the running stable_steps counter during the episode.
         stable_avg = stable_sum / ep_len_safe
+        # Episode-mean ball speed and hole margin.
+        ball_speed_mean = ball_speed_sum / ep_len_safe
+        safe_margin_mean = safe_margin_sum / ep_len_safe
         # Fraction of max episode length actually survived. Rises toward 1.0
         # once the agent stops falling in holes.
         length_frac = ep_len / ep_len_cap if ep_len == ep_len else float("nan")
@@ -118,7 +129,8 @@ def main() -> None:
         # Human summary on stdout (interpretable, not raw Brax sums).
         summary = (
             f"len={ep_len:.1f}/{int(ep_len_cap)} ({length_frac:.0%}) "
-            f"success_frac={success_frac:.3f} "
+            f"success_rate={success_rate:.3f} "
+            f"sweet_frac={sweet_frac:.3f} "
             f"stable_avg={stable_avg:.1f} "
             f"reward/step={reward_per_step:.3f} "
             f"sps={_get('training/sps'):.0f}"
@@ -136,11 +148,24 @@ def main() -> None:
             payload["perf/walltime_s"] = elapsed
             payload["perf/sps_overall"] = num_steps / max(elapsed, 1e-6)
             payload["eval_norm/length_frac"] = length_frac
-            payload["eval_norm/success_frac"] = success_frac
+            payload["eval_norm/success_rate"] = success_rate
+            payload["eval_norm/sweet_frac"] = sweet_frac
             payload["eval_norm/stable_avg"] = stable_avg
             payload["eval_norm/reward_per_step"] = reward_per_step
-            # Composite "health": episode survives AND is mostly in success.
-            payload["eval_norm/deployment_score"] = length_frac * success_frac
+            # Composite "health": episode survives AND succeeded.
+            payload["eval_norm/deployment_score"] = length_frac * success_rate
+            # ---- CPU-aligned aliases (match keys emitted by train_ppo.py) ----
+            # Same panels can overlay both runs in one wandb project.
+            payload["episode/mean_reward"] = reward_sum
+            payload["episode/mean_length"] = ep_len
+            payload["episode/success_rate"] = success_rate          # ∈ [0, 1]
+            payload["episode/mean_stable_steps"] = stable_avg
+            payload["episode/mean_ball_speed"] = ball_speed_mean
+            payload["episode/mean_safe_hole_margin"] = safe_margin_mean
+            payload["rollout/ep_rew_mean"] = reward_sum
+            payload["rollout/ep_len_mean"] = ep_len
+            payload["rollout/final_ball_speed_mean"] = ball_speed_mean
+            payload["rollout/final_safe_hole_margin_mean"] = safe_margin_mean
             wandb.log(payload, step=int(num_steps))
 
         # Periodic checkpointing to survive crashes.
@@ -158,6 +183,17 @@ def main() -> None:
 
     # Import here so the module-load cost is not paid unless this script is run.
     from brax.training.agents.ppo import train as ppo_train
+    from brax.training.agents.ppo import networks as ppo_networks
+    import functools
+
+    # Match SB3's `MlpPolicy` default capacity used by the CPU run:
+    # two hidden layers of 64 with tanh activation, separate policy/value MLPs.
+    network_factory = functools.partial(
+        ppo_networks.make_ppo_networks,
+        policy_hidden_layer_sizes=(64, 64),
+        value_hidden_layer_sizes=(64, 64),
+        activation=jax.nn.tanh,
+    )
 
     # Auto-tune num_evals so `args.steps` is honored faithfully.
     #
@@ -210,6 +246,7 @@ def main() -> None:
         seed=args.seed,
         progress_fn=progress_fn,
         policy_params_fn=policy_params_fn,
+        network_factory=network_factory,
     )
     print(f"[gpu-train] done in {time.time() - t0:.1f}s", flush=True)
 

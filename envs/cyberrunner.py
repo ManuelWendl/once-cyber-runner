@@ -1222,10 +1222,11 @@ class CyberRunnerEnv(gym.Env):
         self.board_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "board")
         self.marble_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "marble")
 
-        # Observation space (always a Dict)
+        # Observation space (always a Dict). `checkpoint` field removed and
+        # `states` re-laid-out to match the GPU env (cyberrunner_mjx.py):
+        # pure stabilization, no path/target conditioning.
         obs_spaces = {
-            "states": spaces.Box(low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32),
-            "checkpoint": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
+            "states": spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32),
         }
         if self.include_vision:
             self.img_size = 64
@@ -1588,61 +1589,39 @@ class CyberRunnerEnv(gym.Env):
         """Get observation with noise.
 
         Returns dict with:
-            "states" (10-dim):
-                [0:2] Joint angles (alpha, beta) with noise
-                [2:4] Ball position (x, y) with noise
-                [4:6] Vector from ball to closest visible path point
-                [6:8] Vector from ball to next waypoint
-                [8:10] Vector from ball to waypoint after next
+            "states" (7-dim, all NOISY — sensor model for sim-to-real):
+                [0:2] Joint angles (alpha, beta) + per-episode bias + per-step noise
+                [2:4] Ball position (x, y) + per-episode bias + per-step noise
+                [4]   Distance from noisy ball pos to nearest hole center
+                [5]   Distance from noisy ball pos to nearest wall segment
+                [6]   Tilt magnitude sqrt(α² + β²) from noisy joints
             "image" (64x64x3, only if include_vision):
                 Cropped board image centered on ball
         """
-        # Per-step noise
+        # Per-step sensor noise
         ball_noise = self.np_random.uniform(-BALL_POS_NOISE, BALL_POS_NOISE, size=2)
         joint_noise = self.np_random.uniform(-JOINT_ANGLE_NOISE, JOINT_ANGLE_NOISE, size=2)
 
-        # Joint angles with bias + noise
+        # Noisy joint angles and ball position
         joint_pos = self.data.qpos[:2] + self._obs_bias["joint"] + joint_noise
-
-        # Ball position with bias + noise
         ball_pos = self._get_ball_pos_board_frame()
-        ball_pos_noisy = ball_pos + self._obs_bias["ball"] + ball_noise
+        ball_pos_noisy = (ball_pos + self._obs_bias["ball"] + ball_noise).astype(np.float32)
 
-        # Vector to closest visible path point
-        vec_to_closest = self._closest_point - ball_pos_noisy
+        # Distance to nearest hole / wall, both from the NOISY ball pos.
+        hole_d = float(np.min(np.linalg.norm(self.holes - ball_pos_noisy[None, :], axis=1)))
+        wall_d = float(self._min_wall_distance(ball_pos_noisy))
+        abs_tilt = float(np.hypot(joint_pos[0], joint_pos[1]))
 
-        # Vectors to next two waypoints
-        num_waypoints = len(self.waypoints)
-        next_wp_idx = min(self._seg_idx + 1, num_waypoints - 1)
-        next_next_wp_idx = min(self._seg_idx + 2, num_waypoints - 1)
+        states = np.array([
+            joint_pos[0], joint_pos[1],
+            ball_pos_noisy[0], ball_pos_noisy[1],
+            hole_d, wall_d, abs_tilt,
+        ], dtype=np.float32)
 
-        vec_to_next_wp = self.waypoints[next_wp_idx] - ball_pos_noisy
-        vec_to_next_next_wp = self.waypoints[next_next_wp_idx] - ball_pos_noisy
-
-        if not self._path_detected:
-            vec_to_closest = np.zeros(2, dtype=np.float32)
-            vec_to_next_wp = np.zeros(2, dtype=np.float32)
-            vec_to_next_next_wp = np.zeros(2, dtype=np.float32)
-
-        states = np.concatenate(
-            [joint_pos, ball_pos_noisy, vec_to_closest, vec_to_next_wp, vec_to_next_next_wp]
-        ).astype(np.float32)
-
-        active_checkpoint = self._get_active_checkpoint_waypoint()
-        if self.prior_mode and self.prior_task == "stabilize":
-            checkpoint_vec = self._prior_target - ball_pos_noisy
-            checkpoint_dist = float(np.linalg.norm(checkpoint_vec))
-        elif active_checkpoint is None:
-            checkpoint_vec = np.zeros(2, dtype=np.float32)
-            checkpoint_dist = 0.0
-        else:
-            checkpoint_vec = active_checkpoint - ball_pos_noisy
-            checkpoint_dist = float(np.linalg.norm(checkpoint_vec))
-
-        obs = {
-            "states": states,
-            "checkpoint": np.array([checkpoint_vec[0], checkpoint_vec[1], checkpoint_dist], dtype=np.float32),
-        }
+        # `checkpoint` field intentionally omitted: stabilize task no longer
+        # conditions on a target. Other tasks reconstruct what they need from
+        # the path-relative vectors already in `states`.
+        obs = {"states": states}
 
         if self.include_vision:
             # Move vision camera above the ball (in board frame)

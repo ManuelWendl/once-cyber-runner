@@ -40,10 +40,12 @@ from flax import struct
 from mujoco import mjx
 
 from envs.cyberrunner import (
+    BALL_POS_NOISE,
     BOARD_HEIGHT,
     BOARD_WIDTH,
     FRAME_SKIP,
     HOLE_RADIUS,
+    JOINT_ANGLE_NOISE,
     MARBLE_RADIUS,
     RANGE_ALPHA,
     RANGE_BETA,
@@ -55,20 +57,36 @@ from envs.cyberrunner import (
 )
 
 
+N_STACK = 4  # frame stacking, matches CPU `train_ppo.py --n_stack 4`
+OBS_DIM = 7   # per-frame obs dim (matches CPU `states` field)
+
+
 @struct.dataclass
 class _EpStats:
-    prev_ball_pos: jnp.ndarray  # (2,)
-    stable_steps: jnp.ndarray   # ()
-    step_count: jnp.ndarray     # ()
-    success: jnp.ndarray        # ()
+    prev_ball_pos_clean: jnp.ndarray   # (2,)  true position, for clean speed
+    prev_ball_pos_noisy: jnp.ndarray   # (2,)  noisy obs position, for EMA speed
+    ema_speed: jnp.ndarray             # ()    EMA-smoothed noisy speed (reward source)
+    obs_buf: jnp.ndarray               # (N_STACK - 1, OBS_DIM) — last 3 frames
+    bias_ball: jnp.ndarray             # (2,)  per-episode ball-pos bias
+    bias_joint: jnp.ndarray            # (2,)  per-episode joint-angle bias
+    stable_steps: jnp.ndarray          # ()
+    step_count: jnp.ndarray            # ()
+    success: jnp.ndarray               # ()    sticky "ever crossed" flag
 
 
 class CyberRunnerMJXEnv(PipelineEnv):
     """Brax-compatible MJX env for the stabilize prior task.
 
-    Observation (10-dim):
-        [alpha, beta, bx, by, vbx, vby, min_hole_dist, min_wall_dist,
-         abs_tilt_norm, ball_speed]
+    Observation matches the CPU env (`envs/cyberrunner.py::_get_obs::states`):
+        per-frame (10-dim, all NOISY):
+            [α, β, bx, by, vec_to_closest_path(2), vec_to_next_wp(2),
+             vec_to_next_next_wp(2)]
+        policy input is a 4-frame stack along the last axis (40-dim total),
+        replicating SB3 `VecFrameStack(n_stack=4)` with zero-init older frames.
+
+    Reward:
+        Identical "safe basin" formula to the CPU env's stabilize branch.
+        `quiet` uses the EMA-smoothed noisy speed (matches CPU sensor model).
 
     Action: (2,) in [-1, 1] — alpha, beta motor commands (same as CPU env).
     """
@@ -80,7 +98,11 @@ class CyberRunnerMJXEnv(PipelineEnv):
         init_tilt_frac: float = 0.05,
         prior_spawn_source: str = "waypoints",
         prior_start_point_spacing: float = 0.01,
-        prior_spawn_min_hole_margin: float = 0.012,
+        # Match CPU `prior_spawn_min_hole_margin=0.0` — spawn from ALL waypoints.
+        prior_spawn_min_hole_margin: float = 0.0,
+        # EMA smoothing α for the noisy ball speed used by the reward
+        # (matches CPU `checkpoint_speed_ema_alpha=0.8`).
+        speed_ema_alpha: float = 0.8,
         # "Safe basin" reward constants.
         d_ref: float = 0.015,          # hole-margin reference (m) — tanh scale
         v_ref: float = 0.03,           # speed reference (m/s) — exp scale
@@ -92,6 +114,10 @@ class CyberRunnerMJXEnv(PipelineEnv):
         # Sweet-spot flag thresholds (for the `success` metric only; NOT reward).
         safe_th: float = 0.5,
         quiet_th: float = 0.5,
+        # Episode-level success criterion — matches CPU env's
+        # `checkpoint_hold_steps=12` (≈ 0.2 s at 60 Hz). An episode is marked
+        # successful once stable_steps crosses this threshold.
+        success_hold_steps: int = 12,
         # MJX solver budget. MuJoCo's defaults (100/50) are overkill for a
         # marble-on-board system that converges in < 5 Newton steps. These
         # knobs are the dominant lever for GPU rollout throughput.
@@ -176,13 +202,16 @@ class CyberRunnerMJXEnv(PipelineEnv):
         self._p_hole = float(p_hole)
         self._safe_th = float(safe_th)
         self._quiet_th = float(quiet_th)
+        self._success_hold_steps = int(success_hold_steps)
         self._solver_iterations = int(solver_iterations)
         self._ls_iterations = int(ls_iterations)
+        self._speed_ema_alpha = float(speed_ema_alpha)
 
     # ---- Brax API --------------------------------------------------------
 
     def reset(self, rng: jax.Array) -> State:
-        rng, k_spawn, k_theta, k_speed, k_alpha, k_beta = jax.random.split(rng, 6)
+        (rng, k_spawn, k_theta, k_speed, k_alpha, k_beta,
+         k_bias_ball, k_bias_joint) = jax.random.split(rng, 8)
 
         idx = jax.random.randint(k_spawn, (), 0, self._num_spawns)
         spawn_xy = self._spawn_bank[idx]
@@ -198,6 +227,14 @@ class CyberRunnerMJXEnv(PipelineEnv):
         )
         theta = jax.random.uniform(k_theta, (), minval=0.0, maxval=2.0 * jnp.pi)
         speed = jax.random.uniform(k_speed, (), minval=0.0, maxval=self._init_ball_speed)
+
+        # Per-episode sensor biases (matches CPU `_obs_bias`).
+        bias_ball = jax.random.uniform(
+            k_bias_ball, (2,), minval=-BALL_POS_NOISE, maxval=BALL_POS_NOISE,
+        ).astype(jnp.float32)
+        bias_joint = jax.random.uniform(
+            k_bias_joint, (2,), minval=-JOINT_ANGLE_NOISE, maxval=JOINT_ANGLE_NOISE,
+        ).astype(jnp.float32)
 
         nq = self.sys.nq
         nv = self.sys.nv
@@ -215,25 +252,40 @@ class CyberRunnerMJXEnv(PipelineEnv):
 
         pipeline_state = self.pipeline_init(qpos, qvel)
         ball_pos = pipeline_state.xpos[self._marble_body_id, :2]
+        # Initial noisy ball pos (no per-step noise, just bias).
+        ball_pos_noisy0 = ball_pos + bias_ball
 
         stats = _EpStats(
-            prev_ball_pos=ball_pos,
+            prev_ball_pos_clean=ball_pos,
+            prev_ball_pos_noisy=ball_pos_noisy0,
+            ema_speed=jnp.asarray(0.0, dtype=jnp.float32),
+            obs_buf=jnp.zeros((N_STACK - 1, OBS_DIM), dtype=jnp.float32),
+            bias_ball=bias_ball,
+            bias_joint=bias_joint,
             stable_steps=jnp.asarray(0, dtype=jnp.int32),
             step_count=jnp.asarray(0, dtype=jnp.int32),
             success=jnp.asarray(0.0, dtype=jnp.float32),
         )
-        ball_vel = jnp.zeros(2, dtype=jnp.float32)
-        obs = self._obs(pipeline_state, ball_pos, ball_vel)
+        # First-step observation: use per-episode bias only (no per-step
+        # sensor noise at reset — matches CPU which adds it inside step()).
+        per_frame = self._build_per_frame_obs(
+            pipeline_state.qpos[0], pipeline_state.qpos[1],
+            ball_pos_noisy0, bias_joint, jnp.zeros(2, dtype=jnp.float32),
+        )
+        obs = self._stack_with_buffer(stats.obs_buf, per_frame)
         # All per-step metric keys must exist in reset for the EpisodeWrapper
         # to sum them consistently across the rollout.
         _zero = jnp.asarray(0.0, dtype=jnp.float32)
         metrics = {
-            "success": stats.success,
+            "success": _zero,        # per-step, fires once per episode
+            "sweet_step": _zero,     # per-step indicator
             "stable_steps": stats.stable_steps.astype(jnp.float32),
             "r_safe": _zero,
             "r_quiet": _zero,
             "r_level": _zero,
             "r_sweet": _zero,
+            "ball_speed": _zero,
+            "safe_hole_margin": _zero,
         }
         info = {"stats": stats, "rng": rng}
         return State(pipeline_state, obs, jnp.asarray(0.0, dtype=jnp.float32),
@@ -246,13 +298,33 @@ class CyberRunnerMJXEnv(PipelineEnv):
         ball_pos = pipeline_state.xpos[self._marble_body_id, :2]
         dt = TIMESTEP * FRAME_SKIP
         stats: _EpStats = state.info["stats"]
-        ball_vel = (ball_pos - stats.prev_ball_pos) / dt
-        ball_speed = jnp.linalg.norm(ball_vel)
 
+        # ---- Sample per-step sensor noise (matches CPU env). ----
+        rng = state.info["rng"]
+        rng, k_ball, k_joint = jax.random.split(rng, 3)
+        ball_noise = jax.random.uniform(
+            k_ball, (2,), minval=-BALL_POS_NOISE, maxval=BALL_POS_NOISE,
+        )
+        joint_noise = jax.random.uniform(
+            k_joint, (2,), minval=-JOINT_ANGLE_NOISE, maxval=JOINT_ANGLE_NOISE,
+        )
+
+        # Noisy ball position (per-episode bias + per-step noise).
+        ball_pos_noisy = ball_pos + stats.bias_ball + ball_noise
+        # Noisy obs speed → EMA-smoothed → consumed by `quiet` term.
+        obs_ball_speed = jnp.linalg.norm(
+            ball_pos_noisy - stats.prev_ball_pos_noisy
+        ) / jnp.maximum(dt, 1e-8)
+        ema_speed = (
+            self._speed_ema_alpha * stats.ema_speed
+            + (1.0 - self._speed_ema_alpha) * obs_ball_speed
+        )
+
+        # Hole distance from CLEAN ball position (matches CPU reward).
         hole_d = jnp.min(jnp.linalg.norm(self._holes - ball_pos[None, :], axis=1))
         hole_margin = hole_d - HOLE_RADIUS
 
-        # Tilt magnitude for the "level" term.
+        # Tilt magnitude from CLEAN qpos for the `level` term.
         alpha = pipeline_state.qpos[0]
         beta = pipeline_state.qpos[1]
         abs_tilt = jnp.sqrt(alpha * alpha + beta * beta)
@@ -260,7 +332,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
         # Shaped potentials — all in [0, 1]. Walls are NOT in the reward;
         # the agent is free to use them as physical brakes.
         safe = jnp.tanh(jnp.maximum(hole_margin, 0.0) / self._d_ref)
-        quiet = jnp.exp(-(ball_speed / self._v_ref) ** 2)
+        quiet = jnp.exp(-(ema_speed / self._v_ref) ** 2)
         level = jnp.exp(-(abs_tilt / self._tilt_ref) ** 2)
 
         # Additive floor (dense early signal) + multiplicative sweet-spot bonus.
@@ -276,8 +348,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
             - jnp.where(in_hole, self._p_hole, 0.0)
         )
 
-        # Sweet-spot flag (diagnostic metric only — never fed into reward).
-        # Tracks fraction of episode the ball spent in a "basin"-like state.
+        # Sweet-spot indicator (diagnostic only — never fed into reward).
         in_sweet = (safe > self._safe_th) & (quiet > self._quiet_th)
         stable_steps = jnp.where(
             in_sweet, stats.stable_steps + 1, jnp.int32(0)
@@ -286,28 +357,59 @@ class CyberRunnerMJXEnv(PipelineEnv):
         step_count = stats.step_count + 1
         timeout = step_count >= self._episode_length
         done = (in_hole | timeout).astype(jnp.float32)
-        # `success` is a PER-STEP indicator (0/1). Brax's EpisodeWrapper sums
-        # it across the rollout, so `success_sum / ep_len` is the fraction of
-        # the episode the ball spent in a safe basin (always in [0, 1]).
-        success = in_sweet.astype(jnp.float32)
+
+        # Success fires ONCE per episode at the first crossing of
+        # `success_hold_steps`. Matches CPU `episode/success_rate` semantics.
+        crossed = (
+            (stats.stable_steps < self._success_hold_steps)
+            & (stable_steps >= self._success_hold_steps)
+            & (stats.success < 0.5)
+        )
+        success_metric = crossed.astype(jnp.float32)
+        success_ever = jnp.maximum(stats.success, success_metric)
+
+        # Build the new per-frame obs (10-dim, all derived from noisy values).
+        per_frame = self._build_per_frame_obs(
+            alpha, beta, ball_pos_noisy, stats.bias_joint, joint_noise,
+        )
+        # Stack with the carried buffer of last (N_STACK - 1) frames → (40,).
+        obs = self._stack_with_buffer(stats.obs_buf, per_frame)
+        # Shift buffer: drop oldest, append current.
+        new_obs_buf = jnp.concatenate(
+            [stats.obs_buf[1:], per_frame[None, :]], axis=0,
+        )
 
         new_stats = _EpStats(
-            prev_ball_pos=ball_pos,
+            prev_ball_pos_clean=ball_pos,
+            prev_ball_pos_noisy=ball_pos_noisy,
+            ema_speed=ema_speed,
+            obs_buf=new_obs_buf,
+            bias_ball=stats.bias_ball,
+            bias_joint=stats.bias_joint,
             stable_steps=stable_steps,
             step_count=step_count,
-            success=success,
+            success=success_ever,
         )
-        obs = self._obs(pipeline_state, ball_pos, ball_vel)
+        # Per-step metrics. Brax's EpisodeWrapper sums them across the
+        # rollout — divide by avg_episode_length in progress_fn for means
+        # (or interpret directly when summing makes semantic sense, like
+        # `success`, which fires once per episode).
+        in_sweet_f = in_sweet.astype(jnp.float32)
         metrics = dict(state.metrics)
         metrics.update({
-            "success": success,
+            "success": success_metric,        # 0/1, fires once per episode
+            "sweet_step": in_sweet_f,         # 0/1 per step (fraction-in-basin)
             "stable_steps": stable_steps.astype(jnp.float32),
             "r_safe": safe,
             "r_quiet": quiet,
             "r_level": level,
             "r_sweet": r_sweet,
+            # `ball_speed` reports the EMA-smoothed noisy speed used by the
+            # reward, matching CPU's `_ball_speed`.
+            "ball_speed": ema_speed.astype(jnp.float32),
+            "safe_hole_margin": jnp.maximum(hole_margin, 0.0).astype(jnp.float32),
         })
-        info = {**state.info, "stats": new_stats}
+        info = {**state.info, "stats": new_stats, "rng": rng}
         return state.replace(
             pipeline_state=pipeline_state, obs=obs, reward=reward, done=done,
             metrics=metrics, info=info,
@@ -315,20 +417,42 @@ class CyberRunnerMJXEnv(PipelineEnv):
 
     # ---- obs / geometry --------------------------------------------------
 
-    def _obs(self, pipeline_state, ball_pos: jax.Array, ball_vel: jax.Array) -> jax.Array:
-        alpha = pipeline_state.qpos[0]
-        beta = pipeline_state.qpos[1]
-        hole_d = jnp.min(jnp.linalg.norm(self._holes - ball_pos[None, :], axis=1))
-        wall_d = self._min_wall_dist(ball_pos)
-        abs_tilt = jnp.sqrt(alpha * alpha + beta * beta)
-        speed = jnp.linalg.norm(ball_vel)
+    def _build_per_frame_obs(
+        self,
+        alpha_clean: jax.Array,
+        beta_clean: jax.Array,
+        ball_pos_noisy: jax.Array,
+        bias_joint: jax.Array,
+        joint_noise: jax.Array,
+    ) -> jax.Array:
+        """Build a 7-dim per-frame obs that mirrors the CPU env's `states`.
+
+        Layout (matches `cyberrunner.py::_get_obs::states`, all NOISY):
+            [0:2] joint_pos = (α_clean, β_clean) + bias_joint + joint_noise
+            [2:4] ball_pos_noisy (passed in, already biased + noised)
+            [4]   distance to nearest hole, from noisy ball pos
+            [5]   distance to nearest wall, from noisy ball pos
+            [6]   tilt magnitude sqrt(α² + β²) from noisy joints
+        """
+        joint_pos = jnp.stack([alpha_clean, beta_clean]) + bias_joint + joint_noise
+        hole_d = jnp.min(jnp.linalg.norm(self._holes - ball_pos_noisy[None, :], axis=1))
+        wall_d = self._min_wall_dist(ball_pos_noisy)
+        abs_tilt = jnp.sqrt(joint_pos[0] * joint_pos[0] + joint_pos[1] * joint_pos[1])
         return jnp.stack([
-            alpha, beta,
-            ball_pos[0], ball_pos[1],
-            ball_vel[0], ball_vel[1],
-            hole_d, wall_d,
-            abs_tilt, speed,
+            joint_pos[0], joint_pos[1],
+            ball_pos_noisy[0], ball_pos_noisy[1],
+            hole_d, wall_d, abs_tilt,
         ]).astype(jnp.float32)
+
+    @staticmethod
+    def _stack_with_buffer(obs_buf: jax.Array, current_frame: jax.Array) -> jax.Array:
+        """Concat last (N_STACK - 1) frames + current → (N_STACK · OBS_DIM,).
+
+        Matches SB3 `VecFrameStack` ordering: oldest..newest along last axis.
+        On reset the buffer is zero-filled, exactly as `StackedObservations`
+        in stable-baselines3 does on its first step.
+        """
+        return jnp.concatenate([obs_buf.reshape(-1), current_frame], axis=0)
 
     def _min_wall_dist(self, ball_pos: jax.Array) -> jax.Array:
         """Min distance from ball center to any wall segment OR board edge."""
@@ -371,9 +495,10 @@ class CyberRunnerMJXEnv(PipelineEnv):
         return filtered.astype(np.float32)
 
     # Brax uses these for policy/value network construction.
+    # Frame-stacked obs: N_STACK frames × OBS_DIM features.
     @property
     def observation_size(self) -> int:
-        return 10
+        return N_STACK * OBS_DIM
 
     @property
     def action_size(self) -> int:

@@ -13,10 +13,11 @@ STEPS=${STEPS:-20000000}
 # Bumped 4096 → 8192 to amortize MJX kernel-launch overhead.
 NUM_ENVS=${NUM_ENVS:-8192}
 UNROLL_LENGTH=${UNROLL_LENGTH:-20}
-# Invariant: batch_size * num_minibatches == num_envs (2048 * 4 = 8192).
-BATCH_SIZE=${BATCH_SIZE:-2048}
-NUM_MINIBATCHES=${NUM_MINIBATCHES:-4}
-NUM_UPDATES_PER_BATCH=${NUM_UPDATES_PER_BATCH:-4}
+# SGD density matches SB3 CPU PPO (n_epochs=10, ~32 minibatches per rollout).
+# Invariant: batch_size * num_minibatches == num_envs (256 * 32 = 8192).
+BATCH_SIZE=${BATCH_SIZE:-256}
+NUM_MINIBATCHES=${NUM_MINIBATCHES:-32}
+NUM_UPDATES_PER_BATCH=${NUM_UPDATES_PER_BATCH:-10}
 SEED=${SEED:-0}
 INIT_BALL_SPEED=${INIT_BALL_SPEED:-0.05}
 INIT_TILT_FRAC=${INIT_TILT_FRAC:-0.05}
