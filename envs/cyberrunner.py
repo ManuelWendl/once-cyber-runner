@@ -1660,35 +1660,49 @@ class CyberRunnerEnv(gym.Env):
     def _compute_reward(self, ball_pos: np.ndarray, curr_progress: float, seg_idx: int) -> float:
         """Stabilized frontier checkpoints + goal bonus + hole penalty."""
         if self.prior_mode and self.prior_task == "stabilize":
-            # Potential-based shaping: φ(s) = −k_d·‖ball − target‖ − k_v·speed.
-            # Δφ is policy-invariant so dense terms cannot accumulate into a
-            # free positive return (the bug of the previous reward design).
-            k_d, k_v = 5.0, 0.5
-            dist_to_target = float(np.linalg.norm(ball_pos - self._prior_target))
-            phi = -k_d * dist_to_target - k_v * self._ball_speed
-            delta_phi = phi - self._prior_phi_prev
-            self._prior_phi_prev = phi
+            # "Safe basin" shaped reward — identical math to cyberrunner_mjx.py.
+            # Walls are NOT in the reward; the agent is free to use corners
+            # and walls as physical brakes through the MuJoCo dynamics.
+            #
+            # safe  = tanh(hole_margin / d_ref)     ∈ [0, 1]
+            # quiet = exp(-(speed / v_ref)²)         ∈ [0, 1]
+            # level = exp(-(abs_tilt / tilt_ref)²)   ∈ [0, 1]
+            #
+            # r = w_shape · (safe + quiet) + w_sweet · safe · quiet · (½ + ½·level)
+            #   − k_a · ‖action‖² − P_hole · 1[in_hole]
+            d_ref = 0.015
+            v_ref = 0.03
+            tilt_ref = 0.08
+            w_shape = 0.3
+            w_sweet = 1.4
+            k_a = 0.005
 
-            touching_wall = self._min_wall_distance(ball_pos) < (WALL_RADIUS + MARBLE_RADIUS + 0.002)
-            safe_enough = self._min_hole_distance > (HOLE_RADIUS + self.safe_hole_margin)
-            stable_here = touching_wall and safe_enough and self._ball_speed < self.checkpoint_speed_threshold
+            hole_margin = self._min_hole_distance - HOLE_RADIUS
+            safe = float(np.tanh(max(hole_margin, 0.0) / d_ref))
+            quiet = float(np.exp(-(self._ball_speed / v_ref) ** 2))
+            abs_tilt = float(np.hypot(self.data.qpos[0], self.data.qpos[1]))
+            level = float(np.exp(-(abs_tilt / tilt_ref) ** 2))
 
-            reward = -0.01 + delta_phi  # time cost + shaping
+            r_shape = w_shape * (safe + quiet)
+            r_sweet = w_sweet * safe * quiet * (0.5 + 0.5 * level)
+            action = np.asarray(self.data.ctrl, dtype=np.float32)
+            r_action = -k_a * float(np.dot(action, action))
 
-            if stable_here:
+            # Sweet-spot diagnostic (not used in reward).
+            in_sweet = (safe > 0.5) and (quiet > 0.5)
+            if in_sweet:
                 self._stable_steps += 1
             else:
                 self._stable_steps = 0
-
+            # Preserve the `_success` flag semantics: the episode is considered
+            # successful if the ball held a sweet-spot state for ≥ hold_steps.
             if self._stable_steps >= self.checkpoint_hold_steps:
-                reward += self.checkpoint_stabilize_reward
                 self._success = True
-                self._stable_steps = 0
 
             hole_reward = -self.hole_penalty if self._min_hole_distance < HOLE_RADIUS else 0.0
             self._in_checkpoint_prev = False
             self._prev_checkpoint_dist = np.inf
-            return reward + hole_reward
+            return r_shape + r_sweet + r_action + hole_reward
 
         checkpoint_reward = 0.0
         active_checkpoint = self._get_active_checkpoint_waypoint()

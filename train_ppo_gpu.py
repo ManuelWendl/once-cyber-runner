@@ -40,6 +40,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--init_tilt_frac", type=float, default=0.05)
     parser.add_argument("--num_evals", type=int, default=100)
     parser.add_argument("--save_every_evals", type=int, default=10)
+    # MJX solver budget — dominant lever for GPU rollout throughput.
+    parser.add_argument("--solver_iterations", type=int, default=6)
+    parser.add_argument("--ls_iterations", type=int, default=6)
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_entity", type=str, default=None)
     return parser.parse_args()
@@ -57,6 +60,8 @@ def main() -> None:
         episode_length=args.episode_length,
         init_ball_speed=args.init_ball_speed,
         init_tilt_frac=args.init_tilt_frac,
+        solver_iterations=args.solver_iterations,
+        ls_iterations=args.ls_iterations,
     )
 
     wandb_run = None

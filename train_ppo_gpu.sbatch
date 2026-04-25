@@ -10,18 +10,20 @@ set -e
 
 # ==== Configurable settings ====
 STEPS=${STEPS:-20000000}
-NUM_ENVS=${NUM_ENVS:-4096}
+# Bumped 4096 → 8192 to amortize MJX kernel-launch overhead.
+NUM_ENVS=${NUM_ENVS:-8192}
 UNROLL_LENGTH=${UNROLL_LENGTH:-20}
-# Invariant for STEPS to be respected:
-#   batch_size * num_minibatches == num_envs
-# → env_step_per_training_step = num_envs * unroll_length = 1 full rollout.
-BATCH_SIZE=${BATCH_SIZE:-1024}
+# Invariant: batch_size * num_minibatches == num_envs (2048 * 4 = 8192).
+BATCH_SIZE=${BATCH_SIZE:-2048}
 NUM_MINIBATCHES=${NUM_MINIBATCHES:-4}
 NUM_UPDATES_PER_BATCH=${NUM_UPDATES_PER_BATCH:-4}
 SEED=${SEED:-0}
 INIT_BALL_SPEED=${INIT_BALL_SPEED:-0.05}
 INIT_TILT_FRAC=${INIT_TILT_FRAC:-0.05}
 NUM_EVALS=${NUM_EVALS:-100}
+# MJX solver budget (primary lever for rollout throughput — defaults are 100/50).
+SOLVER_ITERATIONS=${SOLVER_ITERATIONS:-6}
+LS_ITERATIONS=${LS_ITERATIONS:-6}
 MAX_VIDEO_SPAWNS=${MAX_VIDEO_SPAWNS:-32}
 WANDB_PROJECT=${WANDB_PROJECT:-cyberrunner-prior-gpu}
 WANDB_ENTITY=${WANDB_ENTITY:-filippostaffoni-eth-z-rich}
@@ -85,6 +87,8 @@ python train_ppo_gpu.py \
   --num_minibatches $NUM_MINIBATCHES \
   --num_updates_per_batch $NUM_UPDATES_PER_BATCH \
   --num_evals $NUM_EVALS \
+  --solver_iterations $SOLVER_ITERATIONS \
+  --ls_iterations $LS_ITERATIONS \
   --seed $SEED \
   --init_ball_speed $INIT_BALL_SPEED \
   --init_tilt_frac $INIT_TILT_FRAC \
