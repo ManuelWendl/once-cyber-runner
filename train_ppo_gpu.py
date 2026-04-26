@@ -15,8 +15,67 @@ import pickle
 import time
 
 import jax
+import jax.numpy as jnp
+from brax.envs.base import State, Wrapper
 
 from envs.cyberrunner_mjx import CyberRunnerMJXEnv
+
+
+class RunningRewardNormalizationWrapper(Wrapper):
+    """Per-env running estimate of discounted-return std; normalizes reward.
+
+    Mirrors SB3 ``VecNormalize(norm_reward=True)``: tracks the discounted
+    return ``R_t = γ·R_{t-1} + r_t`` (reset to 0 when the previous step ended
+    an episode) and divides outgoing reward by ``sqrt(var(R) + eps)``,
+    clipping to ``±clip``.
+
+    Brax env state is per-env (vmapped), so each env carries its own Welford
+    running stats. After ~thousand steps per env this converges to the true
+    discounted-return variance — adequate for the millions-of-steps regime.
+    """
+
+    def __init__(self, env, gamma: float = 0.99, eps: float = 1e-8,
+                 clip: float = 10.0):
+        super().__init__(env)
+        self._gamma = float(gamma)
+        self._eps = float(eps)
+        self._clip = float(clip)
+
+    def reset(self, rng: jax.Array) -> State:
+        state = self.env.reset(rng)
+        z = jnp.zeros((), dtype=jnp.float32)
+        info = {
+            **state.info,
+            "_rn_ret": z,
+            "_rn_mean": z,
+            "_rn_m2": z,
+            "_rn_count": z,
+        }
+        return state.replace(info=info)
+
+    def step(self, state: State, action: jax.Array) -> State:
+        new_state = self.env.step(state, action)
+        # Reset return roll-up if the previous transition ended the episode.
+        ret_prev = jnp.where(state.done > 0.5, 0.0, state.info["_rn_ret"])
+        ret = self._gamma * ret_prev + new_state.reward
+        # Welford online update on `ret` (single sample per env per step).
+        count = state.info["_rn_count"] + 1.0
+        delta = ret - state.info["_rn_mean"]
+        mean = state.info["_rn_mean"] + delta / count
+        delta2 = ret - mean
+        m2 = state.info["_rn_m2"] + delta * delta2
+        var = m2 / jnp.maximum(count, 1.0)
+        # SB3 convention: divide by std but DO NOT subtract the mean.
+        norm = new_state.reward / jnp.sqrt(var + self._eps)
+        norm = jnp.clip(norm, -self._clip, self._clip)
+        info = {
+            **new_state.info,
+            "_rn_ret": ret,
+            "_rn_mean": mean,
+            "_rn_m2": m2,
+            "_rn_count": count,
+        }
+        return new_state.replace(reward=norm.astype(jnp.float32), info=info)
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,6 +122,11 @@ def main() -> None:
         solver_iterations=args.solver_iterations,
         ls_iterations=args.ls_iterations,
     )
+    # Mirror CPU `VecNormalize(norm_reward=True)`: divide reward by running
+    # std of the discounted return. Per-env Welford in JAX, see class doc.
+    env = RunningRewardNormalizationWrapper(
+        env, gamma=args.discounting, clip=10.0,
+    )
 
     wandb_run = None
     if args.wandb_project:
@@ -108,15 +172,15 @@ def main() -> None:
         # per episode → mean across episodes = success RATE ∈ [0, 1].
         # Matches CPU `episode/success_rate` semantics.
         success_rate = _get("eval/episode_success")
-        sweet_sum = _get("eval/episode_sweet_step")
+        quiet_sum = _get("eval/episode_quiet_step")
         stable_sum = _get("eval/episode_stable_steps")
         ball_speed_sum = _get("eval/episode_ball_speed")
         safe_margin_sum = _get("eval/episode_safe_hole_margin")
 
-        # Per-step reward (max achievable ~ w_shape·2 + w_sweet ≈ 2.0).
+        # Per-step reward (post-normalization, ~unit scale once Welford warms up).
         reward_per_step = reward_sum / ep_len_safe
-        # Fraction of steps the ball spent in a sweet-spot state.
-        sweet_frac = sweet_sum / ep_len_safe
+        # Fraction of steps the ball spent in a quiet (low-velocity) state.
+        quiet_frac = quiet_sum / ep_len_safe
         # Avg value of the running stable_steps counter during the episode.
         stable_avg = stable_sum / ep_len_safe
         # Episode-mean ball speed and hole margin.
@@ -130,7 +194,7 @@ def main() -> None:
         summary = (
             f"len={ep_len:.1f}/{int(ep_len_cap)} ({length_frac:.0%}) "
             f"success_rate={success_rate:.3f} "
-            f"sweet_frac={sweet_frac:.3f} "
+            f"quiet_frac={quiet_frac:.3f} "
             f"stable_avg={stable_avg:.1f} "
             f"reward/step={reward_per_step:.3f} "
             f"sps={_get('training/sps'):.0f}"
@@ -140,32 +204,32 @@ def main() -> None:
         if wandb_run is not None:
             import wandb
             elapsed = time.time() - t_start
+            term_hole = _get("eval/episode_term_hole")
+            term_timeout = _get("eval/episode_term_timeout")
             payload = {"train/step": int(num_steps)}
             # Pass through every scalar Brax gives us (eval/*, training/*).
             for k, v in flat.items():
                 payload[k] = v
-            # ---- Interpretable derived metrics (what to watch) ----
-            payload["perf/walltime_s"] = elapsed
-            payload["perf/sps_overall"] = num_steps / max(elapsed, 1e-6)
-            payload["eval_norm/length_frac"] = length_frac
-            payload["eval_norm/success_rate"] = success_rate
-            payload["eval_norm/sweet_frac"] = sweet_frac
-            payload["eval_norm/stable_avg"] = stable_avg
-            payload["eval_norm/reward_per_step"] = reward_per_step
-            # Composite "health": episode survives AND succeeded.
-            payload["eval_norm/deployment_score"] = length_frac * success_rate
-            # ---- CPU-aligned aliases (match keys emitted by train_ppo.py) ----
-            # Same panels can overlay both runs in one wandb project.
+            # ---- Unified metric set (must match train_ppo.py keys) ----
             payload["episode/mean_reward"] = reward_sum
             payload["episode/mean_length"] = ep_len
-            payload["episode/success_rate"] = success_rate          # ∈ [0, 1]
+            payload["episode/length_frac"] = length_frac
+            payload["episode/success_rate"] = success_rate
             payload["episode/mean_stable_steps"] = stable_avg
+            payload["episode/quiet_frac"] = quiet_frac
             payload["episode/mean_ball_speed"] = ball_speed_mean
             payload["episode/mean_safe_hole_margin"] = safe_margin_mean
+            payload["episode/reward_per_step"] = reward_per_step
+            payload["episode/deployment_score"] = length_frac * success_rate
+            payload["episode/termination_hole_rate"] = term_hole
+            payload["episode/termination_timeout_rate"] = term_timeout
+            payload["episode/termination_other_rate"] = max(
+                0.0, 1.0 - term_hole - term_timeout
+            )
             payload["rollout/ep_rew_mean"] = reward_sum
             payload["rollout/ep_len_mean"] = ep_len
-            payload["rollout/final_ball_speed_mean"] = ball_speed_mean
-            payload["rollout/final_safe_hole_margin_mean"] = safe_margin_mean
+            payload["perf/walltime_s"] = elapsed
+            payload["perf/sps_overall"] = num_steps / max(elapsed, 1e-6)
             wandb.log(payload, step=int(num_steps))
 
         # Periodic checkpointing to survive crashes.
@@ -184,12 +248,48 @@ def main() -> None:
     # Import here so the module-load cost is not paid unless this script is run.
     from brax.training.agents.ppo import train as ppo_train
     from brax.training.agents.ppo import networks as ppo_networks
-    import functools
+    from brax.training import distribution as brax_distribution
+    from brax.training import networks as brax_networks
+    from brax.training.acme import running_statistics
 
-    # Match SB3's `MlpPolicy` default capacity used by the CPU run:
-    # two hidden layers of 64 with tanh activation, separate policy/value MLPs.
+    # Mimic SB3 `MlpPolicy` for continuous Box actions:
+    #   - two hidden layers of 64, tanh activation, separate policy/value MLPs
+    #   - DiagGaussian (NOT tanh-squashed) action distribution
+    # Brax's default `make_ppo_networks` uses a NormalTanhDistribution; we
+    # rebuild the factory inline with NormalDistribution so the parametric
+    # action distribution matches SB3.
+    def make_ppo_networks_normal(
+        observation_size,
+        action_size,
+        preprocess_observations_fn=running_statistics.normalize,
+        policy_hidden_layer_sizes=(64, 64),
+        value_hidden_layer_sizes=(64, 64),
+        activation=jax.nn.tanh,
+    ):
+        parametric_action_distribution = brax_distribution.NormalDistribution(
+            event_size=action_size,
+        )
+        policy_network = brax_networks.make_policy_network(
+            parametric_action_distribution.param_size,
+            observation_size,
+            preprocess_observations_fn=preprocess_observations_fn,
+            hidden_layer_sizes=policy_hidden_layer_sizes,
+            activation=activation,
+        )
+        value_network = brax_networks.make_value_network(
+            observation_size,
+            preprocess_observations_fn=preprocess_observations_fn,
+            hidden_layer_sizes=value_hidden_layer_sizes,
+            activation=activation,
+        )
+        return ppo_networks.PPONetworks(
+            policy_network=policy_network,
+            value_network=value_network,
+            parametric_action_distribution=parametric_action_distribution,
+        )
+
     network_factory = functools.partial(
-        ppo_networks.make_ppo_networks,
+        make_ppo_networks_normal,
         policy_hidden_layer_sizes=(64, 64),
         value_hidden_layer_sizes=(64, 64),
         activation=jax.nn.tanh,

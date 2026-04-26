@@ -11,21 +11,19 @@ Scope (per the approved plan):
     - spawn from the existing `prior_start_points` bank on CPU, sampled
       per-episode via JAX rng at reset
 
-Reward (per-step, "safe basin" shaping):
-    safe  = tanh(hole_margin / d_ref)                # [0, 1], gradient everywhere
-    quiet = exp(-(speed / v_ref)**2)                 # [0, 1], aggressive at 0
-    level = exp(-(abs_tilt / tilt_ref)**2)           # [0, 1]
+Reward (per-step, survival shaping — identical to CPU stabilize branch):
+    quiet = exp(-(speed / v_ref)**2)                 # [0, 1], peak at 0 speed
 
-    r_step = w_shape · (safe + quiet)                # dense additive floor
-           + w_sweet · safe · quiet · (0.5 + 0.5·level)  # multiplicative sweet-spot
+    r_step = w_quiet · quiet                         # low velocity = +reward
            − k_a · ‖action‖²                         # smoothness
            − P_hole  if ball falls in a hole         # terminal penalty
 
-Walls are NOT rewarded or penalized. The agent is free to discover that
-resting against walls / in corners is a stable strategy through physics.
+Distance to holes is NOT in the reward. If the ball stabilizes anywhere safe
+(even near a hole edge), that is acceptable. The hole penalty itself is
+large enough (50) to dominate the long-horizon return.
 
 Termination: hole fall OR timeout (episode_length). No early success exit —
-the agent gets to keep accruing sweet-spot reward for the full 500 steps.
+the agent gets to keep accruing reward for the full 500 steps.
 """
 from __future__ import annotations
 
@@ -46,7 +44,6 @@ from envs.cyberrunner import (
     FRAME_SKIP,
     HOLE_RADIUS,
     JOINT_ANGLE_NOISE,
-    MARBLE_RADIUS,
     RANGE_ALPHA,
     RANGE_BETA,
     TIMESTEP,
@@ -103,21 +100,17 @@ class CyberRunnerMJXEnv(PipelineEnv):
         # EMA smoothing α for the noisy ball speed used by the reward
         # (matches CPU `checkpoint_speed_ema_alpha=0.8`).
         speed_ema_alpha: float = 0.8,
-        # "Safe basin" reward constants.
-        d_ref: float = 0.015,          # hole-margin reference (m) — tanh scale
+        # Survival reward constants.
         v_ref: float = 0.03,           # speed reference (m/s) — exp scale
-        tilt_ref: float = 0.08,        # tilt reference (rad) — exp scale
-        w_shape: float = 0.3,          # additive-floor weight
-        w_sweet: float = 1.4,          # multiplicative sweet-spot weight
+        w_quiet: float = 1.0,          # weight on the low-velocity term
         k_a: float = 0.005,            # action ℓ2 cost
         p_hole: float = 50.0,          # terminal hole penalty
-        # Sweet-spot flag thresholds (for the `success` metric only; NOT reward).
-        safe_th: float = 0.5,
+        # `success` metric threshold on the quiet term.
         quiet_th: float = 0.5,
-        # Episode-level success criterion — matches CPU env's
-        # `checkpoint_hold_steps=12` (≈ 0.2 s at 60 Hz). An episode is marked
-        # successful once stable_steps crosses this threshold.
-        success_hold_steps: int = 12,
+        # Episode-level success criterion — matches CPU
+        # `checkpoint_hold_steps=6`. Once stable_steps crosses this, the
+        # `success` metric fires once for the episode.
+        success_hold_steps: int = 6,
         # MJX solver budget. MuJoCo's defaults (100/50) are overkill for a
         # marble-on-board system that converges in < 5 Newton steps. These
         # knobs are the dominant lever for GPU rollout throughput.
@@ -192,15 +185,11 @@ class CyberRunnerMJXEnv(PipelineEnv):
         self._range_alpha = (float(RANGE_ALPHA[0]), float(RANGE_ALPHA[1]))
         self._range_beta = (float(RANGE_BETA[0]), float(RANGE_BETA[1]))
 
-        # Reward constants ("safe basin" shaping).
-        self._d_ref = float(d_ref)
+        # Reward constants (survival shaping).
         self._v_ref = float(v_ref)
-        self._tilt_ref = float(tilt_ref)
-        self._w_shape = float(w_shape)
-        self._w_sweet = float(w_sweet)
+        self._w_quiet = float(w_quiet)
         self._k_a = float(k_a)
         self._p_hole = float(p_hole)
-        self._safe_th = float(safe_th)
         self._quiet_th = float(quiet_th)
         self._success_hold_steps = int(success_hold_steps)
         self._solver_iterations = int(solver_iterations)
@@ -255,37 +244,49 @@ class CyberRunnerMJXEnv(PipelineEnv):
         # Initial noisy ball pos (no per-step noise, just bias).
         ball_pos_noisy0 = ball_pos + bias_ball
 
-        stats = _EpStats(
-            prev_ball_pos_clean=ball_pos,
-            prev_ball_pos_noisy=ball_pos_noisy0,
-            ema_speed=jnp.asarray(0.0, dtype=jnp.float32),
-            obs_buf=jnp.zeros((N_STACK - 1, OBS_DIM), dtype=jnp.float32),
-            bias_ball=bias_ball,
-            bias_joint=bias_joint,
-            stable_steps=jnp.asarray(0, dtype=jnp.int32),
-            step_count=jnp.asarray(0, dtype=jnp.int32),
-            success=jnp.asarray(0.0, dtype=jnp.float32),
-        )
         # First-step observation: use per-episode bias only (no per-step
         # sensor noise at reset — matches CPU which adds it inside step()).
         per_frame = self._build_per_frame_obs(
             pipeline_state.qpos[0], pipeline_state.qpos[1],
             ball_pos_noisy0, bias_joint, jnp.zeros(2, dtype=jnp.float32),
         )
-        obs = self._stack_with_buffer(stats.obs_buf, per_frame)
+        # Seed the buffer with [zero, zero, per_frame_reset] so the spawn
+        # frame enters the stack history, matching SB3 VecFrameStack which
+        # writes the reset obs into the freshest slot and then shifts.
+        # Without this the first 3 GPU step obs lose the spawn frame.
+        obs_buf0 = jnp.concatenate(
+            [
+                jnp.zeros((N_STACK - 2, OBS_DIM), dtype=jnp.float32),
+                per_frame[None, :],
+            ],
+            axis=0,
+        )
+        stats = _EpStats(
+            prev_ball_pos_clean=ball_pos,
+            prev_ball_pos_noisy=ball_pos_noisy0,
+            ema_speed=jnp.asarray(0.0, dtype=jnp.float32),
+            obs_buf=obs_buf0,
+            bias_ball=bias_ball,
+            bias_joint=bias_joint,
+            stable_steps=jnp.asarray(0, dtype=jnp.int32),
+            step_count=jnp.asarray(0, dtype=jnp.int32),
+            success=jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        obs = self._stack_with_buffer(
+            jnp.zeros((N_STACK - 1, OBS_DIM), dtype=jnp.float32), per_frame,
+        )
         # All per-step metric keys must exist in reset for the EpisodeWrapper
         # to sum them consistently across the rollout.
         _zero = jnp.asarray(0.0, dtype=jnp.float32)
         metrics = {
             "success": _zero,        # per-step, fires once per episode
-            "sweet_step": _zero,     # per-step indicator
+            "quiet_step": _zero,     # per-step indicator
             "stable_steps": stats.stable_steps.astype(jnp.float32),
-            "r_safe": _zero,
             "r_quiet": _zero,
-            "r_level": _zero,
-            "r_sweet": _zero,
             "ball_speed": _zero,
             "safe_hole_margin": _zero,
+            "term_hole": _zero,
+            "term_timeout": _zero,
         }
         info = {"stats": stats, "rng": rng}
         return State(pipeline_state, obs, jnp.asarray(0.0, dtype=jnp.float32),
@@ -320,38 +321,33 @@ class CyberRunnerMJXEnv(PipelineEnv):
             + (1.0 - self._speed_ema_alpha) * obs_ball_speed
         )
 
-        # Hole distance from CLEAN ball position (matches CPU reward).
+        # Hole distance from CLEAN ball position — used for termination only,
+        # NOT for shaping. (Diagnostic `safe_hole_margin` still logged.)
         hole_d = jnp.min(jnp.linalg.norm(self._holes - ball_pos[None, :], axis=1))
         hole_margin = hole_d - HOLE_RADIUS
 
-        # Tilt magnitude from CLEAN qpos for the `level` term.
+        # Tilt magnitude from CLEAN qpos (diagnostic).
         alpha = pipeline_state.qpos[0]
         beta = pipeline_state.qpos[1]
         abs_tilt = jnp.sqrt(alpha * alpha + beta * beta)
 
-        # Shaped potentials — all in [0, 1]. Walls are NOT in the reward;
-        # the agent is free to use them as physical brakes.
-        safe = jnp.tanh(jnp.maximum(hole_margin, 0.0) / self._d_ref)
+        # Survival shaping: reward stays small per step but ramps up over the
+        # 500-step episode horizon if the ball remains slow ("jiggly is fine").
         quiet = jnp.exp(-(ema_speed / self._v_ref) ** 2)
-        level = jnp.exp(-(abs_tilt / self._tilt_ref) ** 2)
-
-        # Additive floor (dense early signal) + multiplicative sweet-spot bonus.
-        r_shape = self._w_shape * (safe + quiet)
-        r_sweet = self._w_sweet * safe * quiet * (0.5 + 0.5 * level)
         r_action = -self._k_a * jnp.sum(action * action)
 
-        # Events.
-        in_hole = hole_d < (HOLE_RADIUS + MARBLE_RADIUS * 0.2)
+        # Hole termination: identical geometry to CPU env (`HOLE_RADIUS`).
+        in_hole = hole_d < HOLE_RADIUS
 
         reward = (
-            r_shape + r_sweet + r_action
+            self._w_quiet * quiet + r_action
             - jnp.where(in_hole, self._p_hole, 0.0)
         )
 
-        # Sweet-spot indicator (diagnostic only — never fed into reward).
-        in_sweet = (safe > self._safe_th) & (quiet > self._quiet_th)
+        # Quiet indicator (diagnostic + success counter).
+        in_quiet = quiet > self._quiet_th
         stable_steps = jnp.where(
-            in_sweet, stats.stable_steps + 1, jnp.int32(0)
+            in_quiet, stats.stable_steps + 1, jnp.int32(0)
         )
 
         step_count = stats.step_count + 1
@@ -394,20 +390,23 @@ class CyberRunnerMJXEnv(PipelineEnv):
         # rollout — divide by avg_episode_length in progress_fn for means
         # (or interpret directly when summing makes semantic sense, like
         # `success`, which fires once per episode).
-        in_sweet_f = in_sweet.astype(jnp.float32)
+        in_quiet_f = in_quiet.astype(jnp.float32)
+        in_hole_f = in_hole.astype(jnp.float32)
+        timeout_f = timeout.astype(jnp.float32)
         metrics = dict(state.metrics)
         metrics.update({
             "success": success_metric,        # 0/1, fires once per episode
-            "sweet_step": in_sweet_f,         # 0/1 per step (fraction-in-basin)
+            "quiet_step": in_quiet_f,         # 0/1 per step (fraction-quiet)
             "stable_steps": stable_steps.astype(jnp.float32),
-            "r_safe": safe,
             "r_quiet": quiet,
-            "r_level": level,
-            "r_sweet": r_sweet,
             # `ball_speed` reports the EMA-smoothed noisy speed used by the
             # reward, matching CPU's `_ball_speed`.
             "ball_speed": ema_speed.astype(jnp.float32),
             "safe_hole_margin": jnp.maximum(hole_margin, 0.0).astype(jnp.float32),
+            # Termination indicators (Brax sums per-step → 0/1 per episode →
+            # mean across episodes = termination rate).
+            "term_hole": in_hole_f,
+            "term_timeout": timeout_f,
         })
         info = {**state.info, "stats": new_stats, "rng": rng}
         return state.replace(

@@ -1,6 +1,7 @@
 """PPO training for the CyberRunner prior (stabilization) task using stable-baselines3."""
 import argparse
 import pathlib
+import time
 from collections import deque
 
 import gymnasium as gym
@@ -30,7 +31,7 @@ def make_prior_env(
         randomize_init_pos=False,
         include_vision=False,
         reward_every_n_waypoints=3,
-        hole_penalty=10.0,
+        hole_penalty=50.0,
         checkpoint_radius=0.015,
         checkpoint_hold_steps=6,
         checkpoint_speed_threshold=0.05,
@@ -54,7 +55,9 @@ def make_prior_env(
         prior_start_point_spacing=0.01,
         prior_spawn_merge_radius=0.0,
         checkpoint_progress_reward_scale=progress_scale,
-        terminate_on_checkpoint_stabilized=True,
+        # Survival prior: keep the ball alive for the full episode rather than
+        # ending early on first stabilization. Matches GPU env behavior.
+        terminate_on_checkpoint_stabilized=False,
     )
     return FlattenObsWrapper(env, seed=seed)
 
@@ -160,98 +163,114 @@ def main():
         import wandb
 
         class WandbCallback(BaseCallback):
+            """Emit the unified CPU/GPU metric set on a fixed step cadence.
+
+            Metric keys here MUST match those emitted by `train_ppo_gpu.py`'s
+            `progress_fn` so panels overlay across backends.
+            """
+
+            EP_LEN_CAP = 500.0
+
             def __init__(self, log_every: int):
                 super().__init__()
                 self._log_every = int(log_every)
                 self._last_log_step = 0
-                self._ep_rewards = []
-                self._ep_lengths = []
-                self._ep_success = []
-                self._ep_stable_steps = []
-                self._ep_checkpoint_dist = []
-                self._ep_ball_speed = []
-                self._ep_safe_hole_margin = []
-                self._ep_prior_target_dist = []
-                self._termination_counts = {
-                    "stabilized": 0,
-                    "checkpoint": 0,
-                    "hole": 0,
-                    "timeout": 0,
-                    "goal": 0,
-                    "other": 0,
-                }
+                self._t_start = time.time()
+                self._ep_rewards: list[float] = []
+                self._ep_lengths: list[float] = []
+                self._ep_success: list[float] = []
+                self._ep_stable_steps: list[float] = []
+                self._ep_quiet_frac: list[float] = []
+                self._ep_ball_speed_mean: list[float] = []
+                self._ep_safe_margin_mean: list[float] = []
+                self._termination_counts = {"hole": 0, "timeout": 0, "other": 0}
 
             def _on_step(self) -> bool:
                 infos = self.locals.get("infos", [])
-                ep_infos = [i for i in infos if "episode" in i]
-                for info in ep_infos:
+                for info in (i for i in infos if "episode" in i):
+                    ep_len = float(info["episode"]["l"])
+                    ep_len_safe = max(ep_len, 1.0)
                     self._ep_rewards.append(float(info["episode"]["r"]))
-                    self._ep_lengths.append(float(info["episode"]["l"]))
+                    self._ep_lengths.append(ep_len)
                     self._ep_success.append(float(info.get("success", 0.0)))
                     self._ep_stable_steps.append(float(info.get("stable_steps", 0.0)))
-                    self._ep_checkpoint_dist.append(float(info.get("checkpoint_dist", np.nan)))
-                    self._ep_ball_speed.append(float(info.get("ball_speed", np.nan)))
-                    self._ep_safe_hole_margin.append(float(info.get("safe_hole_margin", np.nan)))
-                    self._ep_prior_target_dist.append(float(info.get("prior_target_dist", np.nan)))
+                    self._ep_quiet_frac.append(
+                        float(info.get("ep_quiet_steps", 0.0)) / ep_len_safe
+                    )
+                    self._ep_ball_speed_mean.append(
+                        float(info.get("ep_ball_speed_sum", 0.0)) / ep_len_safe
+                    )
+                    self._ep_safe_margin_mean.append(
+                        float(info.get("ep_safe_hole_margin_sum", 0.0)) / ep_len_safe
+                    )
                     reason = str(info.get("termination_reason", "other"))
                     if reason not in self._termination_counts:
                         reason = "other"
                     self._termination_counts[reason] += 1
 
-                if self.num_timesteps - self._last_log_step >= self._log_every:
-                    payload = {"train/step": self.num_timesteps}
-                    if self._ep_rewards:
-                        mean_reward = float(np.mean(self._ep_rewards))
-                        mean_length = float(np.mean(self._ep_lengths))
-                        mean_success = float(np.mean(self._ep_success))
-                        mean_stable = float(np.mean(self._ep_stable_steps))
-                        mean_checkpoint_dist = float(np.nanmean(self._ep_checkpoint_dist))
-                        mean_ball_speed = float(np.nanmean(self._ep_ball_speed))
-                        mean_safe_margin = float(np.nanmean(self._ep_safe_hole_margin))
-                        mean_prior_target_dist = float(np.nanmean(self._ep_prior_target_dist))
-                        total_eps = len(self._ep_rewards)
-                        payload.update({
-                            "episode/mean_reward": mean_reward,
-                            "episode/mean_length": mean_length,
-                            "episode/success_rate": mean_success,
-                            "episode/mean_stable_steps": mean_stable,
-                            "episode/mean_checkpoint_dist": mean_checkpoint_dist,
-                            "episode/mean_ball_speed": mean_ball_speed,
-                            "episode/mean_safe_hole_margin": mean_safe_margin,
-                            "episode/mean_prior_target_dist": mean_prior_target_dist,
-                            "rollout/ep_rew_mean": mean_reward,
-                            "rollout/ep_len_mean": mean_length,
-                            "rollout/episodes": total_eps,
-                            "rollout/final_checkpoint_dist_mean": mean_checkpoint_dist,
-                            "rollout/final_ball_speed_mean": mean_ball_speed,
-                            "rollout/final_safe_hole_margin_mean": mean_safe_margin,
-                            "rollout/final_prior_target_dist_mean": mean_prior_target_dist,
-                        })
-                        for reason, count in self._termination_counts.items():
-                            payload[f"episode/termination_{reason}_rate"] = float(count / max(total_eps, 1))
-                        print(
-                            f"[step {self.num_timesteps}] "
-                            f"ep_rew_mean={mean_reward:.3f} "
-                            f"ep_len_mean={mean_length:.1f} "
-                            f"success_rate={mean_success:.3f} "
-                            f"stable_steps={mean_stable:.2f} "
-                            f"final_ball_speed={mean_ball_speed:.3f} "
-                            f"final_safe_margin={mean_safe_margin:.3f} "
-                            f"episodes={total_eps}",
-                            flush=True,
+                if self.num_timesteps - self._last_log_step < self._log_every:
+                    return True
+
+                payload = {"train/step": self.num_timesteps}
+                if self._ep_rewards:
+                    n_eps = len(self._ep_rewards)
+                    mean_reward = float(np.mean(self._ep_rewards))
+                    mean_length = float(np.mean(self._ep_lengths))
+                    success_rate = float(np.mean(self._ep_success))
+                    length_frac = mean_length / self.EP_LEN_CAP
+                    reward_per_step = mean_reward / max(mean_length, 1.0)
+                    mean_stable = float(np.mean(self._ep_stable_steps))
+                    quiet_frac = float(np.mean(self._ep_quiet_frac))
+                    mean_ball_speed = float(np.mean(self._ep_ball_speed_mean))
+                    mean_safe_margin = float(np.mean(self._ep_safe_margin_mean))
+                    payload.update({
+                        # Core episode metrics — same keys on GPU.
+                        "episode/mean_reward": mean_reward,
+                        "episode/mean_length": mean_length,
+                        "episode/length_frac": length_frac,
+                        "episode/success_rate": success_rate,
+                        "episode/mean_stable_steps": mean_stable,
+                        "episode/quiet_frac": quiet_frac,
+                        "episode/mean_ball_speed": mean_ball_speed,
+                        "episode/mean_safe_hole_margin": mean_safe_margin,
+                        "episode/reward_per_step": reward_per_step,
+                        "episode/deployment_score": length_frac * success_rate,
+                        # Rollout aliases (kept for SB3-style panels).
+                        "rollout/ep_rew_mean": mean_reward,
+                        "rollout/ep_len_mean": mean_length,
+                        "rollout/episodes": n_eps,
+                    })
+                    for reason, count in self._termination_counts.items():
+                        payload[f"episode/termination_{reason}_rate"] = float(
+                            count / max(n_eps, 1)
                         )
-                        self._ep_rewards.clear()
-                        self._ep_lengths.clear()
-                        self._ep_success.clear()
-                        self._ep_stable_steps.clear()
-                        self._ep_checkpoint_dist.clear()
-                        self._ep_ball_speed.clear()
-                        self._ep_safe_hole_margin.clear()
-                        self._ep_prior_target_dist.clear()
-                        for key in self._termination_counts:
-                            self._termination_counts[key] = 0
-                    wandb.log(payload, step=self.num_timesteps)
-                    self._last_log_step = self.num_timesteps
+                    print(
+                        f"[step {self.num_timesteps}] "
+                        f"len={mean_length:.1f}/{int(self.EP_LEN_CAP)} "
+                        f"({length_frac:.0%}) "
+                        f"success_rate={success_rate:.3f} "
+                        f"quiet_frac={quiet_frac:.3f} "
+                        f"stable={mean_stable:.1f} "
+                        f"reward/step={reward_per_step:.3f} "
+                        f"eps={n_eps}",
+                        flush=True,
+                    )
+                    self._ep_rewards.clear()
+                    self._ep_lengths.clear()
+                    self._ep_success.clear()
+                    self._ep_stable_steps.clear()
+                    self._ep_quiet_frac.clear()
+                    self._ep_ball_speed_mean.clear()
+                    self._ep_safe_margin_mean.clear()
+                    for key in self._termination_counts:
+                        self._termination_counts[key] = 0
+
+                elapsed = time.time() - self._t_start
+                payload["perf/walltime_s"] = elapsed
+                payload["perf/sps_overall"] = self.num_timesteps / max(elapsed, 1e-6)
+
+                wandb.log(payload, step=self.num_timesteps)
+                self._last_log_step = self.num_timesteps
                 return True
 
         class SyncNormCallback(BaseCallback):

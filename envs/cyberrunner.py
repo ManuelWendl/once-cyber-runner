@@ -1277,6 +1277,10 @@ class CyberRunnerEnv(gym.Env):
         self._success = False
         self._prior_target = np.zeros(2, dtype=np.float32)
         self._prior_phi_prev = 0.0
+        # Per-episode running sums for parity with GPU progress_fn metrics.
+        self._ep_quiet_steps = 0
+        self._ep_ball_speed_sum = 0.0
+        self._ep_safe_hole_margin_sum = 0.0
 
     def _build_prior_start_points(self) -> np.ndarray:
         """Recoverable start states for prior-mode resets."""
@@ -1429,6 +1433,9 @@ class CyberRunnerEnv(gym.Env):
         self._stable_steps = 0
         self._in_checkpoint_prev = False
         self._success = False
+        self._ep_quiet_steps = 0
+        self._ep_ball_speed_sum = 0.0
+        self._ep_safe_hole_margin_sum = 0.0
         ball_pos = self._get_ball_pos_board_frame()
         self._prev_ball_pos = ball_pos.copy()
         ball_noise = self.np_random.uniform(-BALL_POS_NOISE, BALL_POS_NOISE, size=2)
@@ -1559,6 +1566,10 @@ class CyberRunnerEnv(gym.Env):
             "stable_steps": int(self._stable_steps),
             "success": float(self._success),
             "prior_target_dist": prior_target_dist,
+            # Episode running sums (read on episode-end by WandbCallback).
+            "ep_quiet_steps": int(self._ep_quiet_steps),
+            "ep_ball_speed_sum": float(self._ep_ball_speed_sum),
+            "ep_safe_hole_margin_sum": float(self._ep_safe_hole_margin_sum),
             "log_path_progress": np.array([curr_progress], dtype=np.float32),
             "log_checkpoint_dist": np.array([checkpoint_dist], dtype=np.float32),
             "log_ball_speed": np.array([self._ball_speed], dtype=np.float32),
@@ -1639,49 +1650,39 @@ class CyberRunnerEnv(gym.Env):
     def _compute_reward(self, ball_pos: np.ndarray, curr_progress: float, seg_idx: int) -> float:
         """Stabilized frontier checkpoints + goal bonus + hole penalty."""
         if self.prior_mode and self.prior_task == "stabilize":
-            # "Safe basin" shaped reward — identical math to cyberrunner_mjx.py.
-            # Walls are NOT in the reward; the agent is free to use corners
-            # and walls as physical brakes through the MuJoCo dynamics.
-            #
-            # safe  = tanh(hole_margin / d_ref)     ∈ [0, 1]
-            # quiet = exp(-(speed / v_ref)²)         ∈ [0, 1]
-            # level = exp(-(abs_tilt / tilt_ref)²)   ∈ [0, 1]
-            #
-            # r = w_shape · (safe + quiet) + w_sweet · safe · quiet · (½ + ½·level)
-            #   − k_a · ‖action‖² − P_hole · 1[in_hole]
-            d_ref = 0.015
+            # Survival-shaped reward. Goal: ball stays alive on the board for
+            # the full 500-step episode without falling into a hole.
+            #   quiet = exp(-(speed / v_ref)²)   ∈ [0, 1]   (low velocity good)
+            #   r = w_quiet · quiet − k_a · ‖action‖² − P_hole · 1[in_hole]
+            # Distance to holes is NOT in the reward — if the ball stabilizes
+            # anywhere safe (including near a hole edge), that is fine.
             v_ref = 0.03
-            tilt_ref = 0.08
-            w_shape = 0.3
-            w_sweet = 1.4
+            w_quiet = 1.0
             k_a = 0.005
 
-            hole_margin = self._min_hole_distance - HOLE_RADIUS
-            safe = float(np.tanh(max(hole_margin, 0.0) / d_ref))
             quiet = float(np.exp(-(self._ball_speed / v_ref) ** 2))
-            abs_tilt = float(np.hypot(self.data.qpos[0], self.data.qpos[1]))
-            level = float(np.exp(-(abs_tilt / tilt_ref) ** 2))
-
-            r_shape = w_shape * (safe + quiet)
-            r_sweet = w_sweet * safe * quiet * (0.5 + 0.5 * level)
             action = np.asarray(self.data.ctrl, dtype=np.float32)
             r_action = -k_a * float(np.dot(action, action))
 
-            # Sweet-spot diagnostic (not used in reward).
-            in_sweet = (safe > 0.5) and (quiet > 0.5)
-            if in_sweet:
+            # Stable-step counter on the quiet criterion (no hole-margin gate).
+            in_quiet = quiet > 0.5
+            if in_quiet:
                 self._stable_steps += 1
+                self._ep_quiet_steps += 1
             else:
                 self._stable_steps = 0
-            # Preserve the `_success` flag semantics: the episode is considered
-            # successful if the ball held a sweet-spot state for ≥ hold_steps.
             if self._stable_steps >= self.checkpoint_hold_steps:
                 self._success = True
+            # Per-episode running sums for parity-aligned wandb metrics.
+            self._ep_ball_speed_sum += float(self._ball_speed)
+            self._ep_safe_hole_margin_sum += max(
+                0.0, float(self._min_hole_distance - HOLE_RADIUS)
+            )
 
             hole_reward = -self.hole_penalty if self._min_hole_distance < HOLE_RADIUS else 0.0
             self._in_checkpoint_prev = False
             self._prev_checkpoint_dist = np.inf
-            return r_shape + r_sweet + r_action + hole_reward
+            return w_quiet * quiet + r_action + hole_reward
 
         checkpoint_reward = 0.0
         active_checkpoint = self._get_active_checkpoint_waypoint()
