@@ -252,12 +252,40 @@ def main() -> None:
     from brax.training import networks as brax_networks
     from brax.training.acme import running_statistics
 
+    # SB3 `MlpPolicy` uses a DiagGaussian (no tanh-squash). Brax ships only
+    # NormalTanhDistribution as a parametric wrapper, so we build a parallel
+    # class that swaps TanhBijector for an identity bijector.
+    class _IdentityBijector:
+        def forward(self, x):
+            return x
+
+        def inverse(self, y):
+            return y
+
+        def forward_log_det_jacobian(self, x):
+            return jnp.zeros_like(x)
+
+    class NormalDiagDistribution(brax_distribution.ParametricDistribution):
+        """DiagGaussian over R^action_size — matches SB3 MlpPolicy."""
+
+        def __init__(self, event_size, min_std=0.001, var_scale=1.0):
+            super().__init__(
+                param_size=2 * event_size,
+                postprocessor=_IdentityBijector(),
+                event_ndims=1,
+                reparametrizable=True,
+            )
+            self._min_std = min_std
+            self._var_scale = var_scale
+
+        def create_dist(self, parameters):
+            loc, scale = jnp.split(parameters, 2, axis=-1)
+            scale = (jax.nn.softplus(scale) + self._min_std) * self._var_scale
+            return brax_distribution.NormalDistribution(loc=loc, scale=scale)
+
     # Mimic SB3 `MlpPolicy` for continuous Box actions:
     #   - two hidden layers of 64, tanh activation, separate policy/value MLPs
     #   - DiagGaussian (NOT tanh-squashed) action distribution
-    # Brax's default `make_ppo_networks` uses a NormalTanhDistribution; we
-    # rebuild the factory inline with NormalDistribution so the parametric
-    # action distribution matches SB3.
     def make_ppo_networks_normal(
         observation_size,
         action_size,
@@ -266,7 +294,7 @@ def main() -> None:
         value_hidden_layer_sizes=(64, 64),
         activation=jax.nn.tanh,
     ):
-        parametric_action_distribution = brax_distribution.NormalDistribution(
+        parametric_action_distribution = NormalDiagDistribution(
             event_size=action_size,
         )
         policy_network = brax_networks.make_policy_network(
