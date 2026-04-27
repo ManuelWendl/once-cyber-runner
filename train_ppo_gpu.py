@@ -104,6 +104,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--init_ball_speed", type=float, default=0.05)
     parser.add_argument("--init_tilt_frac", type=float, default=0.05)
+    parser.add_argument(
+        "--prior_version",
+        type=str,
+        default="legacy",
+        choices=["legacy", "checkpoint_recovery"],
+    )
+    parser.add_argument("--mjx_smoke", action="store_true")
     parser.add_argument("--num_evals", type=int, default=100)
     parser.add_argument("--save_every_evals", type=int, default=10)
     # MJX solver budget — dominant lever for GPU rollout throughput.
@@ -126,9 +133,30 @@ def main() -> None:
         episode_length=args.episode_length,
         init_ball_speed=args.init_ball_speed,
         init_tilt_frac=args.init_tilt_frac,
+        prior_version=args.prior_version,
         solver_iterations=args.solver_iterations,
         ls_iterations=args.ls_iterations,
     )
+    print(
+        f"[gpu-train] prior_version={args.prior_version} "
+        f"obs_dim={env.obs_dim} observation_size={env.observation_size}",
+        flush=True,
+    )
+    if args.mjx_smoke:
+        rng = jax.random.PRNGKey(args.seed)
+        state = env.reset(rng)
+        action = jnp.zeros((env.action_size,), dtype=jnp.float32)
+        state = env.step(state, action)
+        print(f"[mjx-smoke] prior_version={args.prior_version}")
+        print(f"[mjx-smoke] OBS_DIM={env.obs_dim}")
+        print(f"[mjx-smoke] observation_size={env.observation_size}")
+        print(f"[mjx-smoke] reset/step obs shape={state.obs.shape}")
+        print(f"[mjx-smoke] first_step_reward={float(state.reward):.6f}")
+        print(f"[mjx-smoke] metric_keys={sorted(state.metrics.keys())}")
+        for key in ("success", "quiet_step", "checkpoint_dist_final", "checkpoint_dist_min", "term_hole", "term_timeout"):
+            if key in state.metrics:
+                print(f"[mjx-smoke] {key}={float(state.metrics[key]):.6f}")
+        return
     # Mirror CPU `VecNormalize(norm_reward=True)`: divide reward by running
     # std of the discounted return. Per-env Welford in JAX, see class doc.
     env = RunningRewardNormalizationWrapper(
@@ -181,8 +209,14 @@ def main() -> None:
         success_rate = _get("eval/episode_success")
         quiet_sum = _get("eval/episode_quiet_step")
         stable_sum = _get("eval/episode_stable_steps")
+        stable_final = _get("eval/episode_stable_steps_final")
+        stable_max = _get("eval/episode_stable_steps_max")
         ball_speed_sum = _get("eval/episode_ball_speed")
+        observed_speed_sum = _get("eval/episode_observed_speed", ball_speed_sum)
         safe_margin_sum = _get("eval/episode_safe_hole_margin")
+        checkpoint_dist_final_sum = _get("eval/episode_checkpoint_dist_final")
+        checkpoint_dist_min_sum = _get("eval/episode_checkpoint_dist_min")
+        inside_checkpoint_sum = _get("eval/episode_inside_checkpoint")
 
         # Per-step reward (post-normalization, ~unit scale once Welford warms up).
         reward_per_step = reward_sum / ep_len_safe
@@ -191,8 +225,11 @@ def main() -> None:
         # Avg value of the running stable_steps counter during the episode.
         stable_avg = stable_sum / ep_len_safe
         # Episode-mean ball speed and hole margin.
-        ball_speed_mean = ball_speed_sum / ep_len_safe
+        ball_speed_mean = observed_speed_sum / ep_len_safe
         safe_margin_mean = safe_margin_sum / ep_len_safe
+        checkpoint_dist_final = checkpoint_dist_final_sum
+        checkpoint_dist_min = checkpoint_dist_min_sum
+        inside_checkpoint_frac = inside_checkpoint_sum / ep_len_safe
         # Fraction of max episode length actually survived. Rises toward 1.0
         # once the agent stops falling in holes.
         length_frac = ep_len / ep_len_cap if ep_len == ep_len else float("nan")
@@ -222,10 +259,16 @@ def main() -> None:
             payload["episode/mean_length"] = ep_len
             payload["episode/length_frac"] = length_frac
             payload["episode/success_rate"] = success_rate
-            payload["episode/mean_stable_steps"] = stable_avg
+            payload["episode/stable_steps_final"] = stable_final
+            payload["episode/stable_steps_max"] = stable_max
+            payload["episode/mean_stable_steps"] = stable_max
             payload["episode/quiet_frac"] = quiet_frac
+            payload["episode/mean_observed_speed"] = ball_speed_mean
             payload["episode/mean_ball_speed"] = ball_speed_mean
             payload["episode/mean_safe_hole_margin"] = safe_margin_mean
+            payload["episode/checkpoint_dist_final"] = checkpoint_dist_final
+            payload["episode/checkpoint_dist_min"] = checkpoint_dist_min
+            payload["episode/inside_checkpoint_frac"] = inside_checkpoint_frac
             payload["episode/reward_per_step"] = reward_per_step
             payload["episode/deployment_score"] = length_frac * success_rate
             payload["episode/termination_hole_rate"] = term_hole

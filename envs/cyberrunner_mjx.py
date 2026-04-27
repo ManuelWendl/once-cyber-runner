@@ -2,11 +2,10 @@
 
 Optional, additive backend. `envs/cyberrunner.py` is untouched.
 
-Scope (per the approved plan):
+Scope:
     - prior_task = "stabilize" only
-    - NO hand-crafted safe-checkpoint target (pure stabilization)
+    - selectable prior_version: legacy or checkpoint_recovery
     - same MuJoCo geometry: walls, holes, waypoints reused verbatim
-    - 10-dim state obs (no target / checkpoint field)
     - simplified initial conditions (low ball speed, low tilt)
     - spawn from the existing `prior_start_points` bank on CPU, sampled
       per-episode via JAX rng at reset
@@ -41,9 +40,24 @@ from envs.cyberrunner import (
     BALL_POS_NOISE,
     BOARD_HEIGHT,
     BOARD_WIDTH,
+    CHECKPOINT_RECOVERY_OBS_DIM,
     FRAME_SKIP,
     HOLE_RADIUS,
     JOINT_ANGLE_NOISE,
+    LEGACY_PRIOR_OBS_DIM,
+    PRIOR_RECOVERY_ACTION_DELTA_PENALTY,
+    PRIOR_RECOVERY_ACTION_PENALTY,
+    PRIOR_RECOVERY_ALIVE_REWARD,
+    PRIOR_RECOVERY_QUIET_THRESHOLD_SPEED,
+    PRIOR_RECOVERY_TILT_PENALTY,
+    PRIOR_RECOVERY_V_REF,
+    PRIOR_RECOVERY_W_BASIN,
+    PRIOR_RECOVERY_W_HOLD,
+    PRIOR_RECOVERY_W_PROGRESS,
+    PRIOR_RECOVERY_W_QUIET,
+    PRIOR_VERSION_CHECKPOINT_RECOVERY,
+    PRIOR_VERSION_LEGACY,
+    PRIOR_VERSIONS,
     RANGE_ALPHA,
     RANGE_BETA,
     TIMESTEP,
@@ -57,7 +71,7 @@ from envs.cyberrunner import (
 
 
 N_STACK = 4   # frame stacking, matches CPU `train_ppo.py --n_stack 4`
-OBS_DIM = 13  # per-frame obs: 10-dim states + 3-dim checkpoint (matches CPU)
+OBS_DIM = LEGACY_PRIOR_OBS_DIM  # legacy default; env.obs_dim is mode-specific
 
 
 @struct.dataclass
@@ -69,18 +83,26 @@ class _EpStats:
     bias_ball: jnp.ndarray             # (2,)  per-episode ball-pos bias
     bias_joint: jnp.ndarray            # (2,)  per-episode joint-angle bias
     stable_steps: jnp.ndarray          # ()
+    stable_steps_max: jnp.ndarray      # ()
     step_count: jnp.ndarray            # ()
     success: jnp.ndarray               # ()    sticky "ever crossed" flag
+    prev_action: jnp.ndarray           # (2,)
+    target: jnp.ndarray                # (2,)
+    prev_target_dist: jnp.ndarray      # ()
+    checkpoint_dist_min: jnp.ndarray   # ()
+    inside_checkpoint_steps: jnp.ndarray
+    speed_sum: jnp.ndarray
 
 
 class CyberRunnerMJXEnv(PipelineEnv):
     """Brax-compatible MJX env for the stabilize prior task.
 
     Observation matches the CPU env (`envs/cyberrunner.py::_get_obs::states`):
-        per-frame (10-dim, all NOISY):
-            [α, β, bx, by, vec_to_closest_path(2), vec_to_next_wp(2),
-             vec_to_next_next_wp(2)]
-        policy input is a 4-frame stack along the last axis (40-dim total),
+        legacy per-frame is 13-dim: states(10) + checkpoint(3).
+        checkpoint_recovery per-frame is 12-dim:
+            [α, β, bx, by, ckpt_vec(2), ckpt_dist, vec_to_closest_path(2),
+             prev_action(2), inside_ckpt]
+        policy input is a 4-frame stack along the last axis,
         replicating SB3 `VecFrameStack(n_stack=4)` with zero-init older frames.
 
     Reward:
@@ -99,17 +121,25 @@ class CyberRunnerMJXEnv(PipelineEnv):
         prior_start_point_spacing: float = 0.01,
         # Match CPU `prior_spawn_min_hole_margin=0.0` — spawn from ALL waypoints.
         prior_spawn_min_hole_margin: float = 0.0,
+        prior_version: str = PRIOR_VERSION_LEGACY,
         # EMA smoothing α for the noisy ball speed used by the reward
         # (matches CPU `checkpoint_speed_ema_alpha=0.8`).
         speed_ema_alpha: float = 0.8,
         # Survival reward constants.
-        v_ref: float = 0.03,           # speed reference (m/s) — exp scale
+        v_ref: float = 0.03,           # legacy speed reference (m/s)
         w_quiet: float = 1.0,          # weight on the low-velocity term
         k_a: float = 0.005,            # action ℓ2 cost
         p_hole: float = 50.0,          # terminal hole penalty
         p_survival: float = 100.0,     # one-shot bonus on full-episode survival
         # `success` metric threshold on the quiet term.
         quiet_th: float = 0.5,
+        quiet_threshold_speed: float = PRIOR_RECOVERY_QUIET_THRESHOLD_SPEED,
+        w_progress: float = PRIOR_RECOVERY_W_PROGRESS,
+        w_basin: float = PRIOR_RECOVERY_W_BASIN,
+        w_hold: float = PRIOR_RECOVERY_W_HOLD,
+        alive_reward: float = PRIOR_RECOVERY_ALIVE_REWARD,
+        action_delta_penalty: float = PRIOR_RECOVERY_ACTION_DELTA_PENALTY,
+        tilt_penalty: float = PRIOR_RECOVERY_TILT_PENALTY,
         # Episode-level success criterion — matches CPU
         # `checkpoint_hold_steps=6`. Once stable_steps crosses this, the
         # `success` metric fires once for the episode.
@@ -120,6 +150,8 @@ class CyberRunnerMJXEnv(PipelineEnv):
         solver_iterations: int = 6,
         ls_iterations: int = 6,
     ):
+        if prior_version not in PRIOR_VERSIONS:
+            raise ValueError(f"Unknown prior_version={prior_version!r}; expected one of {PRIOR_VERSIONS}")
         walls_h, walls_v, holes, waypoints = get_hard_layout()
         seg_lengths, cum_distances = compute_waypoint_distances(waypoints)
 
@@ -215,18 +247,31 @@ class CyberRunnerMJXEnv(PipelineEnv):
         self._ball_height = float(0.0793)
 
         self._episode_length = int(episode_length)
+        self._prior_version = prior_version
+        self.obs_dim = (
+            CHECKPOINT_RECOVERY_OBS_DIM
+            if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY
+            else LEGACY_PRIOR_OBS_DIM
+        )
         self._init_ball_speed = float(init_ball_speed)
         self._init_tilt_frac = float(init_tilt_frac)
         self._range_alpha = (float(RANGE_ALPHA[0]), float(RANGE_ALPHA[1]))
         self._range_beta = (float(RANGE_BETA[0]), float(RANGE_BETA[1]))
 
         # Reward constants (survival shaping).
-        self._v_ref = float(v_ref)
-        self._w_quiet = float(w_quiet)
-        self._k_a = float(k_a)
+        self._v_ref = float(PRIOR_RECOVERY_V_REF if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else v_ref)
+        self._w_quiet = float(PRIOR_RECOVERY_W_QUIET if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else w_quiet)
+        self._k_a = float(PRIOR_RECOVERY_ACTION_PENALTY if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else k_a)
         self._p_hole = float(p_hole)
         self._p_survival = float(p_survival)
         self._quiet_th = float(quiet_th)
+        self._quiet_threshold_speed = float(quiet_threshold_speed)
+        self._w_progress = float(w_progress)
+        self._w_basin = float(w_basin)
+        self._w_hold = float(w_hold)
+        self._alive_reward = float(alive_reward)
+        self._action_delta_penalty = float(action_delta_penalty)
+        self._tilt_penalty = float(tilt_penalty)
         self._success_hold_steps = int(success_hold_steps)
         self._solver_iterations = int(solver_iterations)
         self._ls_iterations = int(ls_iterations)
@@ -282,10 +327,15 @@ class CyberRunnerMJXEnv(PipelineEnv):
 
         # First-step observation: use per-episode bias only (no per-step
         # sensor noise at reset — matches CPU which adds it inside step()).
+        ball_progress0, _, _ = self._project_to_path(ball_pos)
+        target0 = self._first_backward_safe_corner(ball_progress0)
+        target_dist0 = jnp.linalg.norm(target0 - ball_pos)
         per_frame = self._build_per_frame_obs(
             pipeline_state.qpos[0], pipeline_state.qpos[1],
             ball_pos, ball_pos_noisy0, bias_joint,
             jnp.zeros(2, dtype=jnp.float32),
+            jnp.zeros(2, dtype=jnp.float32),
+            target0,
         )
         # Seed the buffer with [zero, zero, per_frame_reset] so the spawn
         # frame enters the stack history, matching SB3 VecFrameStack which
@@ -293,7 +343,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
         # Without this the first 3 GPU step obs lose the spawn frame.
         obs_buf0 = jnp.concatenate(
             [
-                jnp.zeros((N_STACK - 2, OBS_DIM), dtype=jnp.float32),
+                jnp.zeros((N_STACK - 2, self.obs_dim), dtype=jnp.float32),
                 per_frame[None, :],
             ],
             axis=0,
@@ -306,11 +356,18 @@ class CyberRunnerMJXEnv(PipelineEnv):
             bias_ball=bias_ball,
             bias_joint=bias_joint,
             stable_steps=jnp.asarray(0, dtype=jnp.int32),
+            stable_steps_max=jnp.asarray(0, dtype=jnp.int32),
             step_count=jnp.asarray(0, dtype=jnp.int32),
             success=jnp.asarray(0.0, dtype=jnp.float32),
+            prev_action=jnp.zeros(2, dtype=jnp.float32),
+            target=target0.astype(jnp.float32),
+            prev_target_dist=target_dist0.astype(jnp.float32),
+            checkpoint_dist_min=target_dist0.astype(jnp.float32),
+            inside_checkpoint_steps=jnp.asarray(0, dtype=jnp.int32),
+            speed_sum=jnp.asarray(0.0, dtype=jnp.float32),
         )
         obs = self._stack_with_buffer(
-            jnp.zeros((N_STACK - 1, OBS_DIM), dtype=jnp.float32), per_frame,
+            jnp.zeros((N_STACK - 1, self.obs_dim), dtype=jnp.float32), per_frame,
         )
         # All per-step metric keys must exist in reset for the EpisodeWrapper
         # to sum them consistently across the rollout.
@@ -319,8 +376,17 @@ class CyberRunnerMJXEnv(PipelineEnv):
             "success": _zero,        # per-step, fires once per episode
             "quiet_step": _zero,     # per-step indicator
             "stable_steps": stats.stable_steps.astype(jnp.float32),
+            "stable_steps_final": _zero,
+            "stable_steps_max": _zero,
             "r_quiet": _zero,
+            "r_progress": _zero,
+            "r_basin": _zero,
+            "r_hold": _zero,
             "ball_speed": _zero,
+            "observed_speed": _zero,
+            "checkpoint_dist_final": _zero,
+            "checkpoint_dist_min": _zero,
+            "inside_checkpoint": _zero,
             "safe_hole_margin": _zero,
             "term_hole": _zero,
             "term_timeout": _zero,
@@ -372,21 +438,38 @@ class CyberRunnerMJXEnv(PipelineEnv):
         # 500-step episode horizon if the ball remains slow ("jiggly is fine").
         quiet = jnp.exp(-(ema_speed / self._v_ref) ** 2)
         r_action = -self._k_a * jnp.sum(action * action)
+        target = stats.target
+        checkpoint_dist = jnp.linalg.norm(target - ball_pos_noisy)
+        checkpoint_dist_min = jnp.minimum(stats.checkpoint_dist_min, checkpoint_dist)
+        inside_checkpoint = checkpoint_dist < 0.015
+        r_progress = self._w_progress * jnp.maximum(stats.prev_target_dist - checkpoint_dist, 0.0)
+        r_basin = jnp.where(inside_checkpoint, self._w_basin, 0.0)
+        r_hold = jnp.asarray(0.0, dtype=jnp.float32)
+        r_action_delta = -self._action_delta_penalty * jnp.sum((action - stats.prev_action) ** 2)
+        r_tilt = -self._tilt_penalty * abs_tilt * abs_tilt
 
         # Hole termination: identical geometry to CPU env (`HOLE_RADIUS`).
         in_hole = hole_d < HOLE_RADIUS
 
         # Provisional reward (survival bonus added below once `timeout` known).
-        reward = (
-            self._w_quiet * quiet + r_action
-            - jnp.where(in_hole, self._p_hole, 0.0)
-        )
+        r_hole = -jnp.where(in_hole, self._p_hole, 0.0)
 
         # Quiet indicator (diagnostic + success counter).
-        in_quiet = quiet > self._quiet_th
-        stable_steps = jnp.where(
-            in_quiet, stats.stable_steps + 1, jnp.int32(0)
-        )
+        if self._prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY:
+            in_quiet = ema_speed < self._quiet_threshold_speed
+            stable_condition = inside_checkpoint & in_quiet
+            r_hold = jnp.where(stable_condition, self._w_hold, 0.0)
+            reward = (
+                self._alive_reward + r_progress + r_basin
+                + self._w_quiet * quiet + r_hold
+                + r_action + r_action_delta + r_tilt + r_hole
+            )
+        else:
+            in_quiet = quiet > self._quiet_th
+            stable_condition = in_quiet
+            reward = self._w_quiet * quiet + r_action + r_hole
+        stable_steps = jnp.where(stable_condition, stats.stable_steps + 1, jnp.int32(0))
+        stable_steps_max = jnp.maximum(stats.stable_steps_max, stable_steps)
 
         step_count = stats.step_count + 1
         timeout = step_count >= self._episode_length
@@ -408,7 +491,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
         # Build the new per-frame obs (13-dim: 10-dim states + 3-dim ckpt).
         per_frame = self._build_per_frame_obs(
             alpha, beta, ball_pos, ball_pos_noisy,
-            stats.bias_joint, joint_noise,
+            stats.bias_joint, joint_noise, action, stats.target,
         )
         # Stack with the carried buffer of last (N_STACK - 1) frames → (40,).
         obs = self._stack_with_buffer(stats.obs_buf, per_frame)
@@ -425,8 +508,15 @@ class CyberRunnerMJXEnv(PipelineEnv):
             bias_ball=stats.bias_ball,
             bias_joint=stats.bias_joint,
             stable_steps=stable_steps,
+            stable_steps_max=stable_steps_max,
             step_count=step_count,
             success=success_ever,
+            prev_action=action,
+            target=stats.target,
+            prev_target_dist=checkpoint_dist.astype(jnp.float32),
+            checkpoint_dist_min=checkpoint_dist_min.astype(jnp.float32),
+            inside_checkpoint_steps=stats.inside_checkpoint_steps + inside_checkpoint.astype(jnp.int32),
+            speed_sum=stats.speed_sum + ema_speed,
         )
         # Per-step metrics. Brax's EpisodeWrapper sums them across the
         # rollout — divide by avg_episode_length in progress_fn for means
@@ -440,10 +530,22 @@ class CyberRunnerMJXEnv(PipelineEnv):
             "success": success_metric,        # 0/1, fires once per episode
             "quiet_step": in_quiet_f,         # 0/1 per step (fraction-quiet)
             "stable_steps": stable_steps.astype(jnp.float32),
+            "stable_steps_final": jnp.where(done > 0.5, stable_steps, 0).astype(jnp.float32),
+            "stable_steps_max": jnp.where(done > 0.5, stable_steps_max, 0).astype(jnp.float32),
             "r_quiet": quiet,
+            "r_progress": r_progress.astype(jnp.float32),
+            "r_basin": r_basin.astype(jnp.float32),
+            "r_hold": r_hold.astype(jnp.float32),
+            "r_action": r_action.astype(jnp.float32),
+            "r_action_delta": r_action_delta.astype(jnp.float32),
+            "r_tilt": r_tilt.astype(jnp.float32),
             # `ball_speed` reports the EMA-smoothed noisy speed used by the
             # reward, matching CPU's `_ball_speed`.
             "ball_speed": ema_speed.astype(jnp.float32),
+            "observed_speed": ema_speed.astype(jnp.float32),
+            "checkpoint_dist_final": jnp.where(done > 0.5, checkpoint_dist, 0.0).astype(jnp.float32),
+            "checkpoint_dist_min": jnp.where(done > 0.5, checkpoint_dist_min, 0.0).astype(jnp.float32),
+            "inside_checkpoint": inside_checkpoint.astype(jnp.float32),
             "safe_hole_margin": jnp.maximum(hole_margin, 0.0).astype(jnp.float32),
             # Termination indicators (Brax sums per-step → 0/1 per episode →
             # mean across episodes = termination rate).
@@ -504,10 +606,12 @@ class CyberRunnerMJXEnv(PipelineEnv):
         ball_pos_noisy: jax.Array,
         bias_joint: jax.Array,
         joint_noise: jax.Array,
+        prev_action: jax.Array,
+        target_override: jax.Array | None = None,
     ) -> jax.Array:
-        """Build a 13-dim per-frame obs that mirrors CPU's {states, checkpoint}.
+        """Build a per-frame obs that mirrors the selected CPU prior mode.
 
-        Layout (all NOISY for ball-derived terms):
+        Legacy layout (all NOISY for ball-derived terms):
             [0:2]  joint_pos = (α, β) + bias_joint + joint_noise
             [2:4]  ball_pos_noisy
             [4:6]  vec from noisy ball to closest path point
@@ -515,6 +619,9 @@ class CyberRunnerMJXEnv(PipelineEnv):
             [8:10] vec from noisy ball to waypoint after next
             [10:12] vec from noisy ball to first safe corner BACKWARD
             [12]   distance to that backward corner
+
+        checkpoint_recovery replaces the next-waypoint vectors with previous
+        action and an inside-checkpoint flag, for a 12-dim per-frame obs.
         """
         joint_pos = jnp.stack([alpha_clean, beta_clean]) + bias_joint + joint_noise
         # Path projection on CLEAN ball pos (matches CPU which uses true pos
@@ -529,8 +636,20 @@ class CyberRunnerMJXEnv(PipelineEnv):
         vec_next = next_wp - ball_pos_noisy
         vec_next_next = next_next_wp - ball_pos_noisy
         backward_corner = self._first_backward_safe_corner(ball_progress)
+        if target_override is not None:
+            backward_corner = target_override
         ckpt_vec = backward_corner - ball_pos_noisy
         ckpt_dist = jnp.linalg.norm(ckpt_vec)
+        if self._prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY:
+            inside = (ckpt_dist < 0.015).astype(jnp.float32)
+            return jnp.stack([
+                joint_pos[0], joint_pos[1],
+                ball_pos_noisy[0], ball_pos_noisy[1],
+                ckpt_vec[0], ckpt_vec[1], ckpt_dist,
+                vec_closest[0], vec_closest[1],
+                prev_action[0], prev_action[1],
+                inside,
+            ]).astype(jnp.float32)
         return jnp.stack([
             joint_pos[0], joint_pos[1],
             ball_pos_noisy[0], ball_pos_noisy[1],
@@ -594,7 +713,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
     # Frame-stacked obs: N_STACK frames × OBS_DIM features.
     @property
     def observation_size(self) -> int:
-        return N_STACK * OBS_DIM
+        return N_STACK * self.obs_dim
 
     @property
     def action_size(self) -> int:

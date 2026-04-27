@@ -91,6 +91,9 @@ def make_env(config, id):
             prior_spawn_merge_radius=getattr(config, "prior_spawn_merge_radius", 0.0),
             checkpoint_progress_reward_scale=getattr(config, "checkpoint_progress_reward_scale", 20.0),
             terminate_on_checkpoint_stabilized=getattr(config, "terminate_on_checkpoint_stabilized", False),
+            prior_version=getattr(config, "prior_version", "legacy"),
+            prior_reward_mode=getattr(config, "prior_reward_mode", None),
+            prior_obs_mode=getattr(config, "prior_obs_mode", None),
         )
     else:
         raise NotImplementedError(suite)

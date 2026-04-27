@@ -56,6 +56,26 @@ GOAL_BONUS = 10.0
 GOAL_THRESHOLD = 0.004  # 4mm
 CHECKPOINT_REWARD = 1.0  # paid per reward-waypoint crossed under modulo-N sparsification
 
+# Prior versions.  Keep the legacy prior as the default so old experiments are
+# reproducible; checkpoint_recovery is the new real-transferable stabilizer.
+PRIOR_VERSION_LEGACY = "legacy"
+PRIOR_VERSION_CHECKPOINT_RECOVERY = "checkpoint_recovery"
+PRIOR_VERSIONS = (PRIOR_VERSION_LEGACY, PRIOR_VERSION_CHECKPOINT_RECOVERY)
+LEGACY_PRIOR_OBS_DIM = 13
+CHECKPOINT_RECOVERY_OBS_DIM = 12
+
+# Checkpoint-recovery reward defaults.  These are mirrored in the MJX env.
+PRIOR_RECOVERY_V_REF = 0.04
+PRIOR_RECOVERY_QUIET_THRESHOLD_SPEED = 0.05
+PRIOR_RECOVERY_ALIVE_REWARD = 0.02
+PRIOR_RECOVERY_W_PROGRESS = 8.0
+PRIOR_RECOVERY_W_BASIN = 0.5
+PRIOR_RECOVERY_W_QUIET = 1.0
+PRIOR_RECOVERY_W_HOLD = 1.0
+PRIOR_RECOVERY_ACTION_PENALTY = 0.005
+PRIOR_RECOVERY_ACTION_DELTA_PENALTY = 0.01
+PRIOR_RECOVERY_TILT_PENALTY = 0.05
+
 
 # ============================================================================
 # HARD MAZE LAYOUT
@@ -1136,8 +1156,29 @@ class CyberRunnerEnv(gym.Env):
         checkpoint_progress_reward_scale: float = 20.0,
         terminate_on_checkpoint_stabilized: bool = False,
         prior_survival_bonus: float = 100.0,
+        prior_version: str = PRIOR_VERSION_LEGACY,
+        prior_reward_mode: str | None = None,
+        prior_obs_mode: str | None = None,
+        prior_recovery_v_ref: float = PRIOR_RECOVERY_V_REF,
+        prior_recovery_quiet_threshold_speed: float = PRIOR_RECOVERY_QUIET_THRESHOLD_SPEED,
+        prior_recovery_alive_reward: float = PRIOR_RECOVERY_ALIVE_REWARD,
+        prior_recovery_w_progress: float = PRIOR_RECOVERY_W_PROGRESS,
+        prior_recovery_w_basin: float = PRIOR_RECOVERY_W_BASIN,
+        prior_recovery_w_quiet: float = PRIOR_RECOVERY_W_QUIET,
+        prior_recovery_w_hold: float = PRIOR_RECOVERY_W_HOLD,
+        prior_recovery_action_penalty: float = PRIOR_RECOVERY_ACTION_PENALTY,
+        prior_recovery_action_delta_penalty: float = PRIOR_RECOVERY_ACTION_DELTA_PENALTY,
+        prior_recovery_tilt_penalty: float = PRIOR_RECOVERY_TILT_PENALTY,
     ):
         super().__init__()
+        if prior_version not in PRIOR_VERSIONS:
+            raise ValueError(f"Unknown prior_version={prior_version!r}; expected one of {PRIOR_VERSIONS}")
+        prior_reward_mode = prior_reward_mode or prior_version
+        prior_obs_mode = prior_obs_mode or prior_version
+        if prior_reward_mode not in PRIOR_VERSIONS:
+            raise ValueError(f"Unknown prior_reward_mode={prior_reward_mode!r}; expected one of {PRIOR_VERSIONS}")
+        if prior_obs_mode not in PRIOR_VERSIONS:
+            raise ValueError(f"Unknown prior_obs_mode={prior_obs_mode!r}; expected one of {PRIOR_VERSIONS}")
 
         self.render_mode = render_mode
         self.episode_length = episode_length
@@ -1168,6 +1209,19 @@ class CyberRunnerEnv(gym.Env):
         self.checkpoint_progress_reward_scale = checkpoint_progress_reward_scale
         self.terminate_on_checkpoint_stabilized = terminate_on_checkpoint_stabilized
         self.prior_survival_bonus = float(prior_survival_bonus)
+        self.prior_version = prior_version
+        self.prior_reward_mode = prior_reward_mode
+        self.prior_obs_mode = prior_obs_mode
+        self.prior_recovery_v_ref = float(prior_recovery_v_ref)
+        self.prior_recovery_quiet_threshold_speed = float(prior_recovery_quiet_threshold_speed)
+        self.prior_recovery_alive_reward = float(prior_recovery_alive_reward)
+        self.prior_recovery_w_progress = float(prior_recovery_w_progress)
+        self.prior_recovery_w_basin = float(prior_recovery_w_basin)
+        self.prior_recovery_w_quiet = float(prior_recovery_w_quiet)
+        self.prior_recovery_w_hold = float(prior_recovery_w_hold)
+        self.prior_recovery_action_penalty = float(prior_recovery_action_penalty)
+        self.prior_recovery_action_delta_penalty = float(prior_recovery_action_delta_penalty)
+        self.prior_recovery_tilt_penalty = float(prior_recovery_tilt_penalty)
 
         # Load maze layout
         self.walls_h, self.walls_v, self.holes, self.waypoints = get_hard_layout()
@@ -1235,6 +1289,13 @@ class CyberRunnerEnv(gym.Env):
             "states": spaces.Box(low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32),
             "checkpoint": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
         }
+        if self.prior_obs_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
+            obs_spaces = {
+                "prior_state": spaces.Box(
+                    low=-np.inf, high=np.inf,
+                    shape=(CHECKPOINT_RECOVERY_OBS_DIM,), dtype=np.float32,
+                )
+            }
         if self.include_vision:
             self.img_size = 64
             obs_spaces["image"] = spaces.Box(0, 255, (self.img_size, self.img_size, 3), np.uint8)
@@ -1284,6 +1345,13 @@ class CyberRunnerEnv(gym.Env):
         self._success = False
         self._prior_target = np.zeros(2, dtype=np.float32)
         self._prior_phi_prev = 0.0
+        self._prev_action = np.zeros(2, dtype=np.float32)
+        self._prev_action_for_obs = np.zeros(2, dtype=np.float32)
+        self._prev_target_dist = np.inf
+        self._target_dist_min = np.inf
+        self._stable_steps_max = 0
+        self._ep_inside_checkpoint_steps = 0
+        self._reward_terms: dict[str, float] = {}
         # Per-episode running sums for parity with GPU progress_fn metrics.
         self._ep_quiet_steps = 0
         self._ep_ball_speed_sum = 0.0
@@ -1443,6 +1511,22 @@ class CyberRunnerEnv(gym.Env):
         self._ep_quiet_steps = 0
         self._ep_ball_speed_sum = 0.0
         self._ep_safe_hole_margin_sum = 0.0
+        self._prev_action = np.zeros(2, dtype=np.float32)
+        self._prev_action_for_obs = np.zeros(2, dtype=np.float32)
+        self._prev_target_dist = np.inf
+        self._target_dist_min = np.inf
+        self._stable_steps_max = 0
+        self._ep_inside_checkpoint_steps = 0
+        self._reward_terms = {
+            "reward_progress": 0.0,
+            "reward_basin": 0.0,
+            "reward_quiet": 0.0,
+            "reward_hold": 0.0,
+            "reward_action": 0.0,
+            "reward_action_delta": 0.0,
+            "reward_tilt": 0.0,
+            "reward_hole": 0.0,
+        }
         ball_pos = self._get_ball_pos_board_frame()
         self._prev_ball_pos = ball_pos.copy()
         ball_noise = self.np_random.uniform(-BALL_POS_NOISE, BALL_POS_NOISE, size=2)
@@ -1481,6 +1565,8 @@ class CyberRunnerEnv(gym.Env):
                 -5.0 * float(np.linalg.norm(ball_pos - self._prior_target))
                 - 0.5 * self._ball_speed
             )
+            self._prev_target_dist = float(np.linalg.norm(ball_pos - self._prior_target))
+            self._target_dist_min = self._prev_target_dist
         else:
             self._prior_target = np.zeros(2, dtype=np.float32)
             self._prior_phi_prev = 0.0
@@ -1492,7 +1578,9 @@ class CyberRunnerEnv(gym.Env):
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         # Apply action
-        self.data.ctrl[:] = np.clip(action, -1.0, 1.0)
+        action_clipped = np.clip(action, -1.0, 1.0).astype(np.float32)
+        prev_action = self._prev_action.copy()
+        self.data.ctrl[:] = action_clipped
 
         # Step physics
         for _ in range(FRAME_SKIP):
@@ -1520,7 +1608,10 @@ class CyberRunnerEnv(gym.Env):
         self._path_detected = curr_progress >= 0
 
         # Compute reward
-        reward = self._compute_reward(ball_pos, curr_progress, self._seg_idx)
+        reward = self._compute_reward(
+            ball_pos, curr_progress, self._seg_idx,
+            action_clipped, prev_action, ball_pos_noisy.astype(np.float32),
+        )
 
         # Check termination
         terminated, truncated, info = self._check_termination(ball_pos)
@@ -1537,6 +1628,8 @@ class CyberRunnerEnv(gym.Env):
         # Update state
         if curr_progress >= 0:
             self._prev_progress = curr_progress
+        self._prev_action = action_clipped.copy()
+        self._prev_action_for_obs = action_clipped.copy()
 
         obs = self._get_obs()
         info.update(self._build_info(ball_pos, curr_progress))
@@ -1589,18 +1682,31 @@ class CyberRunnerEnv(gym.Env):
             prior_target_dist = float(np.linalg.norm(ball_pos - self._prior_target))
         else:
             prior_target_dist = float("nan")
+        inside_frac = float(self._ep_inside_checkpoint_steps / max(self._step_count, 1))
+        observed_speed_mean = float(self._ep_ball_speed_sum / max(self._step_count, 1))
         return {
             "path_progress": float(curr_progress),
             "checkpoint_dist": checkpoint_dist,
             "ball_speed": float(self._ball_speed),
+            "observed_speed": float(self._ball_speed),
+            "quiet_threshold_speed": float(self.prior_recovery_quiet_threshold_speed),
             "ball_speed_true": float(self._ball_speed_true),
             "min_hole_distance": float(self._min_hole_distance),
             "safe_hole_margin": float(self._min_hole_distance - HOLE_RADIUS),
             "active_checkpoint_idx": int(self._active_checkpoint_idx),
             "unlocked_checkpoint_idx": int(self._max_checkpoint_reached),
             "stable_steps": int(self._stable_steps),
+            "stable_steps_final": int(self._stable_steps),
+            "stable_steps_max": int(self._stable_steps_max),
             "success": float(self._success),
+            "quiet_steps": int(self._ep_quiet_steps),
+            "quiet_frac": float(self._ep_quiet_steps / max(self._step_count, 1)),
+            "mean_observed_speed": observed_speed_mean,
+            "checkpoint_dist_final": prior_target_dist,
+            "checkpoint_dist_min": float(self._target_dist_min),
+            "inside_checkpoint_frac": inside_frac,
             "prior_target_dist": prior_target_dist,
+            **self._reward_terms,
             # Episode running sums (read on episode-end by WandbCallback).
             "ep_quiet_steps": int(self._ep_quiet_steps),
             "ep_ball_speed_sum": float(self._ep_ball_speed_sum),
@@ -1608,6 +1714,7 @@ class CyberRunnerEnv(gym.Env):
             "log_path_progress": np.array([curr_progress], dtype=np.float32),
             "log_checkpoint_dist": np.array([checkpoint_dist], dtype=np.float32),
             "log_ball_speed": np.array([self._ball_speed], dtype=np.float32),
+            "log_observed_speed": np.array([self._ball_speed], dtype=np.float32),
             "log_ball_speed_true": np.array([self._ball_speed_true], dtype=np.float32),
             "log_min_hole_distance": np.array([self._min_hole_distance], dtype=np.float32),
             "log_safe_hole_margin": np.array([self._min_hole_distance - HOLE_RADIUS], dtype=np.float32),
@@ -1675,6 +1782,40 @@ class CyberRunnerEnv(gym.Env):
         ckpt_vec = backward_corner - ball_pos_noisy
         ckpt_dist = float(np.linalg.norm(ckpt_vec))
 
+        if (
+            self.prior_mode
+            and self.prior_task == "stabilize"
+            and self.prior_obs_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY
+        ):
+            target = self._prior_target
+            if not np.isfinite(target).all() or np.allclose(target, 0.0):
+                target = backward_corner
+            target_vec = target - ball_pos_noisy
+            target_dist = float(np.linalg.norm(target_vec))
+            inside_checkpoint = float(target_dist < self.checkpoint_radius)
+            obs = {
+                "prior_state": np.array(
+                    [
+                        joint_pos[0], joint_pos[1],
+                        ball_pos_noisy[0], ball_pos_noisy[1],
+                        target_vec[0], target_vec[1], target_dist,
+                        vec_to_closest[0], vec_to_closest[1],
+                        self._prev_action_for_obs[0], self._prev_action_for_obs[1],
+                        inside_checkpoint,
+                    ],
+                    dtype=np.float32,
+                )
+            }
+            if self.include_vision:
+                ball_board = self._get_ball_pos_board_frame()
+                cam_local = np.array([ball_board[0], ball_board[1], 0.4])
+                board_pos = self.data.xpos[self.board_body_id]
+                board_mat = self.data.xmat[self.board_body_id].reshape(3, 3)
+                self.data.cam_xpos[self.vision_cam_id] = board_pos + board_mat @ cam_local
+                self.vision_renderer.update_scene(self.data, camera="vision_cam", scene_option=self.vision_vopt)
+                obs["image"] = self.vision_renderer.render()
+            return obs
+
         states = np.concatenate(
             [joint_pos, ball_pos_noisy,
              vec_to_closest, vec_to_next_wp, vec_to_next_next_wp]
@@ -1700,9 +1841,19 @@ class CyberRunnerEnv(gym.Env):
 
         return obs
 
-    def _compute_reward(self, ball_pos: np.ndarray, curr_progress: float, seg_idx: int) -> float:
+    def _compute_reward(
+        self,
+        ball_pos: np.ndarray,
+        curr_progress: float,
+        seg_idx: int,
+        action: np.ndarray | None = None,
+        prev_action: np.ndarray | None = None,
+        ball_pos_observed: np.ndarray | None = None,
+    ) -> float:
         """Stabilized frontier checkpoints + goal bonus + hole penalty."""
         if self.prior_mode and self.prior_task == "stabilize":
+            if self.prior_reward_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
+                return self._compute_checkpoint_recovery_reward(ball_pos, action, prev_action, ball_pos_observed)
             # Survival-shaped reward. Goal: ball stays alive on the board for
             # the full 500-step episode without falling into a hole.
             #   quiet = exp(-(speed / v_ref)²)   ∈ [0, 1]   (low velocity good)
@@ -1726,6 +1877,7 @@ class CyberRunnerEnv(gym.Env):
                 self._stable_steps = 0
             if self._stable_steps >= self.checkpoint_hold_steps:
                 self._success = True
+            self._stable_steps_max = max(self._stable_steps_max, self._stable_steps)
             # Per-episode running sums for parity-aligned wandb metrics.
             self._ep_ball_speed_sum += float(self._ball_speed)
             self._ep_safe_hole_margin_sum += max(
@@ -1796,6 +1948,83 @@ class CyberRunnerEnv(gym.Env):
         hole_reward = -self.hole_penalty if self._min_hole_distance < HOLE_RADIUS else 0.0
 
         return checkpoint_reward + goal_reward + hole_reward
+
+    def _compute_checkpoint_recovery_reward(
+        self,
+        ball_pos: np.ndarray,
+        action: np.ndarray | None,
+        prev_action: np.ndarray | None,
+        ball_pos_observed: np.ndarray | None,
+    ) -> float:
+        """Checkpoint-guided stabilization reward using real-transferable signals."""
+        action = np.asarray(action if action is not None else self.data.ctrl, dtype=np.float32)
+        prev_action = np.asarray(prev_action if prev_action is not None else self._prev_action, dtype=np.float32)
+
+        target = self._prior_target
+        if not np.isfinite(target).all() or np.allclose(target, 0.0):
+            target = self._first_backward_safe_corner(self._prev_progress)
+        reward_ball_pos = np.asarray(ball_pos_observed if ball_pos_observed is not None else ball_pos, dtype=np.float32)
+        target_dist = float(np.linalg.norm(reward_ball_pos - target))
+        self._target_dist_min = min(self._target_dist_min, target_dist)
+
+        quiet_reward = float(np.exp(-(self._ball_speed / self.prior_recovery_v_ref) ** 2))
+        in_quiet = self._ball_speed < self.prior_recovery_quiet_threshold_speed
+        inside_checkpoint = target_dist < self.checkpoint_radius
+
+        progress_delta = 0.0
+        if np.isfinite(self._prev_target_dist):
+            progress_delta = max(self._prev_target_dist - target_dist, 0.0)
+        r_progress = self.prior_recovery_w_progress * progress_delta
+        r_basin = self.prior_recovery_w_basin if inside_checkpoint else 0.0
+        r_quiet = self.prior_recovery_w_quiet * quiet_reward
+        r_hold = self.prior_recovery_w_hold if (inside_checkpoint and in_quiet) else 0.0
+        r_action = -self.prior_recovery_action_penalty * float(np.dot(action, action))
+        action_delta = action - prev_action
+        r_action_delta = -self.prior_recovery_action_delta_penalty * float(np.dot(action_delta, action_delta))
+        tilt = np.asarray(self.data.qpos[:2], dtype=np.float32)
+        r_tilt = -self.prior_recovery_tilt_penalty * float(np.dot(tilt, tilt))
+        r_hole = -self.hole_penalty if self._min_hole_distance < HOLE_RADIUS else 0.0
+
+        if in_quiet:
+            self._ep_quiet_steps += 1
+        if inside_checkpoint:
+            self._ep_inside_checkpoint_steps += 1
+        if inside_checkpoint and in_quiet:
+            self._stable_steps += 1
+        else:
+            self._stable_steps = 0
+        self._stable_steps_max = max(self._stable_steps_max, self._stable_steps)
+        if self._stable_steps >= self.checkpoint_hold_steps:
+            self._success = True
+
+        self._ep_ball_speed_sum += float(self._ball_speed)
+        self._ep_safe_hole_margin_sum += max(0.0, float(self._min_hole_distance - HOLE_RADIUS))
+        self._prev_target_dist = target_dist
+        self._in_checkpoint_prev = inside_checkpoint
+        self._prev_checkpoint_dist = target_dist
+
+        self._reward_terms = {
+            "reward_progress": float(r_progress),
+            "reward_basin": float(r_basin),
+            "reward_quiet": float(r_quiet),
+            "reward_hold": float(r_hold),
+            "reward_action": float(r_action),
+            "reward_action_delta": float(r_action_delta),
+            "reward_tilt": float(r_tilt),
+            "reward_hole": float(r_hole),
+        }
+
+        return (
+            self.prior_recovery_alive_reward
+            + r_progress
+            + r_basin
+            + r_quiet
+            + r_hold
+            + r_action
+            + r_action_delta
+            + r_tilt
+            + r_hole
+        )
 
     def _check_termination(self, ball_pos: np.ndarray) -> tuple[bool, bool, dict[str, Any]]:
         """Check termination conditions."""
@@ -1908,6 +2137,9 @@ class CyberRunner(gym.Env):
         prior_spawn_merge_radius=0.0,
         checkpoint_progress_reward_scale=20.0,
         terminate_on_checkpoint_stabilized=False,
+        prior_version=PRIOR_VERSION_LEGACY,
+        prior_reward_mode=None,
+        prior_obs_mode=None,
     ):
         include_vision = name == "vision"
         self._env = CyberRunnerEnv(
@@ -1939,6 +2171,9 @@ class CyberRunner(gym.Env):
             prior_spawn_merge_radius=prior_spawn_merge_radius,
             checkpoint_progress_reward_scale=checkpoint_progress_reward_scale,
             terminate_on_checkpoint_stabilized=terminate_on_checkpoint_stabilized,
+            prior_version=prior_version,
+            prior_reward_mode=prior_reward_mode,
+            prior_obs_mode=prior_obs_mode,
         )
         self._action_repeat = action_repeat
         self._size = size
@@ -1947,12 +2182,21 @@ class CyberRunner(gym.Env):
 
     @property
     def observation_space(self):
-        spaces_dict = {
-            "states": gym.spaces.Box(-np.inf, np.inf, (10,), dtype=np.float32),
-            "checkpoint": gym.spaces.Box(-np.inf, np.inf, (3,), dtype=np.float32),
+        spaces_dict = {}
+        if self._env.prior_obs_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
+            spaces_dict["prior_state"] = gym.spaces.Box(
+                -np.inf, np.inf, (CHECKPOINT_RECOVERY_OBS_DIM,), dtype=np.float32
+            )
+        else:
+            spaces_dict.update({
+                "states": gym.spaces.Box(-np.inf, np.inf, (10,), dtype=np.float32),
+                "checkpoint": gym.spaces.Box(-np.inf, np.inf, (3,), dtype=np.float32),
+            })
+        spaces_dict.update({
             "log_path_progress": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             "log_checkpoint_dist": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             "log_ball_speed": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+            "log_observed_speed": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             "log_ball_speed_true": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             "log_min_hole_distance": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             "log_safe_hole_margin": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
@@ -1960,7 +2204,7 @@ class CyberRunner(gym.Env):
             "log_unlocked_checkpoint_idx": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             "log_stable_steps": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             "log_success": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-        }
+        })
         if self._include_vision:
             spaces_dict["image"] = gym.spaces.Box(0, 255, self._size + (3,), dtype=np.uint8)
         return gym.spaces.Dict(spaces_dict)
@@ -1984,11 +2228,10 @@ class CyberRunner(gym.Env):
             "is_first": False,
             "is_last": is_last,
             "is_terminal": terminated,
-            "states": obs["states"],
-            "checkpoint": obs["checkpoint"],
             "log_path_progress": last_info["log_path_progress"],
             "log_checkpoint_dist": last_info["log_checkpoint_dist"],
             "log_ball_speed": last_info["log_ball_speed"],
+            "log_observed_speed": last_info["log_observed_speed"],
             "log_ball_speed_true": last_info["log_ball_speed_true"],
             "log_min_hole_distance": last_info["log_min_hole_distance"],
             "log_safe_hole_margin": last_info["log_safe_hole_margin"],
@@ -1997,6 +2240,11 @@ class CyberRunner(gym.Env):
             "log_stable_steps": last_info["log_stable_steps"],
             "log_success": last_info["log_success"],
         }
+        if self._env.prior_obs_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
+            out["prior_state"] = obs["prior_state"]
+        else:
+            out["states"] = obs["states"]
+            out["checkpoint"] = obs["checkpoint"]
         if self._include_vision:
             out["image"] = obs["image"]
         return out, reward, is_last, {}
@@ -2007,11 +2255,10 @@ class CyberRunner(gym.Env):
             "is_first": True,
             "is_last": False,
             "is_terminal": False,
-            "states": obs["states"],
-            "checkpoint": obs["checkpoint"],
             "log_path_progress": info["log_path_progress"],
             "log_checkpoint_dist": info["log_checkpoint_dist"],
             "log_ball_speed": info["log_ball_speed"],
+            "log_observed_speed": info["log_observed_speed"],
             "log_ball_speed_true": info["log_ball_speed_true"],
             "log_min_hole_distance": info["log_min_hole_distance"],
             "log_safe_hole_margin": info["log_safe_hole_margin"],
@@ -2020,6 +2267,11 @@ class CyberRunner(gym.Env):
             "log_stable_steps": info["log_stable_steps"],
             "log_success": info["log_success"],
         }
+        if self._env.prior_obs_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
+            out["prior_state"] = obs["prior_state"]
+        else:
+            out["states"] = obs["states"]
+            out["checkpoint"] = obs["checkpoint"]
         if self._include_vision:
             out["image"] = obs["image"]
         return out
