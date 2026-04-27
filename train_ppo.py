@@ -63,17 +63,22 @@ def make_prior_env(
 
 
 class FlattenObsWrapper(gym.Wrapper):
-    """Flatten Dict obs {states(7)} → Box(7,)."""
+    """Flatten Dict obs {states(10), checkpoint(3)} → Box(13,)."""
 
     def __init__(self, env, seed: int = 0):
         super().__init__(env)
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(13,), dtype=np.float32
         )
         self.env.reset(seed=seed)
 
     def _flatten(self, obs: dict) -> np.ndarray:
-        return np.asarray(obs["states"], dtype=np.float32)
+        return np.concatenate(
+            [
+                np.asarray(obs["states"], dtype=np.float32),
+                np.asarray(obs["checkpoint"], dtype=np.float32),
+            ]
+        ).astype(np.float32)
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
@@ -183,7 +188,9 @@ def main():
                 self._ep_quiet_frac: list[float] = []
                 self._ep_ball_speed_mean: list[float] = []
                 self._ep_safe_margin_mean: list[float] = []
-                self._termination_counts = {"hole": 0, "timeout": 0, "other": 0}
+                self._termination_counts = {
+                    "hole": 0, "timeout": 0, "survived": 0, "other": 0,
+                }
 
             def _on_step(self) -> bool:
                 infos = self.locals.get("infos", [])
@@ -299,7 +306,7 @@ def main():
                         include_corridors=args.checkpoint_mode == "corners_and_corridors",
                         prior_task=args.prior_task,
                     )
-                    buf = deque([np.zeros(7, dtype=np.float32)] * args.n_stack, maxlen=args.n_stack)
+                    buf = deque([np.zeros(13, dtype=np.float32)] * args.n_stack, maxlen=args.n_stack)
                     raw_obs, _ = env.reset(seed=self.num_timesteps)
                     frames, done = [], False
                     while not done:
@@ -345,7 +352,7 @@ def main():
                 return np.clip(normed, -vec_env.clip_obs, vec_env.clip_obs)
 
             def _run_episode(self, spawn_point: np.ndarray, seed: int) -> dict[str, float]:
-                buf = deque([np.zeros(7, dtype=np.float32)] * args.n_stack, maxlen=args.n_stack)
+                buf = deque([np.zeros(13, dtype=np.float32)] * args.n_stack, maxlen=args.n_stack)
                 raw_obs, _ = self._eval_env.reset(seed=seed, options={"spawn_point": spawn_point})
                 total_reward = 0.0
                 done = False

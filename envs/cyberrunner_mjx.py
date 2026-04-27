@@ -48,14 +48,16 @@ from envs.cyberrunner import (
     RANGE_BETA,
     TIMESTEP,
     WALL_RADIUS,
+    _project_points_to_path,
     build_model,
     compute_waypoint_distances,
     get_hard_layout,
+    select_safe_checkpoints,
 )
 
 
-N_STACK = 4  # frame stacking, matches CPU `train_ppo.py --n_stack 4`
-OBS_DIM = 7   # per-frame obs dim (matches CPU `states` field)
+N_STACK = 4   # frame stacking, matches CPU `train_ppo.py --n_stack 4`
+OBS_DIM = 13  # per-frame obs: 10-dim states + 3-dim checkpoint (matches CPU)
 
 
 @struct.dataclass
@@ -105,6 +107,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
         w_quiet: float = 1.0,          # weight on the low-velocity term
         k_a: float = 0.005,            # action ℓ2 cost
         p_hole: float = 50.0,          # terminal hole penalty
+        p_survival: float = 100.0,     # one-shot bonus on full-episode survival
         # `success` metric threshold on the quiet term.
         quiet_th: float = 0.5,
         # Episode-level success criterion — matches CPU
@@ -165,6 +168,38 @@ class CyberRunnerMJXEnv(PipelineEnv):
 
         self._holes = jnp.asarray(holes, dtype=jnp.float32)
         self._waypoints = jnp.asarray(waypoints, dtype=jnp.float32)
+        # Path geometry (numpy → JAX) for in-graph path projection.
+        wp = np.asarray(waypoints, dtype=np.float32)
+        seg_starts_np = wp[:-1]
+        seg_ends_np = wp[1:]
+        seg_vecs_np = seg_ends_np - seg_starts_np
+        seg_lens_np = np.linalg.norm(seg_vecs_np, axis=1).astype(np.float32)
+        cum_dists_np = np.concatenate(
+            [np.zeros(1, dtype=np.float32), np.cumsum(seg_lens_np)]
+        ).astype(np.float32)
+        self._seg_starts = jnp.asarray(seg_starts_np)
+        self._seg_vecs = jnp.asarray(seg_vecs_np)
+        self._seg_lens = jnp.asarray(seg_lens_np)
+        self._cum_dists = jnp.asarray(cum_dists_np)
+        self._num_waypoints = int(wp.shape[0])
+
+        # Safe corner targets — corners only (no single-wall fallback), same
+        # as CPU `_corner_points`. These are static per maze layout.
+        corners_np = select_safe_checkpoints(
+            wp, np.asarray(holes, dtype=np.float32),
+            walls_h, walls_v,
+            reward_every_n_waypoints=3,
+            include_corridors=False,
+        )
+        if len(corners_np) == 0:
+            corners_np = np.zeros((1, 2), dtype=np.float32)
+            corner_progresses_np = np.zeros((1,), dtype=np.float32)
+        else:
+            cp_raw, _ = _project_points_to_path(corners_np, wp)
+            # CPU multiplies by 10 to match its progress scale; replicate.
+            corner_progresses_np = (cp_raw.astype(np.float32) * 10.0)
+        self._corners = jnp.asarray(corners_np.astype(np.float32))
+        self._corner_progresses = jnp.asarray(corner_progresses_np)
 
         # Spawn bank: reuse the CPU waypoints-based spawn logic without
         # checkpoint filtering (pure stabilization). Keep only spawns that
@@ -190,6 +225,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
         self._w_quiet = float(w_quiet)
         self._k_a = float(k_a)
         self._p_hole = float(p_hole)
+        self._p_survival = float(p_survival)
         self._quiet_th = float(quiet_th)
         self._success_hold_steps = int(success_hold_steps)
         self._solver_iterations = int(solver_iterations)
@@ -248,7 +284,8 @@ class CyberRunnerMJXEnv(PipelineEnv):
         # sensor noise at reset — matches CPU which adds it inside step()).
         per_frame = self._build_per_frame_obs(
             pipeline_state.qpos[0], pipeline_state.qpos[1],
-            ball_pos_noisy0, bias_joint, jnp.zeros(2, dtype=jnp.float32),
+            ball_pos, ball_pos_noisy0, bias_joint,
+            jnp.zeros(2, dtype=jnp.float32),
         )
         # Seed the buffer with [zero, zero, per_frame_reset] so the spawn
         # frame enters the stack history, matching SB3 VecFrameStack which
@@ -339,6 +376,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
         # Hole termination: identical geometry to CPU env (`HOLE_RADIUS`).
         in_hole = hole_d < HOLE_RADIUS
 
+        # Provisional reward (survival bonus added below once `timeout` known).
         reward = (
             self._w_quiet * quiet + r_action
             - jnp.where(in_hole, self._p_hole, 0.0)
@@ -353,6 +391,9 @@ class CyberRunnerMJXEnv(PipelineEnv):
         step_count = stats.step_count + 1
         timeout = step_count >= self._episode_length
         done = (in_hole | timeout).astype(jnp.float32)
+        # Survival bonus: full episode survived without falling in a hole.
+        survived = (timeout & ~in_hole).astype(jnp.float32)
+        reward = reward + self._p_survival * survived
 
         # Success fires ONCE per episode at the first crossing of
         # `success_hold_steps`. Matches CPU `episode/success_rate` semantics.
@@ -364,9 +405,10 @@ class CyberRunnerMJXEnv(PipelineEnv):
         success_metric = crossed.astype(jnp.float32)
         success_ever = jnp.maximum(stats.success, success_metric)
 
-        # Build the new per-frame obs (10-dim, all derived from noisy values).
+        # Build the new per-frame obs (13-dim: 10-dim states + 3-dim ckpt).
         per_frame = self._build_per_frame_obs(
-            alpha, beta, ball_pos_noisy, stats.bias_joint, joint_noise,
+            alpha, beta, ball_pos, ball_pos_noisy,
+            stats.bias_joint, joint_noise,
         )
         # Stack with the carried buffer of last (N_STACK - 1) frames → (40,).
         obs = self._stack_with_buffer(stats.obs_buf, per_frame)
@@ -416,31 +458,86 @@ class CyberRunnerMJXEnv(PipelineEnv):
 
     # ---- obs / geometry --------------------------------------------------
 
+    def _project_to_path(self, ball_pos: jax.Array):
+        """JAX equivalent of the CPU env's `compute_path_progress` direct
+        projection branch (no raycasting / wall-occlusion). Returns
+        ``(progress * 10, seg_idx, closest_pt)`` for parity with CPU
+        progress scale.
+        """
+        seg_len_sq = jnp.maximum(
+            jnp.sum(self._seg_vecs * self._seg_vecs, axis=-1), 1e-10,
+        )
+        rel = ball_pos[None, :] - self._seg_starts
+        t = jnp.sum(rel * self._seg_vecs, axis=-1) / seg_len_sq
+        t = jnp.clip(t, 0.0, 1.0)
+        closest = self._seg_starts + t[:, None] * self._seg_vecs
+        offsets = jnp.linalg.norm(closest - ball_pos[None, :], axis=-1)
+        seg_idx = jnp.argmin(offsets)
+        closest_pt = closest[seg_idx]
+        progress = self._cum_dists[seg_idx] + t[seg_idx] * self._seg_lens[seg_idx]
+        return progress * 10.0, seg_idx, closest_pt
+
+    def _first_backward_safe_corner(self, ball_progress: jax.Array) -> jax.Array:
+        """Largest-progress corner with progress ≤ ball_progress + ε.
+
+        Falls back to the corner with smallest |gap| if no backward corner
+        exists. Implementation is jit-compatible (no dynamic slicing).
+        """
+        eps = 0.005
+        backward_mask = self._corner_progresses <= (ball_progress + eps)
+        masked_progress = jnp.where(
+            backward_mask, self._corner_progresses,
+            jnp.full_like(self._corner_progresses, -jnp.inf),
+        )
+        backward_idx = jnp.argmax(masked_progress)
+        forward_gap = jnp.abs(self._corner_progresses - ball_progress)
+        forward_idx = jnp.argmin(forward_gap)
+        has_backward = jnp.any(backward_mask)
+        idx = jnp.where(has_backward, backward_idx, forward_idx)
+        return self._corners[idx]
+
     def _build_per_frame_obs(
         self,
         alpha_clean: jax.Array,
         beta_clean: jax.Array,
+        ball_pos_clean: jax.Array,
         ball_pos_noisy: jax.Array,
         bias_joint: jax.Array,
         joint_noise: jax.Array,
     ) -> jax.Array:
-        """Build a 7-dim per-frame obs that mirrors the CPU env's `states`.
+        """Build a 13-dim per-frame obs that mirrors CPU's {states, checkpoint}.
 
-        Layout (matches `cyberrunner.py::_get_obs::states`, all NOISY):
-            [0:2] joint_pos = (α_clean, β_clean) + bias_joint + joint_noise
-            [2:4] ball_pos_noisy (passed in, already biased + noised)
-            [4]   distance to nearest hole, from noisy ball pos
-            [5]   distance to nearest wall, from noisy ball pos
-            [6]   tilt magnitude sqrt(α² + β²) from noisy joints
+        Layout (all NOISY for ball-derived terms):
+            [0:2]  joint_pos = (α, β) + bias_joint + joint_noise
+            [2:4]  ball_pos_noisy
+            [4:6]  vec from noisy ball to closest path point
+            [6:8]  vec from noisy ball to next waypoint
+            [8:10] vec from noisy ball to waypoint after next
+            [10:12] vec from noisy ball to first safe corner BACKWARD
+            [12]   distance to that backward corner
         """
         joint_pos = jnp.stack([alpha_clean, beta_clean]) + bias_joint + joint_noise
-        hole_d = jnp.min(jnp.linalg.norm(self._holes - ball_pos_noisy[None, :], axis=1))
-        wall_d = self._min_wall_dist(ball_pos_noisy)
-        abs_tilt = jnp.sqrt(joint_pos[0] * joint_pos[0] + joint_pos[1] * joint_pos[1])
+        # Path projection on CLEAN ball pos (matches CPU which uses true pos
+        # internally for `compute_path_progress`; obs vec is then taken to
+        # NOISY ball, so the sim-to-real noise still propagates into obs).
+        ball_progress, seg_idx, closest_pt = self._project_to_path(ball_pos_clean)
+        next_idx = jnp.minimum(seg_idx + 1, self._num_waypoints - 1)
+        next_next_idx = jnp.minimum(seg_idx + 2, self._num_waypoints - 1)
+        next_wp = self._waypoints[next_idx]
+        next_next_wp = self._waypoints[next_next_idx]
+        vec_closest = closest_pt - ball_pos_noisy
+        vec_next = next_wp - ball_pos_noisy
+        vec_next_next = next_next_wp - ball_pos_noisy
+        backward_corner = self._first_backward_safe_corner(ball_progress)
+        ckpt_vec = backward_corner - ball_pos_noisy
+        ckpt_dist = jnp.linalg.norm(ckpt_vec)
         return jnp.stack([
             joint_pos[0], joint_pos[1],
             ball_pos_noisy[0], ball_pos_noisy[1],
-            hole_d, wall_d, abs_tilt,
+            vec_closest[0], vec_closest[1],
+            vec_next[0], vec_next[1],
+            vec_next_next[0], vec_next_next[1],
+            ckpt_vec[0], ckpt_vec[1], ckpt_dist,
         ]).astype(jnp.float32)
 
     @staticmethod

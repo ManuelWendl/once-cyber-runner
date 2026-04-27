@@ -1135,6 +1135,7 @@ class CyberRunnerEnv(gym.Env):
         prior_spawn_merge_radius: float = 0.0,
         checkpoint_progress_reward_scale: float = 20.0,
         terminate_on_checkpoint_stabilized: bool = False,
+        prior_survival_bonus: float = 100.0,
     ):
         super().__init__()
 
@@ -1166,6 +1167,7 @@ class CyberRunnerEnv(gym.Env):
         self.prior_spawn_merge_radius = prior_spawn_merge_radius
         self.checkpoint_progress_reward_scale = checkpoint_progress_reward_scale
         self.terminate_on_checkpoint_stabilized = terminate_on_checkpoint_stabilized
+        self.prior_survival_bonus = float(prior_survival_bonus)
 
         # Load maze layout
         self.walls_h, self.walls_v, self.holes, self.waypoints = get_hard_layout()
@@ -1222,11 +1224,16 @@ class CyberRunnerEnv(gym.Env):
         self.board_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "board")
         self.marble_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "marble")
 
-        # Observation space (always a Dict). `checkpoint` field removed and
-        # `states` re-laid-out to match the GPU env (cyberrunner_mjx.py):
-        # pure stabilization, no path/target conditioning.
+        # Observation space — matches the pre-GPU layout (commit ec3e3ab):
+        #   "states" (10): [α, β, ball_x, ball_y, vec_to_closest_path(2),
+        #                   vec_to_next_wp(2), vec_to_next_next_wp(2)]
+        #   "checkpoint" (3): [vec_x, vec_y, dist] to FIRST SAFE CORNER
+        #                     BACKWARD in the maze path (recomputed every
+        #                     step from the ball's current path progress).
+        # Walls and holes implicitly inferred via path projection / dynamics.
         obs_spaces = {
-            "states": spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32),
+            "states": spaces.Box(low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32),
+            "checkpoint": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
         }
         if self.include_vision:
             self.img_size = 64
@@ -1518,6 +1525,15 @@ class CyberRunnerEnv(gym.Env):
         # Check termination
         terminated, truncated, info = self._check_termination(ball_pos)
 
+        # Survival bonus: ball survived the full episode without falling in
+        # a hole (timeout truncation, no in-hole termination).
+        if (
+            self.prior_mode and self.prior_task == "stabilize"
+            and truncated and not terminated
+        ):
+            reward += self.prior_survival_bonus
+            info["termination_reason"] = "survived"
+
         # Update state
         if curr_progress >= 0:
             self._prev_progress = curr_progress
@@ -1542,6 +1558,25 @@ class CyberRunnerEnv(gym.Env):
         if self._active_checkpoint_idx >= len(self.checkpoint_points):
             return None
         return self.checkpoint_points[self._active_checkpoint_idx]
+
+    def _first_backward_safe_corner(self, ball_progress: float) -> np.ndarray:
+        """Return the safe corner with the largest path-progress ≤ ball_progress.
+
+        Falls back to the corner closest to ``ball_progress`` (forward) if no
+        backward corner exists. Used as the prior's stabilization target.
+        """
+        if len(self._corner_points) == 0:
+            return np.zeros(2, dtype=np.float32)
+        bp = float(ball_progress) if ball_progress >= 0 else 0.0
+        eps = 0.005
+        backward_mask = self._corner_progresses <= (bp + eps)
+        if backward_mask.any():
+            cands = self._corner_points[backward_mask]
+            cprog = self._corner_progresses[backward_mask]
+            return cands[int(np.argmax(cprog))].astype(np.float32)
+        # No backward corner — pick the closest forward one.
+        gaps = np.abs(self._corner_progresses - bp)
+        return self._corner_points[int(np.argmin(gaps))].astype(np.float32)
 
     def _build_info(self, ball_pos: np.ndarray, curr_progress: float) -> dict[str, Any]:
         active_checkpoint = self._get_active_checkpoint_waypoint()
@@ -1600,12 +1635,15 @@ class CyberRunnerEnv(gym.Env):
         """Get observation with noise.
 
         Returns dict with:
-            "states" (7-dim, all NOISY — sensor model for sim-to-real):
-                [0:2] Joint angles (alpha, beta) + per-episode bias + per-step noise
+            "states" (10-dim, all NOISY — sensor model for sim-to-real):
+                [0:2] Joint angles (α, β) + per-episode bias + per-step noise
                 [2:4] Ball position (x, y) + per-episode bias + per-step noise
-                [4]   Distance from noisy ball pos to nearest hole center
-                [5]   Distance from noisy ball pos to nearest wall segment
-                [6]   Tilt magnitude sqrt(α² + β²) from noisy joints
+                [4:6] Vector from noisy ball pos to closest visible path point
+                [6:8] Vector from noisy ball pos to next waypoint
+                [8:10] Vector from noisy ball pos to waypoint after next
+            "checkpoint" (3-dim):
+                [vec_x, vec_y, distance] to the FIRST safe-corner BACKWARD
+                in the maze path from the ball's current progress.
             "image" (64x64x3, only if include_vision):
                 Cropped board image centered on ball
         """
@@ -1618,21 +1656,36 @@ class CyberRunnerEnv(gym.Env):
         ball_pos = self._get_ball_pos_board_frame()
         ball_pos_noisy = (ball_pos + self._obs_bias["ball"] + ball_noise).astype(np.float32)
 
-        # Distance to nearest hole / wall, both from the NOISY ball pos.
-        hole_d = float(np.min(np.linalg.norm(self.holes - ball_pos_noisy[None, :], axis=1)))
-        wall_d = float(self._min_wall_distance(ball_pos_noisy))
-        abs_tilt = float(np.hypot(joint_pos[0], joint_pos[1]))
+        # Vec to closest path point (uses geometry from CLEAN ball pos via
+        # self._closest_point, then offsets from NOISY ball — matches old).
+        vec_to_closest = self._closest_point - ball_pos_noisy
+        # Next two waypoints in path order.
+        num_waypoints = len(self.waypoints)
+        next_idx = min(self._seg_idx + 1, num_waypoints - 1)
+        next_next_idx = min(self._seg_idx + 2, num_waypoints - 1)
+        vec_to_next_wp = self.waypoints[next_idx] - ball_pos_noisy
+        vec_to_next_next_wp = self.waypoints[next_next_idx] - ball_pos_noisy
+        if not self._path_detected:
+            vec_to_closest = np.zeros(2, dtype=np.float32)
+            vec_to_next_wp = np.zeros(2, dtype=np.float32)
+            vec_to_next_next_wp = np.zeros(2, dtype=np.float32)
 
-        states = np.array([
-            joint_pos[0], joint_pos[1],
-            ball_pos_noisy[0], ball_pos_noisy[1],
-            hole_d, wall_d, abs_tilt,
-        ], dtype=np.float32)
+        # First safe corner BACKWARD in the path.
+        backward_corner = self._first_backward_safe_corner(self._prev_progress)
+        ckpt_vec = backward_corner - ball_pos_noisy
+        ckpt_dist = float(np.linalg.norm(ckpt_vec))
 
-        # `checkpoint` field intentionally omitted: stabilize task no longer
-        # conditions on a target. Other tasks reconstruct what they need from
-        # the path-relative vectors already in `states`.
-        obs = {"states": states}
+        states = np.concatenate(
+            [joint_pos, ball_pos_noisy,
+             vec_to_closest, vec_to_next_wp, vec_to_next_next_wp]
+        ).astype(np.float32)
+
+        obs = {
+            "states": states,
+            "checkpoint": np.array(
+                [ckpt_vec[0], ckpt_vec[1], ckpt_dist], dtype=np.float32,
+            ),
+        }
 
         if self.include_vision:
             # Move vision camera above the ball (in board frame)
