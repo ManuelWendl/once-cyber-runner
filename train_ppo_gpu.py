@@ -55,8 +55,11 @@ class RunningRewardNormalizationWrapper(Wrapper):
 
     def step(self, state: State, action: jax.Array) -> State:
         new_state = self.env.step(state, action)
-        # Reset return roll-up if the previous transition ended the episode.
-        ret_prev = jnp.where(state.done > 0.5, 0.0, state.info["_rn_ret"])
+        # NOTE: `state.done` here is ALWAYS 0 because brax's AutoResetWrapper
+        # zeros it before delegating into the inner env stack. We instead
+        # schedule the reset using `new_state.done` (the just-emitted done)
+        # at the END of this method, so the NEXT call sees a fresh `_rn_ret`.
+        ret_prev = state.info["_rn_ret"]
         ret = self._gamma * ret_prev + new_state.reward
         # Welford online update on `ret` (single sample per env per step).
         count = state.info["_rn_count"] + 1.0
@@ -68,9 +71,13 @@ class RunningRewardNormalizationWrapper(Wrapper):
         # SB3 convention: divide by std but DO NOT subtract the mean.
         norm = new_state.reward / jnp.sqrt(var + self._eps)
         norm = jnp.clip(norm, -self._clip, self._clip)
+        # If THIS step ended the episode, zero the carried return so the
+        # NEXT step starts a fresh discounted-return roll-up.
+        next_ret = jnp.where(new_state.done > 0.5,
+                             jnp.zeros_like(ret), ret)
         info = {
             **new_state.info,
-            "_rn_ret": ret,
+            "_rn_ret": next_ret,
             "_rn_mean": mean,
             "_rn_m2": m2,
             "_rn_count": count,
