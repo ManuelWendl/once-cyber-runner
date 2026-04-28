@@ -280,11 +280,12 @@ class CyberRunnerMJXEnv(PipelineEnv):
         self._v_ref = float(PRIOR_RECOVERY_V_REF if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else v_ref)
         self._w_quiet = float(PRIOR_RECOVERY_W_QUIET if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else w_quiet)
         self._k_a = float(PRIOR_RECOVERY_ACTION_PENALTY if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else k_a)
-        # dense uses Wed-era hole penalty (10) — dense reward already
-        # biases away from holes, so the harsher 50 is unnecessary and tends
-        # to dominate VecNormalize stats.
+        # dense bumps the hole penalty above the typical Phase B per-episode
+        # return so "arrive then fall mid-episode" is strictly worse than
+        # never arriving — the dense per-step shaping is loud enough that a
+        # small hole penalty leaves hole-falls net-positive.
         if prior_version == PRIOR_VERSION_DENSE and p_hole == 50.0:
-            p_hole = 10.0
+            p_hole = 100.0
         self._p_hole = float(p_hole)
         # Survival bonus is only meaningful for the legacy sparse reward —
         # dense has dense per-step shaping and would be destabilized
@@ -504,16 +505,13 @@ class CyberRunnerMJXEnv(PipelineEnv):
             stable_steps = stable_steps_pre
         elif self._prior_version == PRIOR_VERSION_DENSE:
             # Two-phase dense reward — see CPU env _compute_dense_reward.
-            # Always-on geometry / progress.
-            ball_progress, _, _ = self._project_to_path(ball_pos)
-            dense_target = self._first_backward_safe_corner(ball_progress)
+            # Target is FROZEN at reset (`stats.target` from reset), so the
+            # progress shaping cannot be gamed by moving forward and re-
+            # acquiring a corner ahead of the spawn as a new "backward"
+            # target. Recomputing every step let the agent drift forward.
+            dense_target = stats.target
             dense_target_dist = jnp.linalg.norm(dense_target - ball_pos)
-            target_changed = jnp.linalg.norm(dense_target - stats.target) > 1e-6
-            progress_delta = jnp.where(
-                target_changed,
-                jnp.asarray(0.0, dtype=jnp.float32),
-                stats.prev_target_dist - dense_target_dist,
-            )
+            progress_delta = stats.prev_target_dist - dense_target_dist
             r_dense_progress = PRIOR_DENSE_PROGRESS_SCALE * progress_delta
 
             # Arrival transition: first step inside the corner basin pays a
@@ -597,12 +595,11 @@ class CyberRunnerMJXEnv(PipelineEnv):
             [stats.obs_buf[1:], per_frame[None, :]], axis=0,
         )
 
-        # Dense version advances the target each step (first backward safe
-        # corner from current ball progress) and tracks the sticky
-        # `dense_arrived` flag. Other versions keep the target frozen at
-        # reset and leave the flag at 0.
+        # Dense version keeps the target frozen at reset (the spawn-time
+        # first backward safe corner) and tracks the sticky `dense_arrived`
+        # flag. Other versions also keep the target frozen.
         if self._prior_version == PRIOR_VERSION_DENSE:
-            next_target = dense_target
+            next_target = stats.target
             next_prev_target_dist = dense_target_dist.astype(jnp.float32)
             next_dense_arrived = new_dense_arrived
         else:

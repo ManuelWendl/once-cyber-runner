@@ -1862,7 +1862,17 @@ class CyberRunnerEnv(gym.Env):
             vec_to_next_next_wp = np.zeros(2, dtype=np.float32)
 
         # First safe corner BACKWARD in the path.
-        backward_corner = self._first_backward_safe_corner(self._prev_progress)
+        # For the dense prior the target is FROZEN at reset (`_prior_target`)
+        # so the obs and reward agree on a stable goal across the episode;
+        # other modes recompute it every step from the ball's current progress.
+        if (
+            self.prior_obs_mode == PRIOR_VERSION_DENSE
+            and np.all(np.isfinite(self._prior_target))
+            and not np.allclose(self._prior_target, 0.0)
+        ):
+            backward_corner = self._prior_target
+        else:
+            backward_corner = self._first_backward_safe_corner(self._prev_progress)
         ckpt_vec = backward_corner - ball_pos_noisy
         ckpt_dist = float(np.linalg.norm(ckpt_vec))
 
@@ -2068,19 +2078,17 @@ class CyberRunnerEnv(gym.Env):
         Success criterion is gated only on wall-contact + low speed (no
         hole-margin cushion); stabilizing next to a hole still counts.
         """
-        # Always-on geometric terms (computed unconditionally — used for
-        # both phase decisions and the progress shaping).
-        target = self._first_backward_safe_corner(self._prev_progress)
+        # Frozen-at-reset target: the first backward safe corner from the
+        # spawn's path progress (set as `self._prior_target` in reset).
+        # Recomputing every step from current progress would let a forward-
+        # moving agent re-acquire corners ahead of the spawn as new "backward"
+        # targets, defeating the purpose of the prior.
+        target = self._prior_target
         target_dist = float(np.linalg.norm(ball_pos - target))
-        target_changed = (
-            not np.all(np.isfinite(self._prev_dense_target))
-            or not np.allclose(target, self._prev_dense_target, atol=1e-6)
-        )
-        if target_changed or not np.isfinite(self._prev_dense_target_dist):
+        if not np.isfinite(self._prev_dense_target_dist):
             progress_delta = 0.0
         else:
             progress_delta = float(self._prev_dense_target_dist - target_dist)
-        self._prev_dense_target = np.asarray(target, dtype=np.float32)
         self._prev_dense_target_dist = target_dist
 
         # ----- Phase A baseline (always paid) -----

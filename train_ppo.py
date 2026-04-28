@@ -42,9 +42,12 @@ def make_prior_env(
         hole_penalty = 50.0
     elif prior_version == PRIOR_VERSION_DENSE:
         checkpoint_hold_steps = 6
-        # dense uses a gentler hole penalty since the dense shaping
-        # already biases away from holes, so it does not need the harsh 50.
-        hole_penalty = 10.0
+        # The Phase B per-step shaping pays ~0.3-0.5/step when held; over a
+        # 500-step episode that easily clears 80-120, so a small -10 hole
+        # penalty leaves "arrive then fall mid-episode" net-positive. Set
+        # large enough to clear the typical good-episode return so falling
+        # is strictly worse than not arriving at all.
+        hole_penalty = 100.0
     else:  # legacy survival reward
         checkpoint_hold_steps = 6
         hole_penalty = 50.0
