@@ -575,7 +575,7 @@ def main():
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01,
+        ent_coef=1e-3,
         learning_rate=1e-4,
         verbose=0,
         tensorboard_log=None,

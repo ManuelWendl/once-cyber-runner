@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_minibatches", type=int, default=32)
     parser.add_argument("--num_updates_per_batch", type=int, default=10)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--entropy_cost", type=float, default=1e-2)
+    parser.add_argument("--entropy_cost", type=float, default=1e-3)
     parser.add_argument("--discounting", type=float, default=0.99)
     parser.add_argument("--gae_lambda", type=float, default=0.95)
     parser.add_argument("--clip_eps", type=float, default=0.2)
