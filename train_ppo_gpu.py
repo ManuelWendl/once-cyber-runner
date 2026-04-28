@@ -95,7 +95,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--num_minibatches", type=int, default=32)
     parser.add_argument("--num_updates_per_batch", type=int, default=10)
-    parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--entropy_cost", type=float, default=1e-2)
     parser.add_argument("--discounting", type=float, default=0.99)
     parser.add_argument("--gae_lambda", type=float, default=0.95)
@@ -108,7 +108,7 @@ def parse_args() -> argparse.Namespace:
         "--prior_version",
         type=str,
         default="legacy",
-        choices=["legacy", "checkpoint_recovery"],
+        choices=["legacy", "checkpoint_recovery", "dense"],
     )
     parser.add_argument("--mjx_smoke", action="store_true")
     parser.add_argument("--num_evals", type=int, default=100)
@@ -159,9 +159,19 @@ def main() -> None:
         return
     # Mirror CPU `VecNormalize(norm_reward=True)`: divide reward by running
     # std of the discounted return. Per-env Welford in JAX, see class doc.
-    env = RunningRewardNormalizationWrapper(
-        env, gamma=args.discounting, clip=10.0,
-    )
+    # Skip for prior versions with large terminal spikes (legacy: -50 hole
+    # + +100 survival; checkpoint_recovery: -50 hole) — the running std
+    # gets dominated by those events and crushes the dense per-step signal.
+    if args.prior_version == "dense":
+        env = RunningRewardNormalizationWrapper(
+            env, gamma=args.discounting, clip=10.0,
+        )
+    else:
+        print(
+            f"[gpu-train] reward normalization DISABLED for "
+            f"prior_version={args.prior_version} (large terminal spikes)",
+            flush=True,
+        )
 
     wandb_run = None
     if args.wandb_project:

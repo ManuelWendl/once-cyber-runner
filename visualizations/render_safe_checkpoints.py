@@ -42,12 +42,14 @@ def plot_safe_checkpoints(
     out_path: str | None = None,
     show: bool = False,
     show_labels: bool = True,
+    include_corridors: bool = True,
 ) -> str:
     if reward_every_n_waypoints <= 0:
         raise ValueError(f"reward_every_n_waypoints must be positive, got {reward_every_n_waypoints}")
 
     if out_path is None:
-        out_path = f"visualizations/safe_checkpoints_continuous_n{reward_every_n_waypoints}.png"
+        suffix = "continuous" if include_corridors else "corners_only"
+        out_path = f"visualizations/safe_checkpoints_{suffix}_n{reward_every_n_waypoints}.png"
 
     walls_h, walls_v, holes, waypoints = get_hard_layout()
     checkpoints = select_safe_checkpoints(
@@ -56,6 +58,7 @@ def plot_safe_checkpoints(
         walls_h=walls_h,
         walls_v=walls_v,
         reward_every_n_waypoints=reward_every_n_waypoints,
+        include_corridors=include_corridors,
     )
 
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -171,12 +174,18 @@ def main() -> None:
     parser.add_argument("--out", type=str, default=None, help="Output image path.")
     parser.add_argument("--show", action="store_true", help="Also display the figure.")
     parser.add_argument("--hide-labels", action="store_true", help="Disable numeric checkpoint labels.")
+    parser.add_argument(
+        "--no-corridors",
+        action="store_true",
+        help="Strict corners only (matches the prior's _corner_points target set).",
+    )
     args = parser.parse_args()
     plot_safe_checkpoints(
         reward_every_n_waypoints=args.n,
         out_path=args.out,
         show=args.show,
         show_labels=not args.hide_labels,
+        include_corridors=not args.no_corridors,
     )
 
 

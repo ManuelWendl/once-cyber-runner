@@ -45,6 +45,7 @@ from envs.cyberrunner import (
     HOLE_RADIUS,
     JOINT_ANGLE_NOISE,
     LEGACY_PRIOR_OBS_DIM,
+    MARBLE_RADIUS,
     PRIOR_RECOVERY_ACTION_DELTA_PENALTY,
     PRIOR_RECOVERY_ACTION_PENALTY,
     PRIOR_RECOVERY_ALIVE_REWARD,
@@ -57,11 +58,21 @@ from envs.cyberrunner import (
     PRIOR_RECOVERY_W_QUIET,
     PRIOR_VERSION_CHECKPOINT_RECOVERY,
     PRIOR_VERSION_LEGACY,
+    PRIOR_VERSION_DENSE,
     PRIOR_VERSIONS,
+    PRIOR_DENSE_ARRIVAL_BONUS,
+    PRIOR_DENSE_PROGRESS_SCALE,
+    PRIOR_DENSE_QUIET_SPEED,
+    PRIOR_DENSE_SAFE_MARGIN_CLIP,
+    PRIOR_DENSE_SAFE_MARGIN_COEF,
+    PRIOR_DENSE_SPEED_COEF,
+    PRIOR_DENSE_TOUCHING_WALL_BONUS,
+    PRIOR_DENSE_WALL_CONTACT_MARGIN,
     RANGE_ALPHA,
     RANGE_BETA,
     TIMESTEP,
     WALL_RADIUS,
+    DENSE_OBS_DIM,
     _project_points_to_path,
     build_model,
     compute_waypoint_distances,
@@ -70,7 +81,7 @@ from envs.cyberrunner import (
 )
 
 
-N_STACK = 4   # frame stacking, matches CPU `train_ppo.py --n_stack 4`
+N_STACK = 3   # frame stacking, matches CPU `train_ppo.py --n_stack 3`
 OBS_DIM = LEGACY_PRIOR_OBS_DIM  # legacy default; env.obs_dim is mode-specific
 
 
@@ -92,6 +103,9 @@ class _EpStats:
     checkpoint_dist_min: jnp.ndarray   # ()
     inside_checkpoint_steps: jnp.ndarray
     speed_sum: jnp.ndarray
+    # Sticky 0/1 flag: ball has entered the corner basin at least once
+    # this episode. Used by the phased dense reward (approach vs stabilize).
+    dense_arrived: jnp.ndarray         # ()  float32, 0.0 or 1.0
 
 
 class CyberRunnerMJXEnv(PipelineEnv):
@@ -119,8 +133,9 @@ class CyberRunnerMJXEnv(PipelineEnv):
         init_tilt_frac: float = 0.05,
         prior_spawn_source: str = "waypoints",
         prior_start_point_spacing: float = 0.01,
-        # Match CPU `prior_spawn_min_hole_margin=0.0` — spawn from ALL waypoints.
-        prior_spawn_min_hole_margin: float = 0.0,
+        # Safe spawn for ALL prior versions: never start adjacent to a hole.
+        # Matches CPU `train_ppo.py` default of 12 mm.
+        prior_spawn_min_hole_margin: float = 0.012,
         prior_version: str = PRIOR_VERSION_LEGACY,
         # EMA smoothing α for the noisy ball speed used by the reward
         # (matches CPU `checkpoint_speed_ema_alpha=0.8`).
@@ -235,7 +250,9 @@ class CyberRunnerMJXEnv(PipelineEnv):
 
         # Spawn bank: reuse the CPU waypoints-based spawn logic without
         # checkpoint filtering (pure stabilization). Keep only spawns that
-        # clear holes by a safe margin.
+        # clear holes by `prior_spawn_min_hole_margin` (12 mm by default for
+        # every prior version — early policies cannot recover from a spawn
+        # right next to a hole).
         spawn_np = self._build_spawn_bank(
             waypoints, holes, prior_spawn_source, prior_start_point_spacing,
             prior_spawn_min_hole_margin,
@@ -248,11 +265,12 @@ class CyberRunnerMJXEnv(PipelineEnv):
 
         self._episode_length = int(episode_length)
         self._prior_version = prior_version
-        self.obs_dim = (
-            CHECKPOINT_RECOVERY_OBS_DIM
-            if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY
-            else LEGACY_PRIOR_OBS_DIM
-        )
+        if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY:
+            self.obs_dim = CHECKPOINT_RECOVERY_OBS_DIM
+        elif prior_version == PRIOR_VERSION_DENSE:
+            self.obs_dim = DENSE_OBS_DIM
+        else:
+            self.obs_dim = LEGACY_PRIOR_OBS_DIM
         self._init_ball_speed = float(init_ball_speed)
         self._init_tilt_frac = float(init_tilt_frac)
         self._range_alpha = (float(RANGE_ALPHA[0]), float(RANGE_ALPHA[1]))
@@ -262,7 +280,17 @@ class CyberRunnerMJXEnv(PipelineEnv):
         self._v_ref = float(PRIOR_RECOVERY_V_REF if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else v_ref)
         self._w_quiet = float(PRIOR_RECOVERY_W_QUIET if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else w_quiet)
         self._k_a = float(PRIOR_RECOVERY_ACTION_PENALTY if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else k_a)
+        # dense uses Wed-era hole penalty (10) — dense reward already
+        # biases away from holes, so the harsher 50 is unnecessary and tends
+        # to dominate VecNormalize stats.
+        if prior_version == PRIOR_VERSION_DENSE and p_hole == 50.0:
+            p_hole = 10.0
         self._p_hole = float(p_hole)
+        # Survival bonus is only meaningful for the legacy sparse reward —
+        # dense has dense per-step shaping and would be destabilized
+        # by a +100 terminal lump sum.
+        if prior_version == PRIOR_VERSION_DENSE:
+            p_survival = 0.0
         self._p_survival = float(p_survival)
         self._quiet_th = float(quiet_th)
         self._quiet_threshold_speed = float(quiet_threshold_speed)
@@ -276,6 +304,11 @@ class CyberRunnerMJXEnv(PipelineEnv):
         self._solver_iterations = int(solver_iterations)
         self._ls_iterations = int(ls_iterations)
         self._speed_ema_alpha = float(speed_ema_alpha)
+
+        # dense reward constants (constant across episodes).
+        self._dense_hold_reward = 1.0
+        self._dense_stabilize_reward = 10.0
+        self._dense_safe_hole_margin = 0.004
 
     # ---- Brax API --------------------------------------------------------
 
@@ -365,6 +398,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
             checkpoint_dist_min=target_dist0.astype(jnp.float32),
             inside_checkpoint_steps=jnp.asarray(0, dtype=jnp.int32),
             speed_sum=jnp.asarray(0.0, dtype=jnp.float32),
+            dense_arrived=jnp.asarray(0.0, dtype=jnp.float32),
         )
         obs = self._stack_with_buffer(
             jnp.zeros((N_STACK - 1, self.obs_dim), dtype=jnp.float32), per_frame,
@@ -464,11 +498,72 @@ class CyberRunnerMJXEnv(PipelineEnv):
                 + self._w_quiet * quiet + r_hold
                 + r_action + r_action_delta + r_tilt + r_hole
             )
+            stable_steps_pre = jnp.where(
+                stable_condition, stats.stable_steps + 1, jnp.int32(0)
+            )
+            stable_steps = stable_steps_pre
+        elif self._prior_version == PRIOR_VERSION_DENSE:
+            # Two-phase dense reward — see CPU env _compute_dense_reward.
+            # Always-on geometry / progress.
+            ball_progress, _, _ = self._project_to_path(ball_pos)
+            dense_target = self._first_backward_safe_corner(ball_progress)
+            dense_target_dist = jnp.linalg.norm(dense_target - ball_pos)
+            target_changed = jnp.linalg.norm(dense_target - stats.target) > 1e-6
+            progress_delta = jnp.where(
+                target_changed,
+                jnp.asarray(0.0, dtype=jnp.float32),
+                stats.prev_target_dist - dense_target_dist,
+            )
+            r_dense_progress = PRIOR_DENSE_PROGRESS_SCALE * progress_delta
+
+            # Arrival transition: first step inside the corner basin pays a
+            # one-time bonus and flips the sticky `dense_arrived` flag.
+            arrival_radius = jnp.asarray(0.015, dtype=jnp.float32)  # = checkpoint_radius
+            arrived_now = dense_target_dist < arrival_radius
+            fresh_arrival = arrived_now & (stats.dense_arrived < 0.5)
+            r_arrival = jnp.where(
+                fresh_arrival, PRIOR_DENSE_ARRIVAL_BONUS, 0.0,
+            ).astype(jnp.float32)
+            new_dense_arrived = jnp.maximum(
+                stats.dense_arrived, arrived_now.astype(jnp.float32)
+            )
+            stabilize_active = new_dense_arrived > 0.5
+
+            # Phase B (stabilize) terms — gated on `stabilize_active`.
+            wall_d = self._min_wall_dist(ball_pos)
+            touching_wall = wall_d < (
+                WALL_RADIUS + MARBLE_RADIUS + PRIOR_DENSE_WALL_CONTACT_MARGIN
+            )
+            safe_margin = jnp.maximum(
+                hole_d - (HOLE_RADIUS + self._dense_safe_hole_margin), 0.0
+            )
+            r_speed = -PRIOR_DENSE_SPEED_COEF * ema_speed
+            r_safe = PRIOR_DENSE_SAFE_MARGIN_COEF * jnp.minimum(
+                safe_margin, PRIOR_DENSE_SAFE_MARGIN_CLIP
+            )
+            r_wall = jnp.where(touching_wall, PRIOR_DENSE_TOUCHING_WALL_BONUS, 0.0)
+            in_quiet = ema_speed < PRIOR_DENSE_QUIET_SPEED
+            stable_condition = touching_wall & in_quiet & stabilize_active
+            stable_steps_pre = jnp.where(
+                stable_condition, stats.stable_steps + 1, jnp.int32(0)
+            )
+            r_hold_step = jnp.where(stable_condition, self._dense_hold_reward, 0.0)
+            saturated = stable_steps_pre >= self._success_hold_steps
+            r_saturate = jnp.where(saturated, self._dense_stabilize_reward, 0.0)
+            stable_steps = jnp.where(saturated, jnp.int32(0), stable_steps_pre)
+            r_hold = r_hold_step + r_saturate
+            r_phaseB = jnp.where(
+                stabilize_active, r_speed + r_safe + r_wall + r_hold, 0.0,
+            )
+            reward = r_dense_progress + r_arrival + r_phaseB + r_hole
         else:
             in_quiet = quiet > self._quiet_th
             stable_condition = in_quiet
             reward = self._w_quiet * quiet + r_action + r_hole
-        stable_steps = jnp.where(stable_condition, stats.stable_steps + 1, jnp.int32(0))
+            stable_steps_pre = jnp.where(
+                stable_condition, stats.stable_steps + 1, jnp.int32(0)
+            )
+            stable_steps = stable_steps_pre
         stable_steps_max = jnp.maximum(stats.stable_steps_max, stable_steps)
 
         step_count = stats.step_count + 1
@@ -480,9 +575,11 @@ class CyberRunnerMJXEnv(PipelineEnv):
 
         # Success fires ONCE per episode at the first crossing of
         # `success_hold_steps`. Matches CPU `episode/success_rate` semantics.
+        # Use `stable_steps_pre` (before any dense post-saturation
+        # reset) so the threshold-crossing edge is detected on all branches.
         crossed = (
             (stats.stable_steps < self._success_hold_steps)
-            & (stable_steps >= self._success_hold_steps)
+            & (stable_steps_pre >= self._success_hold_steps)
             & (stats.success < 0.5)
         )
         success_metric = crossed.astype(jnp.float32)
@@ -500,6 +597,18 @@ class CyberRunnerMJXEnv(PipelineEnv):
             [stats.obs_buf[1:], per_frame[None, :]], axis=0,
         )
 
+        # Dense version advances the target each step (first backward safe
+        # corner from current ball progress) and tracks the sticky
+        # `dense_arrived` flag. Other versions keep the target frozen at
+        # reset and leave the flag at 0.
+        if self._prior_version == PRIOR_VERSION_DENSE:
+            next_target = dense_target
+            next_prev_target_dist = dense_target_dist.astype(jnp.float32)
+            next_dense_arrived = new_dense_arrived
+        else:
+            next_target = stats.target
+            next_prev_target_dist = checkpoint_dist.astype(jnp.float32)
+            next_dense_arrived = stats.dense_arrived
         new_stats = _EpStats(
             prev_ball_pos_clean=ball_pos,
             prev_ball_pos_noisy=ball_pos_noisy,
@@ -512,11 +621,12 @@ class CyberRunnerMJXEnv(PipelineEnv):
             step_count=step_count,
             success=success_ever,
             prev_action=action,
-            target=stats.target,
-            prev_target_dist=checkpoint_dist.astype(jnp.float32),
+            target=next_target,
+            prev_target_dist=next_prev_target_dist,
             checkpoint_dist_min=checkpoint_dist_min.astype(jnp.float32),
             inside_checkpoint_steps=stats.inside_checkpoint_steps + inside_checkpoint.astype(jnp.int32),
             speed_sum=stats.speed_sum + ema_speed,
+            dense_arrived=next_dense_arrived,
         )
         # Per-step metrics. Brax's EpisodeWrapper sums them across the
         # rollout — divide by avg_episode_length in progress_fn for means
@@ -649,6 +759,15 @@ class CyberRunnerMJXEnv(PipelineEnv):
                 vec_closest[0], vec_closest[1],
                 prev_action[0], prev_action[1],
                 inside,
+            ]).astype(jnp.float32)
+        if self._prior_version == PRIOR_VERSION_DENSE:
+            # 9-dim: drop next-waypoint vectors — stabilize task does not
+            # need next-waypoint targeting, only local geometry + safe corner.
+            return jnp.stack([
+                joint_pos[0], joint_pos[1],
+                ball_pos_noisy[0], ball_pos_noisy[1],
+                vec_closest[0], vec_closest[1],
+                ckpt_vec[0], ckpt_vec[1], ckpt_dist,
             ]).astype(jnp.float32)
         return jnp.stack([
             joint_pos[0], joint_pos[1],

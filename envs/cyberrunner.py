@@ -57,12 +57,24 @@ GOAL_THRESHOLD = 0.004  # 4mm
 CHECKPOINT_REWARD = 1.0  # paid per reward-waypoint crossed under modulo-N sparsification
 
 # Prior versions.  Keep the legacy prior as the default so old experiments are
-# reproducible; checkpoint_recovery is the new real-transferable stabilizer.
+# reproducible; checkpoint_recovery is the new real-transferable stabilizer;
+# dense is the dense Wed-style reward (touching_wall + safe_margin +
+# speed penalty + per-step hold + saturate) with success criterion that does
+# NOT gate on hole margin (stable near a hole is acceptable).
 PRIOR_VERSION_LEGACY = "legacy"
 PRIOR_VERSION_CHECKPOINT_RECOVERY = "checkpoint_recovery"
-PRIOR_VERSIONS = (PRIOR_VERSION_LEGACY, PRIOR_VERSION_CHECKPOINT_RECOVERY)
+PRIOR_VERSION_DENSE = "dense"
+PRIOR_VERSIONS = (
+    PRIOR_VERSION_LEGACY,
+    PRIOR_VERSION_CHECKPOINT_RECOVERY,
+    PRIOR_VERSION_DENSE,
+)
 LEGACY_PRIOR_OBS_DIM = 13
 CHECKPOINT_RECOVERY_OBS_DIM = 12
+# dense drops the two next-waypoint vectors (4 dims) from the legacy
+# `states` block: 6-dim states + 3-dim checkpoint = 9.
+DENSE_STATES_DIM = 6
+DENSE_OBS_DIM = DENSE_STATES_DIM + 3
 
 # Checkpoint-recovery reward defaults.  These are mirrored in the MJX env.
 PRIOR_RECOVERY_V_REF = 0.04
@@ -75,6 +87,23 @@ PRIOR_RECOVERY_W_HOLD = 1.0
 PRIOR_RECOVERY_ACTION_PENALTY = 0.005
 PRIOR_RECOVERY_ACTION_DELTA_PENALTY = 0.01
 PRIOR_RECOVERY_TILT_PENALTY = 0.05
+
+# dense reward defaults — restored from commit ec3e3ab (last Wed).
+# Speed gate uses the current v_ref (0.03) instead of Wed's looser 0.05.
+PRIOR_DENSE_SPEED_COEF = 0.05         # weight on linear -speed shaping
+PRIOR_DENSE_SAFE_MARGIN_COEF = 2.0    # weight on min(safe_margin, clip)
+PRIOR_DENSE_SAFE_MARGIN_CLIP = 0.02   # safe_margin saturates here
+PRIOR_DENSE_TOUCHING_WALL_BONUS = 0.05
+PRIOR_DENSE_QUIET_SPEED = 0.05        # speed gate for stable-step counter (Wed-style, relaxed)
+PRIOR_DENSE_WALL_CONTACT_MARGIN = 0.002  # ball is "touching" if d < r_w + r_m + this
+# Progress-to-safe-corner shaping (port of `main:cyberrunner_env.py:_compute_reward`
+# but targeting the first BACKWARD safe corner instead of the maze goal).
+# Symmetric: rewards moving toward, penalizes moving away.
+PRIOR_DENSE_PROGRESS_SCALE = 20.0
+# One-time bump paid the first step the ball enters the corner basin (i.e.
+# crosses target_dist < checkpoint_radius). Marks the transition from the
+# "approach" phase to the "stabilize" phase.
+PRIOR_DENSE_ARRIVAL_BONUS = 5.0
 
 
 # ============================================================================
@@ -291,8 +320,14 @@ def compute_waypoint_distances(waypoints: np.ndarray) -> tuple[np.ndarray, np.nd
     return seg_lengths.astype(np.float32), cum_distances.astype(np.float32)
 
 
-def _project_points_to_path(points: np.ndarray, waypoints: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Project points onto the reference path and return path progress and offset."""
+def _project_points_to_path(
+    points: np.ndarray, waypoints: np.ndarray, return_closest: bool = False
+):
+    """Project points onto the reference path and return path progress and offset.
+
+    With ``return_closest=True`` also returns the closest path point per input
+    (used for line-of-sight reachability checks).
+    """
     seg_starts = waypoints[:-1]
     seg_ends = waypoints[1:]
     seg_vecs = seg_ends - seg_starts
@@ -309,7 +344,12 @@ def _project_points_to_path(points: np.ndarray, waypoints: np.ndarray) -> tuple[
     best_offset = offsets[np.arange(len(points)), best_seg]
     best_t = t_clipped[np.arange(len(points)), best_seg]
     progress = cum_distances[best_seg] + best_t * seg_lengths[best_seg]
-    return progress.astype(np.float32), best_offset.astype(np.float32)
+    progress = progress.astype(np.float32)
+    best_offset = best_offset.astype(np.float32)
+    if return_closest:
+        closest_pts = closest[np.arange(len(points)), best_seg].astype(np.float32)
+        return progress, best_offset, closest_pts
+    return progress, best_offset
 
 
 def _point_to_segment_distance(points: np.ndarray, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
@@ -467,18 +507,40 @@ def select_safe_checkpoints(
             # If all close holes were blocked, candidate is safe
             hole_clearance[i] = -worst if worst > -np.inf else margin_i
 
-    progress, path_offset = _project_points_to_path(candidates, waypoints)
+    progress, path_offset, closest_path_pts = _project_points_to_path(
+        candidates, waypoints, return_closest=True,
+    )
     # Keep checkpoints relevant to maze progression, but allow slightly off-path
     # corner basins that are genuinely good stop/restart locations.
     max_path_offset = 0.065
 
-    valid = (
+    pre_valid = (
         (hole_clearance > 0.0)
         & (wall_clearance >= -1e-6)
         & (edge_clearance >= -1e-6)
         & (path_offset < max_path_offset)
         & is_safe
     )
+    # Path reachability: drop candidates whose centerline path to the closest
+    # path point grazes a wall (sub-mm clearance), e.g. an LOS that barely
+    # skirts a wall endpoint into a sealed-off pocket. Threshold is set to
+    # WALL_RADIUS — comfortably above the numeric grazing regime but well
+    # below the (WALL_RADIUS + MARBLE_RADIUS) gap where the ball can
+    # physically squeeze through, so legitimate narrow corridors stay valid.
+    wall_s_all = np.vstack([h_starts, v_starts])
+    wall_e_all = np.vstack([h_ends, v_ends])
+    min_clearance = WALL_RADIUS
+    n_samples = 32
+    ts = np.linspace(0.0, 1.0, n_samples, dtype=np.float32)
+    reachable = np.ones(len(candidates), dtype=bool)
+    for i in np.where(pre_valid)[0]:
+        p = candidates[i]
+        q = closest_path_pts[i]
+        seg_pts = p[None, :] + ts[:, None] * (q - p)[None, :]
+        min_d = _point_to_segment_distance(seg_pts, wall_s_all, wall_e_all).min()
+        if min_d < min_clearance:
+            reachable[i] = False
+    valid = pre_valid & reachable
     if not np.any(valid):
         return np.zeros((0, 2), dtype=np.float32)
 
@@ -1285,8 +1347,12 @@ class CyberRunnerEnv(gym.Env):
         #                     BACKWARD in the maze path (recomputed every
         #                     step from the ball's current path progress).
         # Walls and holes implicitly inferred via path projection / dynamics.
+        if self.prior_obs_mode == PRIOR_VERSION_DENSE:
+            states_dim = DENSE_STATES_DIM
+        else:
+            states_dim = 10
         obs_spaces = {
-            "states": spaces.Box(low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32),
+            "states": spaces.Box(low=-np.inf, high=np.inf, shape=(states_dim,), dtype=np.float32),
             "checkpoint": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
         }
         if self.prior_obs_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
@@ -1349,6 +1415,15 @@ class CyberRunnerEnv(gym.Env):
         self._prev_action_for_obs = np.zeros(2, dtype=np.float32)
         self._prev_target_dist = np.inf
         self._target_dist_min = np.inf
+        # Dense-version progress shaping: track the first-backward safe-corner
+        # target between steps so we can reward (prev_dist − curr_dist).
+        # Reset to current target on corner crossings so the discontinuity
+        # does not produce a spurious progress reward.
+        self._prev_dense_target = np.full(2, np.nan, dtype=np.float32)
+        self._prev_dense_target_dist = np.inf
+        # Sticky "ball entered the corner basin once this episode" flag —
+        # drives the phased dense reward (approach vs stabilize).
+        self._dense_arrived = False
         self._stable_steps_max = 0
         self._ep_inside_checkpoint_steps = 0
         self._reward_terms: dict[str, float] = {}
@@ -1515,6 +1590,11 @@ class CyberRunnerEnv(gym.Env):
         self._prev_action_for_obs = np.zeros(2, dtype=np.float32)
         self._prev_target_dist = np.inf
         self._target_dist_min = np.inf
+        self._prev_dense_target = np.full(2, np.nan, dtype=np.float32)
+        self._prev_dense_target_dist = np.inf
+        # Sticky "ball entered the corner basin once this episode" flag —
+        # drives the phased dense reward (approach vs stabilize).
+        self._dense_arrived = False
         self._stable_steps_max = 0
         self._ep_inside_checkpoint_steps = 0
         self._reward_terms = {
@@ -1617,9 +1697,13 @@ class CyberRunnerEnv(gym.Env):
         terminated, truncated, info = self._check_termination(ball_pos)
 
         # Survival bonus: ball survived the full episode without falling in
-        # a hole (timeout truncation, no in-hole termination).
+        # a hole (timeout truncation, no in-hole termination). Only paid for
+        # the legacy survival reward — dense and checkpoint_recovery
+        # already provide dense per-step shaping, so the +100 lump sum would
+        # only destabilize VecNormalize.
         if (
             self.prior_mode and self.prior_task == "stabilize"
+            and self.prior_reward_mode == PRIOR_VERSION_LEGACY
             and truncated and not terminated
         ):
             reward += self.prior_survival_bonus
@@ -1816,10 +1900,19 @@ class CyberRunnerEnv(gym.Env):
                 obs["image"] = self.vision_renderer.render()
             return obs
 
-        states = np.concatenate(
-            [joint_pos, ball_pos_noisy,
-             vec_to_closest, vec_to_next_wp, vec_to_next_next_wp]
-        ).astype(np.float32)
+        if self.prior_obs_mode == PRIOR_VERSION_DENSE:
+            # dense drops vec_to_next_wp / vec_to_next_next_wp — the
+            # stabilize task does not need next-waypoint targeting, only the
+            # local geometry (joint angles, ball position, closest path point)
+            # and the safe-corner pointer in `checkpoint`.
+            states = np.concatenate(
+                [joint_pos, ball_pos_noisy, vec_to_closest]
+            ).astype(np.float32)
+        else:
+            states = np.concatenate(
+                [joint_pos, ball_pos_noisy,
+                 vec_to_closest, vec_to_next_wp, vec_to_next_next_wp]
+            ).astype(np.float32)
 
         obs = {
             "states": states,
@@ -1854,6 +1947,8 @@ class CyberRunnerEnv(gym.Env):
         if self.prior_mode and self.prior_task == "stabilize":
             if self.prior_reward_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
                 return self._compute_checkpoint_recovery_reward(ball_pos, action, prev_action, ball_pos_observed)
+            if self.prior_reward_mode == PRIOR_VERSION_DENSE:
+                return self._compute_dense_reward(ball_pos)
             # Survival-shaped reward. Goal: ball stays alive on the board for
             # the full 500-step episode without falling into a hole.
             #   quiet = exp(-(speed / v_ref)²)   ∈ [0, 1]   (low velocity good)
@@ -1948,6 +2043,91 @@ class CyberRunnerEnv(gym.Env):
         hole_reward = -self.hole_penalty if self._min_hole_distance < HOLE_RADIUS else 0.0
 
         return checkpoint_reward + goal_reward + hole_reward
+
+    def _compute_dense_reward(self, ball_pos: np.ndarray) -> float:
+        """Two-phase dense reward for the stabilize prior.
+
+        Phase A — APPROACH (ball not yet at the corner):
+            r = s_p · (prev_target_dist − target_dist) − hole_penalty · 1[in_hole]
+
+        Transition — first step the ball enters the corner basin
+        (target_dist < checkpoint_radius) → one-time +arrival_bonus.
+
+        Phase B — STABILIZE (sticky for the rest of the episode):
+            adds  −k_v · speed
+                + w_safe · min(safe_margin, clip)
+                + b_wall · 1[touching_wall]
+                + checkpoint_hold_reward       per stable step
+                + checkpoint_stabilize_reward  each time stable_steps saturates
+
+        The progress term and hole penalty stay active in BOTH phases — so
+        if the ball drifts away after arrival, the symmetric progress term
+        pulls it back rather than relying purely on the policy's memory of
+        the hold reward.
+
+        Success criterion is gated only on wall-contact + low speed (no
+        hole-margin cushion); stabilizing next to a hole still counts.
+        """
+        # Always-on geometric terms (computed unconditionally — used for
+        # both phase decisions and the progress shaping).
+        target = self._first_backward_safe_corner(self._prev_progress)
+        target_dist = float(np.linalg.norm(ball_pos - target))
+        target_changed = (
+            not np.all(np.isfinite(self._prev_dense_target))
+            or not np.allclose(target, self._prev_dense_target, atol=1e-6)
+        )
+        if target_changed or not np.isfinite(self._prev_dense_target_dist):
+            progress_delta = 0.0
+        else:
+            progress_delta = float(self._prev_dense_target_dist - target_dist)
+        self._prev_dense_target = np.asarray(target, dtype=np.float32)
+        self._prev_dense_target_dist = target_dist
+
+        # ----- Phase A baseline (always paid) -----
+        reward = PRIOR_DENSE_PROGRESS_SCALE * progress_delta
+        hole_reward = -self.hole_penalty if self._min_hole_distance < HOLE_RADIUS else 0.0
+
+        # ----- Arrival transition -----
+        arrived_now = target_dist < self.checkpoint_radius
+        if arrived_now and not self._dense_arrived:
+            reward += PRIOR_DENSE_ARRIVAL_BONUS
+            self._dense_arrived = True
+
+        # ----- Phase B (stabilize, sticky) -----
+        if self._dense_arrived:
+            wall_d = self._min_wall_distance(ball_pos)
+            touching_wall = wall_d < (WALL_RADIUS + MARBLE_RADIUS + PRIOR_DENSE_WALL_CONTACT_MARGIN)
+            safe_margin = max(
+                self._min_hole_distance - (HOLE_RADIUS + self.safe_hole_margin), 0.0
+            )
+            reward += -PRIOR_DENSE_SPEED_COEF * self._ball_speed
+            reward += PRIOR_DENSE_SAFE_MARGIN_COEF * min(safe_margin, PRIOR_DENSE_SAFE_MARGIN_CLIP)
+            if touching_wall:
+                reward += PRIOR_DENSE_TOUCHING_WALL_BONUS
+
+            stable_here = touching_wall and self._ball_speed < PRIOR_DENSE_QUIET_SPEED
+            if stable_here:
+                self._stable_steps += 1
+                self._ep_quiet_steps += 1
+                reward += self.checkpoint_hold_reward
+            else:
+                self._stable_steps = 0
+            self._stable_steps_max = max(self._stable_steps_max, self._stable_steps)
+            if self._stable_steps >= self.checkpoint_hold_steps:
+                reward += self.checkpoint_stabilize_reward
+                self._success = True
+                self._stable_steps = 0
+        else:
+            # Pre-arrival: no stable-step counting, no quiet bookkeeping.
+            self._stable_steps = 0
+
+        self._ep_ball_speed_sum += float(self._ball_speed)
+        self._ep_safe_hole_margin_sum += max(
+            0.0, float(self._min_hole_distance - HOLE_RADIUS)
+        )
+        self._in_checkpoint_prev = False
+        self._prev_checkpoint_dist = np.inf
+        return float(reward + hole_reward)
 
     def _compute_checkpoint_recovery_reward(
         self,

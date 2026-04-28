@@ -28,17 +28,33 @@ def make_prior_env(
         CHECKPOINT_RECOVERY_OBS_DIM,
         LEGACY_PRIOR_OBS_DIM,
         PRIOR_VERSION_CHECKPOINT_RECOVERY,
+        PRIOR_VERSION_DENSE,
+        DENSE_OBS_DIM,
         CyberRunnerEnv,
     )
 
-    checkpoint_hold_steps = 25 if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else 6
+    # Safe spawn applies to ALL prior versions: never start the ball within
+    # 12 mm of a hole — early policies cannot recover from spawn-adjacent
+    # hole failures and the resulting -hole_penalty events drown the shaping.
+    prior_spawn_min_hole_margin = 0.012
+    if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY:
+        checkpoint_hold_steps = 25
+        hole_penalty = 50.0
+    elif prior_version == PRIOR_VERSION_DENSE:
+        checkpoint_hold_steps = 6
+        # dense uses a gentler hole penalty since the dense shaping
+        # already biases away from holes, so it does not need the harsh 50.
+        hole_penalty = 10.0
+    else:  # legacy survival reward
+        checkpoint_hold_steps = 6
+        hole_penalty = 50.0
     env = CyberRunnerEnv(
         render_mode=render_mode,
         episode_length=500,
         randomize_init_pos=False,
         include_vision=False,
         reward_every_n_waypoints=3,
-        hole_penalty=50.0,
+        hole_penalty=hole_penalty,
         checkpoint_radius=0.015,
         checkpoint_hold_steps=checkpoint_hold_steps,
         checkpoint_speed_threshold=0.05,
@@ -52,13 +68,13 @@ def make_prior_env(
         prior_task=prior_task,
         prior_spawn_source=prior_spawn_source,
         prior_start_waypoint_window=3,
-        # Init matches GPU defaults — gentle starts, agent must hold sweet spots.
+        # Gentle init kept across all prior versions (less aggressive than Wed's
+        # 0.2/0.25 — the dense module restores Wed's REWARD, not its init).
         prior_init_ball_speed=0.05,
         prior_init_tilt_frac=0.05,
         prior_min_checkpoint_start_dist=0.02,
         prior_max_checkpoint_start_dist=0.12,
-        # Spawn from ALL waypoints (no hole-margin filtering).
-        prior_spawn_min_hole_margin=0.0,
+        prior_spawn_min_hole_margin=prior_spawn_min_hole_margin,
         prior_start_point_spacing=0.01,
         prior_spawn_merge_radius=0.0,
         checkpoint_progress_reward_scale=progress_scale,
@@ -67,7 +83,12 @@ def make_prior_env(
         terminate_on_checkpoint_stabilized=False,
         prior_version=prior_version,
     )
-    obs_dim = CHECKPOINT_RECOVERY_OBS_DIM if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else LEGACY_PRIOR_OBS_DIM
+    if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY:
+        obs_dim = CHECKPOINT_RECOVERY_OBS_DIM
+    elif prior_version == PRIOR_VERSION_DENSE:
+        obs_dim = DENSE_OBS_DIM
+    else:
+        obs_dim = LEGACY_PRIOR_OBS_DIM
     return FlattenObsWrapper(env, seed=seed, prior_version=prior_version, obs_dim=obs_dim)
 
 
@@ -107,7 +128,7 @@ def main():
     parser.add_argument("--logdir", type=str, default="logdir/ppo")
     parser.add_argument("--steps", type=int, default=1_000_000)
     parser.add_argument("--n_envs", type=int, default=16)
-    parser.add_argument("--n_stack", type=int, default=4)
+    parser.add_argument("--n_stack", type=int, default=3)
     parser.add_argument("--progress_scale", type=float, default=2.0)
     parser.add_argument(
         "--checkpoint_mode",
@@ -131,7 +152,7 @@ def main():
         "--prior_version",
         type=str,
         default="legacy",
-        choices=["legacy", "checkpoint_recovery"],
+        choices=["legacy", "checkpoint_recovery", "dense"],
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wandb_project", type=str, default=None)
@@ -186,6 +207,12 @@ def main():
         "termination_reason",
     )
 
+    # Reward normalization OFF for prior versions that emit large terminal
+    # spikes (hole_penalty=50 and/or +100 survival lump): the running std
+    # then gets dominated by those events, crushing the dense per-step
+    # signal. dense has bounded dense rewards (hole_penalty=10, no
+    # survival bonus) and benefits from VecNormalize.
+    norm_reward = args.prior_version == "dense"
     vec_env = VecNormalize(
         VecFrameStack(
             VecMonitor(
@@ -194,7 +221,7 @@ def main():
             ),
             n_stack=args.n_stack,
         ),
-        norm_obs=True, norm_reward=True, clip_obs=10.0,
+        norm_obs=True, norm_reward=norm_reward, clip_obs=10.0,
     )
 
     eval_env = VecNormalize(
@@ -543,7 +570,7 @@ def main():
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.01,
-        learning_rate=3e-4,
+        learning_rate=1e-4,
         verbose=0,
         tensorboard_log=None,
         seed=args.seed,
