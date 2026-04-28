@@ -106,6 +106,9 @@ class _EpStats:
     # Sticky 0/1 flag: ball has entered the corner basin at least once
     # this episode. Used by the phased dense reward (approach vs stabilize).
     dense_arrived: jnp.ndarray         # ()  float32, 0.0 or 1.0
+    # Path-segment index of the frozen dense target. Used by the dense obs
+    # to expose the next waypoint along the path going toward the target.
+    target_seg_idx: jnp.ndarray        # ()  int32
 
 
 class CyberRunnerMJXEnv(PipelineEnv):
@@ -364,12 +367,17 @@ class CyberRunnerMJXEnv(PipelineEnv):
         ball_progress0, _, _ = self._project_to_path(ball_pos)
         target0 = self._first_backward_safe_corner(ball_progress0)
         target_dist0 = jnp.linalg.norm(target0 - ball_pos)
+        # Project the frozen target onto the path to cache its segment index.
+        # The dense obs uses this to select the next waypoint along the path
+        # going toward the target.
+        _, target_seg_idx0, _ = self._project_to_path(target0)
         per_frame = self._build_per_frame_obs(
             pipeline_state.qpos[0], pipeline_state.qpos[1],
             ball_pos, ball_pos_noisy0, bias_joint,
             jnp.zeros(2, dtype=jnp.float32),
             jnp.zeros(2, dtype=jnp.float32),
             target0,
+            target_seg_idx0,
         )
         # Seed the buffer with [zero, zero, per_frame_reset] so the spawn
         # frame enters the stack history, matching SB3 VecFrameStack which
@@ -400,6 +408,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
             inside_checkpoint_steps=jnp.asarray(0, dtype=jnp.int32),
             speed_sum=jnp.asarray(0.0, dtype=jnp.float32),
             dense_arrived=jnp.asarray(0.0, dtype=jnp.float32),
+            target_seg_idx=target_seg_idx0.astype(jnp.int32),
         )
         obs = self._stack_with_buffer(
             jnp.zeros((N_STACK - 1, self.obs_dim), dtype=jnp.float32), per_frame,
@@ -583,10 +592,12 @@ class CyberRunnerMJXEnv(PipelineEnv):
         success_metric = crossed.astype(jnp.float32)
         success_ever = jnp.maximum(stats.success, success_metric)
 
-        # Build the new per-frame obs (13-dim: 10-dim states + 3-dim ckpt).
+        # Build the new per-frame obs (legacy 13-dim: states(10)+ckpt(3);
+        # dense 11-dim: states(8)+ckpt(3); checkpoint_recovery 12-dim).
         per_frame = self._build_per_frame_obs(
             alpha, beta, ball_pos, ball_pos_noisy,
             stats.bias_joint, joint_noise, action, stats.target,
+            stats.target_seg_idx,
         )
         # Stack with the carried buffer of last (N_STACK - 1) frames → (40,).
         obs = self._stack_with_buffer(stats.obs_buf, per_frame)
@@ -624,6 +635,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
             inside_checkpoint_steps=stats.inside_checkpoint_steps + inside_checkpoint.astype(jnp.int32),
             speed_sum=stats.speed_sum + ema_speed,
             dense_arrived=next_dense_arrived,
+            target_seg_idx=stats.target_seg_idx,
         )
         # Per-step metrics. Brax's EpisodeWrapper sums them across the
         # rollout — divide by avg_episode_length in progress_fn for means
@@ -715,6 +727,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
         joint_noise: jax.Array,
         prev_action: jax.Array,
         target_override: jax.Array | None = None,
+        target_seg_idx_override: jax.Array | None = None,
     ) -> jax.Array:
         """Build a per-frame obs that mirrors the selected CPU prior mode.
 
@@ -758,12 +771,33 @@ class CyberRunnerMJXEnv(PipelineEnv):
                 inside,
             ]).astype(jnp.float32)
         if self._prior_version == PRIOR_VERSION_DENSE:
-            # 9-dim: drop next-waypoint vectors — stabilize task does not
-            # need next-waypoint targeting, only local geometry + safe corner.
+            # 11-dim: states(8) + ckpt(3). The "next waypoint" vector points
+            # to the next path node going TOWARD the (frozen) target:
+            #   ball_seg > target_seg → waypoints[ball_seg]   (step backward)
+            #   ball_seg < target_seg → waypoints[ball_seg+1] (step forward)
+            #   equal                 → target itself
+            tgt_seg = (
+                target_seg_idx_override
+                if target_seg_idx_override is not None
+                else seg_idx
+            )
+            wp_at_seg = self._waypoints[seg_idx]
+            wp_at_seg_p1 = self._waypoints[
+                jnp.minimum(seg_idx + 1, self._num_waypoints - 1)
+            ]
+            target_for_obs = (
+                target_override if target_override is not None else backward_corner
+            )
+            next_wp_toward_target = jnp.where(
+                seg_idx > tgt_seg, wp_at_seg,
+                jnp.where(seg_idx < tgt_seg, wp_at_seg_p1, target_for_obs),
+            )
+            vec_to_next_wp_to_target = next_wp_toward_target - ball_pos_noisy
             return jnp.stack([
                 joint_pos[0], joint_pos[1],
                 ball_pos_noisy[0], ball_pos_noisy[1],
                 vec_closest[0], vec_closest[1],
+                vec_to_next_wp_to_target[0], vec_to_next_wp_to_target[1],
                 ckpt_vec[0], ckpt_vec[1], ckpt_dist,
             ]).astype(jnp.float32)
         return jnp.stack([

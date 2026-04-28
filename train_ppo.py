@@ -423,10 +423,13 @@ def main():
                     env.close()
                     if frames:
                         video = np.stack(frames).transpose(0, 3, 1, 2)
-                        wandb.log({
-                            "eval/video": wandb.Video(video, fps=30, format="mp4"),
-                            "train/step": self.num_timesteps,
-                        }, step=self.num_timesteps)
+                        # Write to run.summary instead of run.history so the
+                        # dashboard shows ONE video that refreshes, rather
+                        # than appending a new clip every video_freq steps.
+                        wandb.run.summary["eval/video"] = wandb.Video(
+                            video, fps=30, format="mp4",
+                        )
+                        wandb.run.summary["eval/video_step"] = self.num_timesteps
                 return True
 
         class WandbRobustEvalCallback(BaseCallback):

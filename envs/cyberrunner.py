@@ -71,9 +71,10 @@ PRIOR_VERSIONS = (
 )
 LEGACY_PRIOR_OBS_DIM = 13
 CHECKPOINT_RECOVERY_OBS_DIM = 12
-# dense drops the two next-waypoint vectors (4 dims) from the legacy
-# `states` block: 6-dim states + 3-dim checkpoint = 9.
-DENSE_STATES_DIM = 6
+# dense states (8): [α, β, ball_x, ball_y, vec_to_closest_path(2),
+#                    vec_to_next_waypoint_toward_target(2)]
+# Plus 3-dim checkpoint vector (vec to target + dist) → 11 total.
+DENSE_STATES_DIM = 8
 DENSE_OBS_DIM = DENSE_STATES_DIM + 3
 
 # Checkpoint-recovery reward defaults.  These are mirrored in the MJX env.
@@ -321,12 +322,17 @@ def compute_waypoint_distances(waypoints: np.ndarray) -> tuple[np.ndarray, np.nd
 
 
 def _project_points_to_path(
-    points: np.ndarray, waypoints: np.ndarray, return_closest: bool = False
+    points: np.ndarray,
+    waypoints: np.ndarray,
+    return_closest: bool = False,
+    return_seg_idx: bool = False,
 ):
     """Project points onto the reference path and return path progress and offset.
 
-    With ``return_closest=True`` also returns the closest path point per input
-    (used for line-of-sight reachability checks).
+    With ``return_closest=True`` also returns the closest path point per input.
+    With ``return_seg_idx=True`` also returns the segment index. Both flags are
+    additive and append to the return tuple in this order:
+    ``(progress, offset[, closest_pt][, seg_idx])``.
     """
     seg_starts = waypoints[:-1]
     seg_ends = waypoints[1:]
@@ -346,10 +352,14 @@ def _project_points_to_path(
     progress = cum_distances[best_seg] + best_t * seg_lengths[best_seg]
     progress = progress.astype(np.float32)
     best_offset = best_offset.astype(np.float32)
+    if not (return_closest or return_seg_idx):
+        return progress, best_offset
+    out: list = [progress, best_offset]
     if return_closest:
-        closest_pts = closest[np.arange(len(points)), best_seg].astype(np.float32)
-        return progress, best_offset, closest_pts
-    return progress, best_offset
+        out.append(closest[np.arange(len(points)), best_seg].astype(np.float32))
+    if return_seg_idx:
+        out.append(best_seg.astype(np.int32))
+    return tuple(out)
 
 
 def _point_to_segment_distance(points: np.ndarray, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
@@ -1424,6 +1434,9 @@ class CyberRunnerEnv(gym.Env):
         # Sticky "ball entered the corner basin once this episode" flag —
         # drives the phased dense reward (approach vs stabilize).
         self._dense_arrived = False
+        # Path-segment index of the frozen dense target. Used by the dense
+        # obs to expose `vec_to_next_wp_toward_target`. -1 = not set.
+        self._prior_target_seg_idx = -1
         self._stable_steps_max = 0
         self._ep_inside_checkpoint_steps = 0
         self._reward_terms: dict[str, float] = {}
@@ -1595,6 +1608,9 @@ class CyberRunnerEnv(gym.Env):
         # Sticky "ball entered the corner basin once this episode" flag —
         # drives the phased dense reward (approach vs stabilize).
         self._dense_arrived = False
+        # Path-segment index of the frozen dense target. Used by the dense
+        # obs to expose `vec_to_next_wp_toward_target`. -1 = not set.
+        self._prior_target_seg_idx = -1
         self._stable_steps_max = 0
         self._ep_inside_checkpoint_steps = 0
         self._reward_terms = {
@@ -1641,6 +1657,12 @@ class CyberRunnerEnv(gym.Env):
                 candidates = self._corner_points
                 progress_gap = np.abs(self._corner_progresses - ball_progress)
             self._prior_target = candidates[int(np.argmin(progress_gap))].astype(np.float32)
+            # Cache the target's path segment index so the dense obs can
+            # expose the next waypoint along the polyline going toward it.
+            _, _, target_seg_idx = _project_points_to_path(
+                self._prior_target[None, :], self.waypoints, return_seg_idx=True,
+            )
+            self._prior_target_seg_idx = int(target_seg_idx[0])
             self._prior_phi_prev = float(
                 -5.0 * float(np.linalg.norm(ball_pos - self._prior_target))
                 - 0.5 * self._ball_speed
@@ -1649,6 +1671,7 @@ class CyberRunnerEnv(gym.Env):
             self._target_dist_min = self._prev_target_dist
         else:
             self._prior_target = np.zeros(2, dtype=np.float32)
+            self._prior_target_seg_idx = -1
             self._prior_phi_prev = 0.0
 
         obs = self._get_obs()
@@ -1911,12 +1934,32 @@ class CyberRunnerEnv(gym.Env):
             return obs
 
         if self.prior_obs_mode == PRIOR_VERSION_DENSE:
-            # dense drops vec_to_next_wp / vec_to_next_next_wp — the
-            # stabilize task does not need next-waypoint targeting, only the
-            # local geometry (joint angles, ball position, closest path point)
-            # and the safe-corner pointer in `checkpoint`.
+            # Next waypoint along the path going BACKWARD toward the frozen
+            # safe-corner target. Path is start→goal ordered, target's
+            # progress ≤ ball's progress, so the next backward path step is
+            # the start of the segment the ball is currently on.
+            #   seg_idx > target_seg_idx  →  next = waypoints[seg_idx]
+            #   seg_idx == target_seg_idx →  next = target itself (final hop)
+            #   seg_idx < target_seg_idx  →  next = waypoints[seg_idx+1]
+            #     (rare: ball drifted past target, must come back forward)
+            tgt_seg = self._prior_target_seg_idx
+            num_wp = len(self.waypoints)
+            if tgt_seg < 0 or not self._path_detected:
+                next_wp_toward_target = ball_pos_noisy  # zero vector after subtract
+            elif self._seg_idx > tgt_seg:
+                next_wp_toward_target = self.waypoints[self._seg_idx]
+            elif self._seg_idx < tgt_seg:
+                next_wp_toward_target = self.waypoints[
+                    min(self._seg_idx + 1, num_wp - 1)
+                ]
+            else:
+                next_wp_toward_target = self._prior_target
+            vec_to_next_wp_to_target = (
+                next_wp_toward_target - ball_pos_noisy
+            ).astype(np.float32)
             states = np.concatenate(
-                [joint_pos, ball_pos_noisy, vec_to_closest]
+                [joint_pos, ball_pos_noisy, vec_to_closest,
+                 vec_to_next_wp_to_target]
             ).astype(np.float32)
         else:
             states = np.concatenate(
