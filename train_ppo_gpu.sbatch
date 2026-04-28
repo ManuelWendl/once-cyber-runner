@@ -21,6 +21,9 @@ NUM_UPDATES_PER_BATCH=${NUM_UPDATES_PER_BATCH:-10}
 SEED=${SEED:-0}
 INIT_BALL_SPEED=${INIT_BALL_SPEED:-0.05}
 INIT_TILT_FRAC=${INIT_TILT_FRAC:-0.05}
+# Prior reward / obs scheme: legacy | checkpoint_recovery | dense
+PRIOR_VERSION=${PRIOR_VERSION:-dense}
+LEARNING_RATE=${LEARNING_RATE:-1e-4}
 NUM_EVALS=${NUM_EVALS:-100}
 # MJX solver budget (primary lever for rollout throughput — defaults are 100/50).
 SOLVER_ITERATIONS=${SOLVER_ITERATIONS:-6}
@@ -93,6 +96,8 @@ python train_ppo_gpu.py \
   --seed $SEED \
   --init_ball_speed $INIT_BALL_SPEED \
   --init_tilt_frac $INIT_TILT_FRAC \
+  --prior_version $PRIOR_VERSION \
+  --learning_rate $LEARNING_RATE \
   $WANDB_ARGS
 
 echo "Training complete. Rendering policy video..."
