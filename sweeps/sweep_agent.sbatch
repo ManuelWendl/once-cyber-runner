@@ -3,17 +3,21 @@
 #SBATCH --job-name=ppo_sweep_agent
 #SBATCH --account=pmlr_jobs
 #SBATCH --mem=32G
-#SBATCH --time=04:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=logs/sweep_%j.out
 
-# W&B sweep agent runner for the GPU PPO prior.
+# Single long-lived W&B sweep agent for the student cluster (one job at a
+# time per user). Mirrors train_ppo_gpu.sbatch's environment exactly so the
+# sweep behaves identically to a manual run.
 #
-# Required env: SWEEP_ID (e.g. "filippostaffoni-eth-z-rich/cyberrunner-prior-gpu-sweep/abc123")
-# Optional env: COUNT (number of trials this agent will pick up before exiting; default 1).
+# Required env: SWEEP_ID (e.g. "entity/project/abc123")
+# Optional env: COUNT (number of sequential trials before the agent exits;
+#               default 20). With 1M steps per trial and 12h walltime, ~15-20
+#               trials normally fit comfortably; the agent exits cleanly when
+#               either COUNT or the walltime is reached.
 #
-# Submit with:
-#   SWEEP_ID=<entity/project/id> sbatch --array=0-15 sweeps/sweep_agent.sbatch
-# (or use sweeps/launch_sweep.sh which wraps this).
+# Submit with sweeps/launch_sweep.sh, or directly:
+#   SWEEP_ID=<entity/project/id> sbatch sweeps/sweep_agent.sbatch
 
 set -e
 
@@ -22,13 +26,24 @@ if [ -z "$SWEEP_ID" ]; then
   exit 1
 fi
 
-COUNT=${COUNT:-1}
+COUNT=${COUNT:-20}
 
+# ==== Paths ====
 REPO_DIR=$HOME/efficient-exploration-for-cyberrunner-pmlr
-RUN_NAME=ppo_sweep_$(date +%Y%m%d_%H%M%S)_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}
-SCRATCH_DIR=/work/scratch/$USER/ppo_gpu_sweep/$RUN_NAME
 
-mkdir -p $SCRATCH_DIR logs
+# ==== Derived names ====
+RUN_NAME=ppo_sweep_$(date +%Y%m%d_%H%M%S)_${SLURM_JOB_ID}
+SCRATCH_DIR=/work/scratch/$USER/ppo_gpu_sweep/$RUN_NAME
+PERMA_DIR=$HOME/r2dreamer_results/$RUN_NAME
+
+mkdir -p $SCRATCH_DIR $PERMA_DIR logs
+
+# ==== Cleanup hook ====
+cleanup() {
+  echo "[cleanup] copying essential files to $PERMA_DIR"
+  cp $SCRATCH_DIR/*.pkl $PERMA_DIR/ 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # ==== GPU info ====
 nvidia-smi
@@ -38,7 +53,7 @@ nvidia-smi
 module load cuda/12.9
 export PATH=/cluster/data/cuda/x86_64/12.9/bin:$PATH
 
-# ==== Rendering off (sweep agents skip the post-training video) ====
+# ==== Rendering (MuJoCo headless; sweep agents do not render videos) ====
 export MUJOCO_GL=egl
 
 # ==== Conda ====
@@ -48,18 +63,17 @@ conda activate $HOME/envs/cyberrunner_gpu
 # ==== PYTHONPATH ====
 export PYTHONPATH=$REPO_DIR:$PYTHONPATH
 
-# Force every trial in this agent to write into its own scratch logdir.
-# `--logdir` overrides the value baked into the sweep YAML, which is fine
-# because wandb agent appends extra `--key=value` pairs at the end.
+# Keep wandb metadata under scratch so the home quota does not balloon.
 export WANDB_DIR=$SCRATCH_DIR
 
 cd $REPO_DIR
 
-echo "Starting wandb agent for sweep $SWEEP_ID (count=$COUNT)"
-echo "  scratch=$SCRATCH_DIR"
+echo "Starting wandb sweep agent"
+echo "  SWEEP_ID=$SWEEP_ID  COUNT=$COUNT"
+echo "  scratch=$SCRATCH_DIR  perma=$PERMA_DIR"
 
-# `wandb agent` will keep launching trials until $COUNT is reached or the
-# sbatch time limit is hit, whichever comes first.
+# Sequentially pick up COUNT trials (or until walltime). Each trial runs
+# train_ppo_gpu.py with the hyperparams the sweep controller suggests.
 wandb agent --count $COUNT "$SWEEP_ID"
 
 echo "Agent finished."

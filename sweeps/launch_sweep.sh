@@ -1,10 +1,17 @@
 #!/bin/bash
-# Create the W&B sweep and dispatch a fleet of sbatch agents on the cluster.
+# Create the W&B sweep and submit ONE long-lived agent on the cluster.
+#
+# The student cluster only allows one job at a time per user, so this
+# script does NOT use sbatch arrays — it submits a single agent that
+# sequentially picks up COUNT trials inside the same Slurm job.
 #
 # Usage:
-#   ./sweeps/launch_sweep.sh                      # default 16 agents, 1 trial each
-#   NUM_AGENTS=32 TRIALS_PER_AGENT=2 ./sweeps/launch_sweep.sh
-#   SWEEP_ID=existing/sweep/id ./sweeps/launch_sweep.sh   # skip creation
+#   ./sweeps/launch_sweep.sh                      # creates sweep + 1 agent (20 trials)
+#   COUNT=10 ./sweeps/launch_sweep.sh             # cap trials per submission
+#   SWEEP_ID=existing/sweep/id ./sweeps/launch_sweep.sh   # reuse a sweep
+#
+# When the agent's job ends (walltime or COUNT reached), just run this
+# script again with SWEEP_ID=... to dispatch the next batch of trials.
 #
 # Requirements:
 #   - `wandb` CLI logged in (run `wandb login` once on the cluster).
@@ -14,13 +21,10 @@ set -e
 
 REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 SWEEP_YAML=${SWEEP_YAML:-$REPO_DIR/sweeps/ppo_gpu_sweep.yaml}
-NUM_AGENTS=${NUM_AGENTS:-16}
-TRIALS_PER_AGENT=${TRIALS_PER_AGENT:-1}
+COUNT=${COUNT:-20}
 
 if [ -z "$SWEEP_ID" ]; then
   echo "Creating W&B sweep from $SWEEP_YAML ..."
-  # `wandb sweep` prints "Created sweep with ID: <id>" and "Run sweep agent with:
-  # wandb agent <entity>/<project>/<id>" on stderr. We grep the agent line.
   SWEEP_OUT=$(wandb sweep "$SWEEP_YAML" 2>&1 | tee /dev/tty)
   SWEEP_ID=$(echo "$SWEEP_OUT" | grep -oE 'wandb agent [^ ]+' | tail -1 | awk '{print $3}')
   if [ -z "$SWEEP_ID" ]; then
@@ -32,8 +36,8 @@ else
   echo "Reusing existing sweep id: $SWEEP_ID"
 fi
 
-echo "Submitting $NUM_AGENTS sbatch agents (count=$TRIALS_PER_AGENT each) ..."
+echo "Submitting one sweep-agent sbatch job (count=$COUNT trials)."
+echo "Re-run this script with SWEEP_ID=$SWEEP_ID after it finishes for more."
 sbatch \
-  --array=0-$((NUM_AGENTS - 1)) \
-  --export=ALL,SWEEP_ID=$SWEEP_ID,COUNT=$TRIALS_PER_AGENT \
+  --export=ALL,SWEEP_ID=$SWEEP_ID,COUNT=$COUNT \
   $REPO_DIR/sweeps/sweep_agent.sbatch
