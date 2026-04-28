@@ -7,6 +7,15 @@ models/
 out/
 *.db
 
+# Generated docs / scratch reports
+docs/dense_prior_explained.tex
+docs/dense_prior_explained.pdf
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
+report_prior.tex
+
 # Weights & Biases
 wandb/
 *.wandb
