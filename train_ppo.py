@@ -440,15 +440,20 @@ def main():
                             fps=30,
                             macro_block_size=None,
                         )
-                        # Write to run.summary instead of run.history so the
-                        # dashboard panel shows ONE video that refreshes,
-                        # rather than appending a clip every video_freq steps.
-                        # The on-disk file keeps the step in its name so the
-                        # full archive is sortable in the media tab.
-                        wandb.run.summary["eval/video"] = wandb.Video(
-                            str(video_path), fps=30, format="mp4",
+                        # Log via wandb.log with an explicit step so the W&B
+                        # media tab orders videos by training step. (Using
+                        # run.summary makes wandb auto-name the media file
+                        # `video_summary_<internal_id>`, which is not
+                        # step-sortable.)
+                        wandb.log(
+                            {
+                                "eval/video": wandb.Video(
+                                    str(video_path), fps=30, format="mp4",
+                                ),
+                                "eval/video_step": self.num_timesteps,
+                            },
+                            step=int(self.num_timesteps),
                         )
-                        wandb.run.summary["eval/video_step"] = self.num_timesteps
                 return True
 
         class WandbRobustEvalCallback(BaseCallback):

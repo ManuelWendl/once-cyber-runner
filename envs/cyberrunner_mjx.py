@@ -365,13 +365,43 @@ class CyberRunnerMJXEnv(PipelineEnv):
 
         # First-step observation: use per-episode bias only (no per-step
         # sensor noise at reset — matches CPU which adds it inside step()).
-        ball_progress0, _, _ = self._project_to_path(ball_pos)
+        ball_progress0, ball_seg_idx0, ball_on_path0 = self._project_to_path(ball_pos)
         target0 = self._first_backward_safe_corner(ball_progress0)
-        target_dist0 = jnp.linalg.norm(target0 - ball_pos)
         # Project the frozen target onto the path to cache its segment index.
         # The dense obs uses this to select the next waypoint along the path
         # going toward the target.
         _, target_seg_idx0, _ = self._project_to_path(target0)
+        # Seed `prev_target_dist` with the SAME metric used in step. For
+        # dense (path-aware), match step's formula so the first
+        # progress_delta is 0 and not a spurious cliff at episode start.
+        eucl_to_target0 = jnp.linalg.norm(target0 - ball_pos)
+        if self._prior_version == PRIOR_VERSION_DENSE:
+            tgt_seg_start0 = self._seg_starts[target_seg_idx0]
+            tgt_seg_vec0 = self._seg_vecs[target_seg_idx0]
+            tgt_seg_len_sq0 = jnp.maximum(
+                jnp.sum(tgt_seg_vec0 * tgt_seg_vec0), 1e-10,
+            )
+            t_target0 = jnp.clip(
+                jnp.sum((target0 - tgt_seg_start0) * tgt_seg_vec0)
+                / tgt_seg_len_sq0,
+                0.0,
+                1.0,
+            )
+            target_on_path0 = tgt_seg_start0 + t_target0 * tgt_seg_vec0
+            s_target_raw0 = (
+                self._cum_dists[target_seg_idx0]
+                + t_target0 * self._seg_lens[target_seg_idx0]
+            )
+            tail_target0 = jnp.linalg.norm(target0 - target_on_path0)
+            s_ball_raw0 = ball_progress0 / 10.0
+            d_path0 = jnp.abs(s_ball_raw0 - s_target_raw0)
+            d_off0 = jnp.linalg.norm(ball_pos - ball_on_path0)
+            same_seg0 = ball_seg_idx0 == target_seg_idx0
+            target_dist0 = jnp.where(
+                same_seg0, eucl_to_target0, d_path0 + d_off0 + tail_target0,
+            )
+        else:
+            target_dist0 = eucl_to_target0
         per_frame = self._build_per_frame_obs(
             pipeline_state.qpos[0], pipeline_state.qpos[1],
             ball_pos, ball_pos_noisy0, bias_joint,
@@ -517,22 +547,70 @@ class CyberRunnerMJXEnv(PipelineEnv):
             )
             stable_steps = stable_steps_pre
         elif self._prior_version == PRIOR_VERSION_DENSE:
-            # Dense reward, single-phase: progress shaping + one-time arrival
-            # bonus + hole penalty. Phase B (stabilize) was dropped — the
-            # corner geometry plus the hole penalty are enough to make the
-            # agent stay near the target, and the per-step Phase B reward
-            # was overwhelming the navigation signal. Target is FROZEN at
-            # reset (`stats.target`), so progress shaping cannot be gamed by
-            # re-acquiring a corner ahead of the spawn as a new target.
+            # Dense reward, single-phase, PATH-AWARE: progress shaping along
+            # the safe waypoint polyline + one-time arrival bonus + hole
+            # penalty. Straight-line Euclidean shaping was telling the agent
+            # to dive across walls/holes when the corner sat off-polyline a
+            # few segments back. Now ``dense_target_dist`` is path-distance
+            # along the polyline plus a constant off-path tail, switched to
+            # direct Euclidean once the ball reaches the target's segment
+            # (so it can leave the path to enter the corner basin).
             dense_target = stats.target
-            dense_target_dist = jnp.linalg.norm(dense_target - ball_pos)
-            progress_delta = stats.prev_target_dist - dense_target_dist
-            r_dense_progress = PRIOR_DENSE_PROGRESS_SCALE * progress_delta
+            target_seg_idx = stats.target_seg_idx
 
-            # Arrival transition: first step inside the corner basin pays a
-            # one-time bonus and flips the sticky `dense_arrived` flag.
+            # Project the (frozen) corner onto its waypoint segment to get
+            # path arc length and the constant off-path tail. Cheap O(1).
+            tgt_seg_start = self._seg_starts[target_seg_idx]
+            tgt_seg_vec = self._seg_vecs[target_seg_idx]
+            tgt_seg_len_sq = jnp.maximum(
+                jnp.sum(tgt_seg_vec * tgt_seg_vec), 1e-10,
+            )
+            t_target = jnp.clip(
+                jnp.sum((dense_target - tgt_seg_start) * tgt_seg_vec)
+                / tgt_seg_len_sq,
+                0.0,
+                1.0,
+            )
+            target_on_path = tgt_seg_start + t_target * tgt_seg_vec
+            s_target_raw = (
+                self._cum_dists[target_seg_idx]
+                + t_target * self._seg_lens[target_seg_idx]
+            )
+            tail_target = jnp.linalg.norm(dense_target - target_on_path)
+
+            # Project ball onto the polyline (CLEAN ball pos for parity
+            # with the obs and CPU env). `_project_to_path` returns
+            # ``progress * 10`` for parity with CPU's scaled progress.
+            ball_progress, ball_seg_idx, ball_on_path = self._project_to_path(
+                ball_pos
+            )
+            s_ball_raw = ball_progress / 10.0
+            d_path = jnp.abs(s_ball_raw - s_target_raw)
+            d_off = jnp.linalg.norm(ball_pos - ball_on_path)
+
+            # Same-segment → direct Euclidean (final leg into the corner).
+            # Different segments → path-distance + off-path offset + tail.
+            eucl_to_target = jnp.linalg.norm(dense_target - ball_pos)
+            same_seg = ball_seg_idx == target_seg_idx
+            dense_target_dist = jnp.where(
+                same_seg, eucl_to_target, d_path + d_off + tail_target,
+            ).astype(jnp.float32)
+
+            progress_delta = stats.prev_target_dist - dense_target_dist
+            # Progress shaping gated on `dense_arrived`: fires only BEFORE
+            # the first basin entry (see CPU comment for rationale — kills
+            # the entry/exit oscillation incentive observed in videos).
+            not_arrived_yet = stats.dense_arrived < 0.5
+            r_dense_progress = jnp.where(
+                not_arrived_yet,
+                PRIOR_DENSE_PROGRESS_SCALE * progress_delta,
+                jnp.float32(0.0),
+            ).astype(jnp.float32)
+
+            # Arrival uses Euclidean distance to the actual corner (the
+            # corner lives off-path, so path-distance is wrong here).
             arrival_radius = jnp.asarray(0.015, dtype=jnp.float32)  # = checkpoint_radius
-            arrived_now = dense_target_dist < arrival_radius
+            arrived_now = eucl_to_target < arrival_radius
             fresh_arrival = arrived_now & (stats.dense_arrived < 0.5)
             r_arrival = jnp.where(
                 fresh_arrival, PRIOR_DENSE_ARRIVAL_BONUS, 0.0,

@@ -2003,7 +2003,7 @@ class CyberRunnerEnv(gym.Env):
             if self.prior_reward_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
                 return self._compute_checkpoint_recovery_reward(ball_pos, action, prev_action, ball_pos_observed)
             if self.prior_reward_mode == PRIOR_VERSION_DENSE:
-                return self._compute_dense_reward(ball_pos)
+                return self._compute_dense_reward(ball_pos, curr_progress, seg_idx)
             # Survival-shaped reward. Goal: ball stays alive on the board for
             # the full 500-step episode without falling into a hole.
             #   quiet = exp(-(speed / v_ref)²)   ∈ [0, 1]   (low velocity good)
@@ -2099,35 +2099,59 @@ class CyberRunnerEnv(gym.Env):
 
         return checkpoint_reward + goal_reward + hole_reward
 
-    def _compute_dense_reward(self, ball_pos: np.ndarray) -> float:
+    def _compute_dense_reward(
+        self, ball_pos: np.ndarray, curr_progress: float, seg_idx: int,
+    ) -> float:
         """Single-phase dense reward for the stabilize prior.
 
-            r = s_p · (prev_target_dist − target_dist)
+            r = s_p · (prev_d − d)
                 + arrival_bonus · 1[fresh arrival]
                 − hole_penalty · 1[in_hole]
 
-        No Phase B (no per-step stabilize/hold/wall/safe_margin bonuses).
-        The corner geometry + hole penalty are enough to keep the ball
-        parked near the target once it arrives, and the progress term keeps
-        pulling it back if it drifts.
+        ``d`` is **path-aware** (not raw Euclidean). The straight-line metric
+        was telling the agent to dive across walls/holes when the corner
+        target sat off-polyline a few segments back. Now:
 
-        Target is FROZEN at reset (`self._prior_target`). Recomputing every
-        step from current progress would let a forward-moving agent re-
-        acquire corners ahead of the spawn as new "backward" targets,
-        defeating the purpose of the prior.
+        - When the ball's path projection is on a DIFFERENT segment than
+          the target's projection, ``d = |s_ball − s_target| + d_off + tail``
+          where ``s`` is raw arc length along the polyline, ``d_off`` is the
+          ball's offset from its path projection, and ``tail`` is the constant
+          Euclidean distance from the target's path projection to the actual
+          corner. This routes the gradient along the safe polyline.
+        - When the ball reaches the target's segment, switch to direct
+          Euclidean ``‖ball − target‖`` so the agent can leave the path and
+          enter the corner basin (where the safe corner lives by construction).
+
+        Arrival is still detected on Euclidean distance to the actual corner.
+        Target is FROZEN at reset (`self._prior_target`).
         """
         target = self._prior_target
-        target_dist = float(np.linalg.norm(ball_pos - target))
+        target_dist = self._path_aware_dist_to_target(
+            ball_pos, curr_progress, seg_idx,
+        )
         if not np.isfinite(self._prev_dense_target_dist):
             progress_delta = 0.0
         else:
             progress_delta = float(self._prev_dense_target_dist - target_dist)
         self._prev_dense_target_dist = target_dist
 
-        reward = PRIOR_DENSE_PROGRESS_SCALE * progress_delta
+        # Progress shaping is gated on `_dense_arrived`: it fires only BEFORE
+        # the first basin entry. After arrival, telescoping deltas from
+        # exit/re-entry would otherwise net to zero but make oscillation
+        # equal-reward to standing still — and drifting is easier than
+        # holding steady. Killing the signal post-arrival removes the
+        # incentive structure that was producing the oscillation observed in
+        # the rollout videos. Hole penalty + corner geometry now do the rest.
+        if not self._dense_arrived:
+            reward = PRIOR_DENSE_PROGRESS_SCALE * progress_delta
+        else:
+            reward = 0.0
         hole_reward = -self.hole_penalty if self._min_hole_distance < HOLE_RADIUS else 0.0
 
-        arrived_now = target_dist < self.checkpoint_radius
+        # Arrival uses Euclidean distance to the actual corner (the corner
+        # lives off-path, so path-distance is wrong for the arrival check).
+        eucl_to_target = float(np.linalg.norm(ball_pos - target))
+        arrived_now = eucl_to_target < self.checkpoint_radius
         if arrived_now and not self._dense_arrived:
             reward += PRIOR_DENSE_ARRIVAL_BONUS
             self._dense_arrived = True
@@ -2142,6 +2166,49 @@ class CyberRunnerEnv(gym.Env):
         self._in_checkpoint_prev = False
         self._prev_checkpoint_dist = np.inf
         return float(reward + hole_reward)
+
+    def _path_aware_dist_to_target(
+        self, ball_pos: np.ndarray, curr_progress: float, seg_idx: int,
+    ) -> float:
+        """Distance from ball to ``self._prior_target`` along the safe polyline.
+
+        Returns:
+            ``|s_ball − s_target| + ‖ball − closest_pt‖ + ‖target − target_on_path‖``
+            when ball and target are on different polyline segments;
+            ``‖ball − target‖`` (direct Euclidean) once they share a segment.
+
+        Falls back to Euclidean if the target seg index is unset, the path
+        was not detected this step, or the dispatch is in a non-prior mode.
+        """
+        target = self._prior_target
+        target_seg = int(self._prior_target_seg_idx)
+        if (
+            target_seg < 0
+            or curr_progress < 0
+            or seg_idx < 0
+            or seg_idx == target_seg
+        ):
+            return float(np.linalg.norm(ball_pos - target))
+
+        # Project the (frozen) corner onto its waypoint segment to get
+        # the path-arc-length offset and the constant tail distance.
+        seg_start = self.waypoints[target_seg]
+        seg_end = self.waypoints[target_seg + 1]
+        seg_vec = seg_end - seg_start
+        seg_len_sq = max(float(np.dot(seg_vec, seg_vec)), 1e-10)
+        t_target = float(np.dot(target - seg_start, seg_vec)) / seg_len_sq
+        t_target = max(0.0, min(1.0, t_target))
+        target_on_path = seg_start + t_target * seg_vec
+        s_target = float(self.cum_distances[target_seg]) + t_target * float(
+            self.seg_lengths[target_seg]
+        )
+        tail_target = float(np.linalg.norm(target - target_on_path))
+
+        # `compute_path_progress` returns arc length × 10; convert back.
+        s_ball = float(curr_progress) / 10.0
+        d_path = abs(s_ball - s_target)
+        d_off = float(np.linalg.norm(ball_pos - self._closest_point))
+        return d_path + d_off + tail_target
 
     def _compute_checkpoint_recovery_reward(
         self,
