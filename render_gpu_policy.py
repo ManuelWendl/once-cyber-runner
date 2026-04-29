@@ -2,8 +2,9 @@
 
 The Brax-trained policy is a pure JAX function. Rendering reuses the existing
 CPU `CyberRunnerEnv(render_mode='rgb_array')` to produce frames that match
-`eval_prior.py` visually; the only cross-backend coupling is a ~20-line
-observation adapter from the CPU dict obs to the 10-dim MJX layout.
+`eval_prior.py` visually. Per-frame obs is built from the CPU env's DENSE
+dict obs (states + checkpoint → 11-dim) and externally frame-stacked to match
+training (N_STACK=3 → 33-dim).
 
 Usage:
     python render_gpu_policy.py \
@@ -16,8 +17,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import pathlib
 import pickle
+from collections import deque
 from dataclasses import dataclass, field
 
 import cv2
@@ -29,10 +32,14 @@ import numpy as np
 from envs.cyberrunner import (
     BOARD_HEIGHT,
     BOARD_WIDTH,
+    DENSE_OBS_DIM,
+    PRIOR_VERSION_DENSE,
     WALL_RADIUS,
     CyberRunnerEnv,
     _point_to_segment_distance,
 )
+
+N_STACK = 3
 
 VIDEO_FPS = 30
 COL_WHITE = (255, 255, 255)
@@ -75,39 +82,16 @@ def _draw_hud(frame, spawn_idx, n_spawns, step, reward, speed, hole_margin, done
     return out
 
 
-def _cpu_to_mjx_obs(env: CyberRunnerEnv, raw_obs: dict, info: dict) -> np.ndarray:
-    """Build the 10-dim MJX obs from the CPU env state.
+def _dense_per_frame_obs(raw_obs: dict) -> np.ndarray:
+    """Concatenate `states` (8) + `checkpoint` (3) → 11-dim DENSE obs frame.
 
-    CPU env keeps the geometric ground truth (no noise-free speed/margin
-    needed — the MJX obs is built from noise-free qpos for policy-consistent
-    evaluation). To keep the policy input distribution close to training,
-    mirror the MJX `_obs` formula exactly using the CPU env's `self.data`.
+    Matches the per-frame layout produced by `CyberRunnerMJXEnv._obs_per_frame`
+    in PRIOR_VERSION_DENSE mode. The CPU env emits the same fields; we just
+    flatten the dict here.
     """
-    qpos = env.unwrapped.data.qpos
-    alpha = float(qpos[0])
-    beta = float(qpos[1])
-    ball_pos = env.unwrapped._get_ball_pos_board_frame()
-    # velocity: use the env's cached true ball speed vector via finite diff
-    ball_vel = (ball_pos - env.unwrapped._prev_ball_pos).astype(np.float32)
-    dt_ctrl = 1.0 / 60.0
-    ball_vel = ball_vel / max(dt_ctrl, 1e-8)
-    speed = float(np.linalg.norm(ball_vel))
-
-    hole_d = float(np.min(np.linalg.norm(env.unwrapped.holes - ball_pos[None, :], axis=1)))
-    wall_seg_d = float(_point_to_segment_distance(
-        ball_pos[None, :], env.unwrapped._wall_starts, env.unwrapped._wall_ends).min())
-    edge_d = float(min(ball_pos[0], BOARD_WIDTH - ball_pos[0],
-                       ball_pos[1], BOARD_HEIGHT - ball_pos[1])) + WALL_RADIUS
-    wall_d = min(wall_seg_d, edge_d)
-
-    abs_tilt = float(np.sqrt(alpha * alpha + beta * beta))
-    return np.asarray([
-        alpha, beta,
-        float(ball_pos[0]), float(ball_pos[1]),
-        float(ball_vel[0]), float(ball_vel[1]),
-        hole_d, wall_d,
-        abs_tilt, speed,
-    ], dtype=np.float32)
+    return np.concatenate(
+        [raw_obs["states"], raw_obs["checkpoint"]], axis=0
+    ).astype(np.float32)
 
 
 def _build_eval_env(init_ball_speed: float, init_tilt_frac: float) -> CyberRunnerEnv:
@@ -129,6 +113,8 @@ def _build_eval_env(init_ball_speed: float, init_tilt_frac: float) -> CyberRunne
         checkpoint_include_corridors=True,
         prior_mode=True,
         prior_task="stabilize",
+        prior_version=PRIOR_VERSION_DENSE,
+        prior_obs_mode=PRIOR_VERSION_DENSE,
         prior_spawn_source="waypoints",
         prior_start_waypoint_window=3,
         prior_init_ball_speed=init_ball_speed,
@@ -143,13 +129,103 @@ def _build_eval_env(init_ball_speed: float, init_tilt_frac: float) -> CyberRunne
     )
 
 
-def _make_inference_fn(params_pkl: dict, obs_size: int, action_size: int):
+def _split_inference_params(params) -> tuple[tuple, int, tuple[int, ...]]:
+    """Pull (normalizer, policy_only) out of the saved (normalizer, PPONetworkParams).
+
+    Saved pickle stores `(running_statistics, PPONetworkParams(policy, value))`
+    — the value head is needed for training but not for inference.
+    `make_inference_fn` calls `policy_network.apply(*params, obs)` with
+    params=(normalizer, policy), so we drop the value side here.
+
+    Also returns `obs_size` (from the normalizer state shape) and
+    `policy_hidden_sizes` inferred from the policy Dense kernel chain.
+    """
+    normalizer, network_params = params
+    policy_params = network_params.policy
+    obs_size = int(jax.tree_util.tree_leaves(normalizer)[0].shape[0])
+    kernels = [
+        l for l in jax.tree_util.tree_leaves(policy_params) if l.ndim == 2
+    ]
+    hidden = tuple(int(k.shape[1]) for k in kernels[:-1])
+    return (normalizer, policy_params), obs_size, hidden
+
+
+def _make_inference_fn(
+    inference_params: tuple, obs_size: int, action_size: int,
+    hidden_sizes: tuple[int, ...],
+):
+    """Rebuild the policy used in `train_ppo_gpu.py` and load saved params.
+
+    Training uses a custom factory: separate (h, h) MLPs for policy/value, tanh
+    activation, DiagGaussian (NormalDistribution, no tanh squashing). The
+    inference fn here must match that factory or the saved params won't bind.
+    """
+    from brax.training import distribution as brax_distribution
+    from brax.training import networks as brax_networks
+    from brax.training.acme import running_statistics
     from brax.training.agents.ppo import networks as ppo_networks
 
-    network_factory = ppo_networks.make_ppo_networks
-    network = network_factory(observation_size=obs_size, action_size=action_size)
+    class _IdentityBijector:
+        # Brax accepts any object with these three methods as a postprocessor;
+        # avoids depending on a specific base class name across versions.
+        def forward(self, x):
+            return x
+
+        def inverse(self, y):
+            return y
+
+        def forward_log_det_jacobian(self, x):
+            return jnp.zeros_like(x[..., 0])
+
+    class NormalDiagDistribution(brax_distribution.ParametricDistribution):
+        def __init__(self, event_size, min_std=0.001, var_scale=1.0):
+            super().__init__(
+                param_size=2 * event_size,
+                postprocessor=_IdentityBijector(),
+                event_ndims=1,
+                reparametrizable=True,
+            )
+            self._min_std = min_std
+            self._var_scale = var_scale
+
+        def create_dist(self, parameters):
+            loc, scale = jnp.split(parameters, 2, axis=-1)
+            scale = (jax.nn.softplus(scale) + self._min_std) * self._var_scale
+            return brax_distribution.NormalDistribution(loc=loc, scale=scale)
+
+    def make_ppo_networks_normal(
+        observation_size,
+        action_size,
+        preprocess_observations_fn=running_statistics.normalize,
+        policy_hidden_layer_sizes=hidden_sizes,
+        value_hidden_layer_sizes=hidden_sizes,
+        activation=jax.nn.tanh,
+    ):
+        dist = NormalDiagDistribution(event_size=action_size)
+        policy_network = brax_networks.make_policy_network(
+            dist.param_size,
+            observation_size,
+            preprocess_observations_fn=preprocess_observations_fn,
+            hidden_layer_sizes=policy_hidden_layer_sizes,
+            activation=activation,
+        )
+        value_network = brax_networks.make_value_network(
+            observation_size,
+            preprocess_observations_fn=preprocess_observations_fn,
+            hidden_layer_sizes=value_hidden_layer_sizes,
+            activation=activation,
+        )
+        return ppo_networks.PPONetworks(
+            policy_network=policy_network,
+            value_network=value_network,
+            parametric_action_distribution=dist,
+        )
+
+    network = make_ppo_networks_normal(
+        observation_size=obs_size, action_size=action_size,
+    )
     make_inference = ppo_networks.make_inference_fn(network)
-    return make_inference(params_pkl["params"], deterministic=True)
+    return make_inference(inference_params, deterministic=True)
 
 
 def _run_episode(
@@ -157,15 +233,23 @@ def _run_episode(
     spawn_idx: int, n_spawns: int, rng: jax.Array, capture_frames: bool,
 ) -> EpisodeResult:
     raw_obs, _info = env.reset(seed=int(spawn_idx), options={"spawn_point": spawn_point})
+    # Frame stack mirrors SB3 VecFrameStack / MJX `_stack_with_buffer`:
+    # zeros for the first (N_STACK - 1) frames, oldest..newest along axis.
+    buf: deque = deque(
+        [np.zeros(DENSE_OBS_DIM, dtype=np.float32)] * (N_STACK - 1),
+        maxlen=N_STACK - 1,
+    )
     total_reward = 0.0
     done = False
     last_info: dict = {}
     frames = []
     step_count = 0
     while not done:
-        obs = _cpu_to_mjx_obs(env, raw_obs, last_info)
+        frame_obs = _dense_per_frame_obs(raw_obs)
+        stacked = np.concatenate([*buf, frame_obs], axis=0)
         rng, sub = jax.random.split(rng)
-        action, _ = inference_fn(jnp.asarray(obs), sub)
+        action, _ = inference_fn(jnp.asarray(stacked), sub)
+        buf.append(frame_obs)
         raw_obs, reward, terminated, truncated, info = env.step(np.asarray(action))
         total_reward += float(reward)
         done = bool(terminated or truncated)
@@ -219,10 +303,21 @@ def main() -> None:
     print(f"Loading params: {params_path}")
     with open(params_path, "rb") as f:
         params_pkl = pickle.load(f)
-    obs_size = int(params_pkl.get("obs_size", 10))
-    action_size = int(params_pkl.get("action_size", 2))
+    inference_params, obs_size, hidden_sizes = _split_inference_params(
+        params_pkl["params"],
+    )
+    action_size = int(params_pkl.get("action_size") or 2)
+    print(f"  obs_size={obs_size}  action_size={action_size}  hidden={hidden_sizes}")
+    if obs_size != N_STACK * DENSE_OBS_DIM:
+        raise ValueError(
+            f"Saved checkpoint expects obs_size={obs_size}, but render builds "
+            f"{N_STACK * DENSE_OBS_DIM}-dim obs (N_STACK={N_STACK} × DENSE_OBS_DIM={DENSE_OBS_DIM}). "
+            "This script only supports DENSE prior checkpoints."
+        )
 
-    inference_fn = _make_inference_fn(params_pkl, obs_size, action_size)
+    inference_fn = _make_inference_fn(
+        inference_params, obs_size, action_size, hidden_sizes,
+    )
 
     # CPU env for rendering; uses the same simplified init as training.
     env = _build_eval_env(args.init_ball_speed, args.init_tilt_frac)
