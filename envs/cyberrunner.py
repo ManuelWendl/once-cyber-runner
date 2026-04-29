@@ -114,7 +114,7 @@ PRIOR_DENSE_ARRIVAL_BONUS = 50.0
 # = 100 (similar order to ARRIVAL_BONUS), but the realistic accumulation is
 # smaller because the ball is rarely fully quiet for a full 500 steps.
 PRIOR_DENSE_STAY_BONUS = 0.2
-PRIOR_DENSE_STAY_V_REF = 0.03  # v_ref for the quiet shape (matches legacy)
+PRIOR_DENSE_STAY_V_REF = 0.05  # v_ref for the quiet shape; aligned with QUIET_SPEED
 
 
 # ============================================================================
@@ -2175,6 +2175,19 @@ class CyberRunnerEnv(gym.Env):
                 np.exp(-(self._ball_speed / PRIOR_DENSE_STAY_V_REF) ** 2)
             )
             reward += PRIOR_DENSE_STAY_BONUS * quiet
+
+            # Wall-contact + low-speed bonus: rewards the canonical "parked
+            # against a corner wall, not moving" pose. Both conditions must
+            # hold (wall contact AND ball_speed < QUIET_SPEED). This adds
+            # active learning signal for the counter-momentum control the
+            # agent needs to actually stop the ball after arrival.
+            wall_d = self._min_wall_distance(ball_pos)
+            touching_wall = wall_d < (
+                WALL_RADIUS + MARBLE_RADIUS + PRIOR_DENSE_WALL_CONTACT_MARGIN
+            )
+            low_speed = self._ball_speed < PRIOR_DENSE_QUIET_SPEED
+            if touching_wall and low_speed:
+                reward += PRIOR_DENSE_TOUCHING_WALL_BONUS
 
         # No Phase B accumulators; keep diagnostics zeroed.
         self._stable_steps = 0

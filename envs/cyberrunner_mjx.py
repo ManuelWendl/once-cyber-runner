@@ -636,6 +636,22 @@ class CyberRunnerMJXEnv(PipelineEnv):
                 jnp.float32(0.0),
             ).astype(jnp.float32)
 
+            # Wall-contact + low-speed bonus: rewards the canonical "parked
+            # against a corner wall, not moving" pose. Both conditions must
+            # hold (wall contact AND speed < QUIET_SPEED). Adds active
+            # signal for the counter-momentum control needed to stop the
+            # ball after arrival.
+            wall_d = self._min_wall_dist(ball_pos)
+            touching_wall = wall_d < jnp.float32(
+                WALL_RADIUS + MARBLE_RADIUS + PRIOR_DENSE_WALL_CONTACT_MARGIN
+            )
+            low_speed = ema_speed < jnp.float32(PRIOR_DENSE_QUIET_SPEED)
+            r_wall_quiet = jnp.where(
+                stay_active & touching_wall & low_speed,
+                jnp.float32(PRIOR_DENSE_TOUCHING_WALL_BONUS),
+                jnp.float32(0.0),
+            ).astype(jnp.float32)
+
             # No Phase B: keep stable_steps zeroed (still carried in the
             # pytree for parity with other branches and diagnostics).
             # Drive `success` off fresh_arrival by spoofing
@@ -648,7 +664,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
                 fresh_arrival, self._success_hold_steps, jnp.int32(0)
             )
 
-            reward = r_dense_progress + r_arrival + r_stay + r_hole
+            reward = r_dense_progress + r_arrival + r_stay + r_wall_quiet + r_hole
         else:
             in_quiet = quiet > self._quiet_th
             stable_condition = in_quiet
