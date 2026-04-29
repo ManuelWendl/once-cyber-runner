@@ -28,8 +28,8 @@ import jax.numpy as jnp
 # Verify the precision config actually took effect (logged at startup so we
 # can confirm in the slurm output that f32 + TF32 are live).
 print(
-    f"[precision] jax_enable_x64={jax.config.read('jax_enable_x64')} "
-    f"matmul_precision={jax.config.read('jax_default_matmul_precision')} "
+    f"[precision] jax_enable_x64={jax.config.jax_enable_x64} "
+    f"matmul_precision={jax.config.jax_default_matmul_precision} "
     f"default_dtype={jnp.array(1.0).dtype} "
     f"devices={jax.devices()} "
     f"XLA_FLAGS={os.environ.get('XLA_FLAGS', '')}",
