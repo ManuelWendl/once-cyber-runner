@@ -66,6 +66,8 @@ from envs.cyberrunner import (
     PRIOR_DENSE_SAFE_MARGIN_CLIP,
     PRIOR_DENSE_SAFE_MARGIN_COEF,
     PRIOR_DENSE_SPEED_COEF,
+    PRIOR_DENSE_STAY_BONUS,
+    PRIOR_DENSE_STAY_V_REF,
     PRIOR_DENSE_TOUCHING_WALL_BONUS,
     PRIOR_DENSE_WALL_CONTACT_MARGIN,
     RANGE_ALPHA,
@@ -619,6 +621,21 @@ class CyberRunnerMJXEnv(PipelineEnv):
                 stats.dense_arrived, arrived_now.astype(jnp.float32)
             )
 
+            # Stabilize term — only after arrival (sticky flag), only while
+            # currently inside the basin, and quiet-gated by
+            # exp(−(speed / v_ref)²). Encourages the agent to park near the
+            # corner rather than oscillating in-and-out. Bounded by
+            # PRIOR_DENSE_STAY_BONUS per step so it doesn't dominate.
+            quiet_stay = jnp.exp(
+                -(ema_speed / jnp.float32(PRIOR_DENSE_STAY_V_REF)) ** 2
+            )
+            stay_active = arrived_now & (new_dense_arrived > 0.5)
+            r_stay = jnp.where(
+                stay_active,
+                jnp.float32(PRIOR_DENSE_STAY_BONUS) * quiet_stay,
+                jnp.float32(0.0),
+            ).astype(jnp.float32)
+
             # No Phase B: keep stable_steps zeroed (still carried in the
             # pytree for parity with other branches and diagnostics).
             # Drive `success` off fresh_arrival by spoofing
@@ -631,7 +648,7 @@ class CyberRunnerMJXEnv(PipelineEnv):
                 fresh_arrival, self._success_hold_steps, jnp.int32(0)
             )
 
-            reward = r_dense_progress + r_arrival + r_hole
+            reward = r_dense_progress + r_arrival + r_stay + r_hole
         else:
             in_quiet = quiet > self._quiet_th
             stable_condition = in_quiet

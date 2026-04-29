@@ -107,6 +107,14 @@ PRIOR_DENSE_PROGRESS_SCALE = 20.0
 # hole-penalty hit so the policy is willing to navigate risky terrain to
 # reach the target rather than freeze at a safe far-from-everything spot.
 PRIOR_DENSE_ARRIVAL_BONUS = 50.0
+# Per-step bonus paid AFTER arrival when the ball is inside the basin AND
+# slow. Shape: STAY_BONUS · exp(−(speed / v_ref)²) · 1[in_basin]. Quietness
+# gating means oscillating in-and-out fast still earns close to zero per
+# step, while parking earns ~STAY_BONUS. Max episode budget ≈ 500 · 0.2
+# = 100 (similar order to ARRIVAL_BONUS), but the realistic accumulation is
+# smaller because the ball is rarely fully quiet for a full 500 steps.
+PRIOR_DENSE_STAY_BONUS = 0.2
+PRIOR_DENSE_STAY_V_REF = 0.03  # v_ref for the quiet shape (matches legacy)
 
 
 # ============================================================================
@@ -2156,6 +2164,17 @@ class CyberRunnerEnv(gym.Env):
             reward += PRIOR_DENSE_ARRIVAL_BONUS
             self._dense_arrived = True
             self._success = True  # success = reached the safe corner once
+
+        # Stabilize term — only after arrival, only inside the basin, and
+        # quiet-gated by exp(−(speed / v_ref)²) so the agent is rewarded for
+        # parking near the corner rather than oscillating in-and-out. This
+        # is intentionally small (max ~0.2 / step) so it doesn't dominate
+        # progress shaping or the arrival bonus.
+        if self._dense_arrived and arrived_now:
+            quiet = float(
+                np.exp(-(self._ball_speed / PRIOR_DENSE_STAY_V_REF) ** 2)
+            )
+            reward += PRIOR_DENSE_STAY_BONUS * quiet
 
         # No Phase B accumulators; keep diagnostics zeroed.
         self._stable_steps = 0
