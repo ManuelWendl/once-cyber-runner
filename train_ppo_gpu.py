@@ -285,10 +285,13 @@ def main() -> None:
         )
         print(f"[step {num_steps}] eval#{eval_counter['n']} {summary}", flush=True)
 
-        # Profiler: skip eval#1 (JIT compile + first warmup), start trace,
-        # stop and exit after eval#2 (one epoch worth of training captured).
+        # Profiler: wait until the JIT cache is fully warm before tracing.
+        # Brax compiles `training_epoch` lazily on the first call (between
+        # eval#1 and eval#2), so capturing earlier yields a trace dominated
+        # by `cache_miss` / `trace_to_jaxpr` / `parallel_callable` rather
+        # than steady-state GPU kernels. Start AFTER eval#3, stop after #4.
         if args.profile:
-            if eval_counter["n"] == 1 and not profile_state["started"]:
+            if eval_counter["n"] == 3 and not profile_state["started"]:
                 trace_dir = pathlib.Path(args.profile_outdir).resolve()
                 trace_dir.mkdir(parents=True, exist_ok=True)
                 profile_state["outdir"] = str(trace_dir)
@@ -296,7 +299,7 @@ def main() -> None:
                 profile_state["started"] = True
                 print(f"[profile] started trace → {trace_dir}", flush=True)
             elif (
-                eval_counter["n"] >= 2
+                eval_counter["n"] >= 4
                 and profile_state["started"]
                 and not profile_state["stopped"]
             ):
