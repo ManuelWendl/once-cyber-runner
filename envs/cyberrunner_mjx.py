@@ -543,9 +543,15 @@ class CyberRunnerMJXEnv(PipelineEnv):
 
             # No Phase B: keep stable_steps zeroed (still carried in the
             # pytree for parity with other branches and diagnostics).
+            # Drive `success` off fresh_arrival by spoofing
+            # `stable_steps_pre` to the threshold on the arrival step —
+            # the shared crossed-threshold check below then fires once.
             in_quiet = ema_speed < PRIOR_DENSE_QUIET_SPEED
             stable_condition = arrived_now & in_quiet  # diagnostic only
             stable_steps = jnp.int32(0)
+            stable_steps_pre = jnp.where(
+                fresh_arrival, self._success_hold_steps, jnp.int32(0)
+            )
 
             reward = r_dense_progress + r_arrival + r_hole
         else:
