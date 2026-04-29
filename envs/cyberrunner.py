@@ -94,7 +94,7 @@ PRIOR_RECOVERY_TILT_PENALTY = 0.05
 PRIOR_DENSE_SPEED_COEF = 0.05         # weight on linear -speed shaping
 PRIOR_DENSE_SAFE_MARGIN_COEF = 2.0    # weight on min(safe_margin, clip)
 PRIOR_DENSE_SAFE_MARGIN_CLIP = 0.02   # safe_margin saturates here
-PRIOR_DENSE_TOUCHING_WALL_BONUS = 0.05
+PRIOR_DENSE_TOUCHING_WALL_BONUS = 0.15
 PRIOR_DENSE_QUIET_SPEED = 0.05        # speed gate for stable-step counter (Wed-style, relaxed)
 PRIOR_DENSE_WALL_CONTACT_MARGIN = 0.002  # ball is "touching" if d < r_w + r_m + this
 # Progress-to-safe-corner shaping (port of `main:cyberrunner_env.py:_compute_reward`
@@ -113,7 +113,7 @@ PRIOR_DENSE_ARRIVAL_BONUS = 50.0
 # step, while parking earns ~STAY_BONUS. Max episode budget ≈ 500 · 0.2
 # = 100 (similar order to ARRIVAL_BONUS), but the realistic accumulation is
 # smaller because the ball is rarely fully quiet for a full 500 steps.
-PRIOR_DENSE_STAY_BONUS = 0.2
+PRIOR_DENSE_STAY_BONUS = 0.4
 PRIOR_DENSE_STAY_V_REF = 0.05  # v_ref for the quiet shape; aligned with QUIET_SPEED
 
 

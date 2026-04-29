@@ -42,12 +42,14 @@ def make_prior_env(
         hole_penalty = 50.0
     elif prior_version == PRIOR_VERSION_DENSE:
         checkpoint_hold_steps = 6
-        # Tuned down from 100: a 100-cost terminal made the agent freeze
-        # anywhere safely far from holes rather than risk the maze to reach
-        # the target. 25 is large enough that a fall costs roughly half a
-        # good Phase B return, but small enough that the +arrival bonus
-        # dominates the calculus over hole avoidance.
-        hole_penalty = 25.0
+        # Tuned down 25 → 10: with the post-arrival stabilize bonuses
+        # (stay + wall-quiet, max ~0.55/step over 500 steps ≈ 275), the
+        # implicit cost of falling (forfeited stay bonus) already dominates
+        # the explicit penalty. Keep a small explicit term for cold-start
+        # navigation safety — without it, a freshly-initialized policy that
+        # hasn't learned the path has no gradient distinguishing "drift
+        # into hole" from "stall near spawn" before reaching the corner.
+        hole_penalty = 10.0
     else:  # legacy survival reward
         checkpoint_hold_steps = 6
         hole_penalty = 50.0
@@ -213,7 +215,7 @@ def main():
     # Reward normalization OFF for prior versions that emit large terminal
     # spikes (hole_penalty=50 and/or +100 survival lump): the running std
     # then gets dominated by those events, crushing the dense per-step
-    # signal. dense has bounded dense rewards (hole_penalty=25, no
+    # signal. dense has bounded dense rewards (hole_penalty=10, no
     # survival bonus) and benefits from VecNormalize.
     norm_reward = args.prior_version == "dense"
     vec_env = VecNormalize(

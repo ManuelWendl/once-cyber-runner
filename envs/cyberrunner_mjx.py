@@ -285,13 +285,14 @@ class CyberRunnerMJXEnv(PipelineEnv):
         self._v_ref = float(PRIOR_RECOVERY_V_REF if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else v_ref)
         self._w_quiet = float(PRIOR_RECOVERY_W_QUIET if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else w_quiet)
         self._k_a = float(PRIOR_RECOVERY_ACTION_PENALTY if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else k_a)
-        # dense uses a moderate hole penalty so the policy is willing to
-        # navigate risky parts of the maze to reach the target. With p_hole
-        # too high (e.g. 100) the agent freezes at a safe far-from-holes
-        # spot rather than approach. The +arrival bonus is sized to
-        # dominate the hole-penalty hit on the path to the target.
+        # dense uses a small hole penalty so the policy is willing to
+        # navigate risky parts of the maze to reach the target. With the
+        # post-arrival stay + wall-quiet bonuses (max ~0.55/step over 500
+        # steps ≈ 275), the implicit cost of falling already dominates the
+        # explicit penalty. Keep a small explicit term (10) for cold-start
+        # navigation safety. Mirrors train_ppo.py default.
         if prior_version == PRIOR_VERSION_DENSE and p_hole == 50.0:
-            p_hole = 25.0
+            p_hole = 10.0
         self._p_hole = float(p_hole)
         # Survival bonus is only meaningful for the legacy sparse reward —
         # dense has dense per-step shaping and would be destabilized
