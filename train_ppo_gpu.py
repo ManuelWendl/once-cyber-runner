@@ -137,6 +137,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ls_iterations", type=int, default=6)
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_entity", type=str, default=None)
+    # JAX profiler: capture a chrome-tracing dump for one rollout chunk so
+    # we can spot which kernels actually dominate. The trace starts AFTER
+    # the first eval (so JIT compile time is excluded), runs across one
+    # full epoch (one progress_fn call), then stops and exits.
+    parser.add_argument("--profile", action="store_true",
+                        help="Capture a JAX/XLA trace and exit after one epoch.")
+    parser.add_argument("--profile_outdir", type=str, default="profile_trace")
     return parser.parse_args()
 
 
@@ -213,6 +220,10 @@ def main() -> None:
     eval_counter = {"n": 0}
     t_start = time.time()
     _latest_params = {"p": None}
+    # Profiler state: started after first eval (post-JIT), stopped after
+    # second eval. One epoch of trace is enough to see kernel-level
+    # bottlenecks. `--profile` exits after writing the trace.
+    profile_state = {"started": False, "stopped": False, "outdir": None}
 
     def policy_params_fn(current_step, make_policy, params):
         _latest_params["p"] = params
@@ -273,6 +284,33 @@ def main() -> None:
             f"sps={_get('training/sps'):.0f}"
         )
         print(f"[step {num_steps}] eval#{eval_counter['n']} {summary}", flush=True)
+
+        # Profiler: skip eval#1 (JIT compile + first warmup), start trace,
+        # stop and exit after eval#2 (one epoch worth of training captured).
+        if args.profile:
+            if eval_counter["n"] == 1 and not profile_state["started"]:
+                trace_dir = pathlib.Path(args.profile_outdir).resolve()
+                trace_dir.mkdir(parents=True, exist_ok=True)
+                profile_state["outdir"] = str(trace_dir)
+                jax.profiler.start_trace(str(trace_dir))
+                profile_state["started"] = True
+                print(f"[profile] started trace → {trace_dir}", flush=True)
+            elif (
+                eval_counter["n"] >= 2
+                and profile_state["started"]
+                and not profile_state["stopped"]
+            ):
+                jax.profiler.stop_trace()
+                profile_state["stopped"] = True
+                print(
+                    f"[profile] trace written to {profile_state['outdir']} — "
+                    f"open with: tensorboard --logdir {profile_state['outdir']} "
+                    "(install tensorflow-cpu + tensorboard-plugin-profile)",
+                    flush=True,
+                )
+                # Clean exit; we only wanted the trace.
+                import sys
+                sys.exit(0)
 
         if wandb_run is not None:
             import wandb

@@ -49,6 +49,10 @@ cleanup() {
   cp $SCRATCH_DIR/wandb_run_id.txt $PERMA_DIR/ 2>/dev/null || true
   cp eval_videos/eval_all_spawns_gpu.mp4 $PERMA_DIR/ 2>/dev/null || true
   cp eval_videos/summary_gpu.csv $PERMA_DIR/ 2>/dev/null || true
+  # Profile traces (small, useful to keep). XLA writes plugins/profile/<ts>/.
+  if [ -d "$SCRATCH_DIR/profile_trace" ]; then
+    cp -r $SCRATCH_DIR/profile_trace $PERMA_DIR/ 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -89,6 +93,11 @@ WANDB_ARGS=""
 [ -n "$WANDB_PROJECT" ] && WANDB_ARGS="--wandb_project $WANDB_PROJECT"
 [ -n "$WANDB_ENTITY"  ] && WANDB_ARGS="$WANDB_ARGS --wandb_entity $WANDB_ENTITY"
 
+# Optional one-shot profile: PROFILE=1 sbatch ... → captures one epoch of
+# trace (post-JIT) and exits. Output goes to $SCRATCH_DIR/profile_trace.
+PROFILE_ARGS=""
+[ "${PROFILE:-0}" = "1" ] && PROFILE_ARGS="--profile --profile_outdir $SCRATCH_DIR/profile_trace"
+
 python train_ppo_gpu.py \
   --logdir $SCRATCH_DIR \
   --steps $STEPS \
@@ -105,7 +114,8 @@ python train_ppo_gpu.py \
   --init_tilt_frac $INIT_TILT_FRAC \
   --prior_version $PRIOR_VERSION \
   --learning_rate $LEARNING_RATE \
-  $WANDB_ARGS
+  $WANDB_ARGS \
+  $PROFILE_ARGS
 
 echo "Training complete. Rendering policy video..."
 
