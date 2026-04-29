@@ -15,6 +15,14 @@ import pickle
 import time
 
 import jax
+
+# Force MJX/JAX into float32 with TF32 matmuls. MJX defaults to f64, which is
+# 2x-60x slower than f32 on most GPUs (worst on consumer cards). This is the
+# single biggest GPU PPO speedup. Must run BEFORE any jax.numpy import that
+# would lock the dtype config.
+jax.config.update("jax_enable_x64", False)
+jax.config.update("jax_default_matmul_precision", "tensorfloat32")
+
 import jax.numpy as jnp
 from brax.envs.base import State, Wrapper
 
@@ -89,19 +97,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--logdir", type=str, default="logdir/ppo_gpu")
     parser.add_argument("--steps", type=int, default=20_000_000)
-    parser.add_argument("--num_envs", type=int, default=2048)
+    parser.add_argument("--num_envs", type=int, default=8192)
     parser.add_argument("--num_eval_envs", type=int, default=128)
     parser.add_argument("--unroll_length", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--num_minibatches", type=int, default=32)
     parser.add_argument("--num_updates_per_batch", type=int, default=10)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--entropy_cost", type=float, default=1e-3)
-    parser.add_argument("--discounting", type=float, default=0.99)
-    parser.add_argument("--gae_lambda", type=float, default=0.95)
-    parser.add_argument("--clip_eps", type=float, default=0.2)
+    parser.add_argument("--learning_rate", type=float, default=2.5e-4)
+    parser.add_argument("--entropy_cost", type=float, default=8.9e-3)
+    parser.add_argument("--discounting", type=float, default=0.97)
+    parser.add_argument("--gae_lambda", type=float, default=0.97)
+    parser.add_argument("--clip_eps", type=float, default=0.23)
     parser.add_argument("--episode_length", type=int, default=500)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--init_ball_speed", type=float, default=0.05)
     parser.add_argument("--init_tilt_frac", type=float, default=0.05)
     parser.add_argument(

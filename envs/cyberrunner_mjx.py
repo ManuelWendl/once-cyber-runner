@@ -283,12 +283,13 @@ class CyberRunnerMJXEnv(PipelineEnv):
         self._v_ref = float(PRIOR_RECOVERY_V_REF if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else v_ref)
         self._w_quiet = float(PRIOR_RECOVERY_W_QUIET if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else w_quiet)
         self._k_a = float(PRIOR_RECOVERY_ACTION_PENALTY if prior_version == PRIOR_VERSION_CHECKPOINT_RECOVERY else k_a)
-        # dense bumps the hole penalty above the typical Phase B per-episode
-        # return so "arrive then fall mid-episode" is strictly worse than
-        # never arriving — the dense per-step shaping is loud enough that a
-        # small hole penalty leaves hole-falls net-positive.
+        # dense uses a moderate hole penalty so the policy is willing to
+        # navigate risky parts of the maze to reach the target. With p_hole
+        # too high (e.g. 100) the agent freezes at a safe far-from-holes
+        # spot rather than approach. The +arrival bonus is sized to
+        # dominate the hole-penalty hit on the path to the target.
         if prior_version == PRIOR_VERSION_DENSE and p_hole == 50.0:
-            p_hole = 100.0
+            p_hole = 25.0
         self._p_hole = float(p_hole)
         # Survival bonus is only meaningful for the legacy sparse reward —
         # dense has dense per-step shaping and would be destabilized
@@ -516,11 +517,13 @@ class CyberRunnerMJXEnv(PipelineEnv):
             )
             stable_steps = stable_steps_pre
         elif self._prior_version == PRIOR_VERSION_DENSE:
-            # Two-phase dense reward — see CPU env _compute_dense_reward.
-            # Target is FROZEN at reset (`stats.target` from reset), so the
-            # progress shaping cannot be gamed by moving forward and re-
-            # acquiring a corner ahead of the spawn as a new "backward"
-            # target. Recomputing every step let the agent drift forward.
+            # Dense reward, single-phase: progress shaping + one-time arrival
+            # bonus + hole penalty. Phase B (stabilize) was dropped — the
+            # corner geometry plus the hole penalty are enough to make the
+            # agent stay near the target, and the per-step Phase B reward
+            # was overwhelming the navigation signal. Target is FROZEN at
+            # reset (`stats.target`), so progress shaping cannot be gamed by
+            # re-acquiring a corner ahead of the spawn as a new target.
             dense_target = stats.target
             dense_target_dist = jnp.linalg.norm(dense_target - ball_pos)
             progress_delta = stats.prev_target_dist - dense_target_dist
@@ -537,35 +540,14 @@ class CyberRunnerMJXEnv(PipelineEnv):
             new_dense_arrived = jnp.maximum(
                 stats.dense_arrived, arrived_now.astype(jnp.float32)
             )
-            stabilize_active = new_dense_arrived > 0.5
 
-            # Phase B (stabilize) terms — gated on `stabilize_active`.
-            wall_d = self._min_wall_dist(ball_pos)
-            touching_wall = wall_d < (
-                WALL_RADIUS + MARBLE_RADIUS + PRIOR_DENSE_WALL_CONTACT_MARGIN
-            )
-            safe_margin = jnp.maximum(
-                hole_d - (HOLE_RADIUS + self._dense_safe_hole_margin), 0.0
-            )
-            r_speed = -PRIOR_DENSE_SPEED_COEF * ema_speed
-            r_safe = PRIOR_DENSE_SAFE_MARGIN_COEF * jnp.minimum(
-                safe_margin, PRIOR_DENSE_SAFE_MARGIN_CLIP
-            )
-            r_wall = jnp.where(touching_wall, PRIOR_DENSE_TOUCHING_WALL_BONUS, 0.0)
+            # No Phase B: keep stable_steps zeroed (still carried in the
+            # pytree for parity with other branches and diagnostics).
             in_quiet = ema_speed < PRIOR_DENSE_QUIET_SPEED
-            stable_condition = touching_wall & in_quiet & stabilize_active
-            stable_steps_pre = jnp.where(
-                stable_condition, stats.stable_steps + 1, jnp.int32(0)
-            )
-            r_hold_step = jnp.where(stable_condition, self._dense_hold_reward, 0.0)
-            saturated = stable_steps_pre >= self._success_hold_steps
-            r_saturate = jnp.where(saturated, self._dense_stabilize_reward, 0.0)
-            stable_steps = jnp.where(saturated, jnp.int32(0), stable_steps_pre)
-            r_hold = r_hold_step + r_saturate
-            r_phaseB = jnp.where(
-                stabilize_active, r_speed + r_safe + r_wall + r_hold, 0.0,
-            )
-            reward = r_dense_progress + r_arrival + r_phaseB + r_hole
+            stable_condition = arrived_now & in_quiet  # diagnostic only
+            stable_steps = jnp.int32(0)
+
+            reward = r_dense_progress + r_arrival + r_hole
         else:
             in_quiet = quiet > self._quiet_th
             stable_condition = in_quiet

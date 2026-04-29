@@ -42,12 +42,12 @@ def make_prior_env(
         hole_penalty = 50.0
     elif prior_version == PRIOR_VERSION_DENSE:
         checkpoint_hold_steps = 6
-        # The Phase B per-step shaping pays ~0.3-0.5/step when held; over a
-        # 500-step episode that easily clears 80-120, so a small -10 hole
-        # penalty leaves "arrive then fall mid-episode" net-positive. Set
-        # large enough to clear the typical good-episode return so falling
-        # is strictly worse than not arriving at all.
-        hole_penalty = 100.0
+        # Tuned down from 100: a 100-cost terminal made the agent freeze
+        # anywhere safely far from holes rather than risk the maze to reach
+        # the target. 25 is large enough that a fall costs roughly half a
+        # good Phase B return, but small enough that the +arrival bonus
+        # dominates the calculus over hole avoidance.
+        hole_penalty = 25.0
     else:  # legacy survival reward
         checkpoint_hold_steps = 6
         hole_penalty = 50.0
@@ -213,7 +213,7 @@ def main():
     # Reward normalization OFF for prior versions that emit large terminal
     # spikes (hole_penalty=50 and/or +100 survival lump): the running std
     # then gets dominated by those events, crushing the dense per-step
-    # signal. dense has bounded dense rewards (hole_penalty=10, no
+    # signal. dense has bounded dense rewards (hole_penalty=25, no
     # survival bonus) and benefits from VecNormalize.
     norm_reward = args.prior_version == "dense"
     vec_env = VecNormalize(
@@ -423,11 +423,30 @@ def main():
                     env.close()
                     if frames:
                         video = np.stack(frames).transpose(0, 3, 1, 2)
+                        # Save to disk with a zero-padded step in the filename
+                        # so the W&B media browser sorts videos chronologically.
+                        # Width 10 ⇒ supports up to 10B steps without re-padding.
+                        videos_dir = logdir / "wandb_videos"
+                        videos_dir.mkdir(parents=True, exist_ok=True)
+                        video_path = videos_dir / (
+                            f"eval_step_{self.num_timesteps:010d}.mp4"
+                        )
+                        # Encode via wandb.Video by writing the frames to disk
+                        # using imageio (already a wandb video dep).
+                        import imageio
+                        imageio.mimwrite(
+                            str(video_path),
+                            np.stack(frames),
+                            fps=30,
+                            macro_block_size=None,
+                        )
                         # Write to run.summary instead of run.history so the
-                        # dashboard shows ONE video that refreshes, rather
-                        # than appending a new clip every video_freq steps.
+                        # dashboard panel shows ONE video that refreshes,
+                        # rather than appending a clip every video_freq steps.
+                        # The on-disk file keeps the step in its name so the
+                        # full archive is sortable in the media tab.
                         wandb.run.summary["eval/video"] = wandb.Video(
-                            video, fps=30, format="mp4",
+                            str(video_path), fps=30, format="mp4",
                         )
                         wandb.run.summary["eval/video_step"] = self.num_timesteps
                 return True

@@ -103,8 +103,10 @@ PRIOR_DENSE_WALL_CONTACT_MARGIN = 0.002  # ball is "touching" if d < r_w + r_m +
 PRIOR_DENSE_PROGRESS_SCALE = 20.0
 # One-time bump paid the first step the ball enters the corner basin (i.e.
 # crosses target_dist < checkpoint_radius). Marks the transition from the
-# "approach" phase to the "stabilize" phase.
-PRIOR_DENSE_ARRIVAL_BONUS = 5.0
+# "approach" phase to the "stabilize" phase. Sized to clearly dominate the
+# hole-penalty hit so the policy is willing to navigate risky terrain to
+# reach the target rather than freeze at a safe far-from-everything spot.
+PRIOR_DENSE_ARRIVAL_BONUS = 50.0
 
 
 # ============================================================================
@@ -2098,34 +2100,22 @@ class CyberRunnerEnv(gym.Env):
         return checkpoint_reward + goal_reward + hole_reward
 
     def _compute_dense_reward(self, ball_pos: np.ndarray) -> float:
-        """Two-phase dense reward for the stabilize prior.
+        """Single-phase dense reward for the stabilize prior.
 
-        Phase A — APPROACH (ball not yet at the corner):
-            r = s_p · (prev_target_dist − target_dist) − hole_penalty · 1[in_hole]
+            r = s_p · (prev_target_dist − target_dist)
+                + arrival_bonus · 1[fresh arrival]
+                − hole_penalty · 1[in_hole]
 
-        Transition — first step the ball enters the corner basin
-        (target_dist < checkpoint_radius) → one-time +arrival_bonus.
+        No Phase B (no per-step stabilize/hold/wall/safe_margin bonuses).
+        The corner geometry + hole penalty are enough to keep the ball
+        parked near the target once it arrives, and the progress term keeps
+        pulling it back if it drifts.
 
-        Phase B — STABILIZE (sticky for the rest of the episode):
-            adds  −k_v · speed
-                + w_safe · min(safe_margin, clip)
-                + b_wall · 1[touching_wall]
-                + checkpoint_hold_reward       per stable step
-                + checkpoint_stabilize_reward  each time stable_steps saturates
-
-        The progress term and hole penalty stay active in BOTH phases — so
-        if the ball drifts away after arrival, the symmetric progress term
-        pulls it back rather than relying purely on the policy's memory of
-        the hold reward.
-
-        Success criterion is gated only on wall-contact + low speed (no
-        hole-margin cushion); stabilizing next to a hole still counts.
+        Target is FROZEN at reset (`self._prior_target`). Recomputing every
+        step from current progress would let a forward-moving agent re-
+        acquire corners ahead of the spawn as new "backward" targets,
+        defeating the purpose of the prior.
         """
-        # Frozen-at-reset target: the first backward safe corner from the
-        # spawn's path progress (set as `self._prior_target` in reset).
-        # Recomputing every step from current progress would let a forward-
-        # moving agent re-acquire corners ahead of the spawn as new "backward"
-        # targets, defeating the purpose of the prior.
         target = self._prior_target
         target_dist = float(np.linalg.norm(ball_pos - target))
         if not np.isfinite(self._prev_dense_target_dist):
@@ -2134,44 +2124,17 @@ class CyberRunnerEnv(gym.Env):
             progress_delta = float(self._prev_dense_target_dist - target_dist)
         self._prev_dense_target_dist = target_dist
 
-        # ----- Phase A baseline (always paid) -----
         reward = PRIOR_DENSE_PROGRESS_SCALE * progress_delta
         hole_reward = -self.hole_penalty if self._min_hole_distance < HOLE_RADIUS else 0.0
 
-        # ----- Arrival transition -----
         arrived_now = target_dist < self.checkpoint_radius
         if arrived_now and not self._dense_arrived:
             reward += PRIOR_DENSE_ARRIVAL_BONUS
             self._dense_arrived = True
+            self._success = True  # success = reached the safe corner once
 
-        # ----- Phase B (stabilize, sticky) -----
-        if self._dense_arrived:
-            wall_d = self._min_wall_distance(ball_pos)
-            touching_wall = wall_d < (WALL_RADIUS + MARBLE_RADIUS + PRIOR_DENSE_WALL_CONTACT_MARGIN)
-            safe_margin = max(
-                self._min_hole_distance - (HOLE_RADIUS + self.safe_hole_margin), 0.0
-            )
-            reward += -PRIOR_DENSE_SPEED_COEF * self._ball_speed
-            reward += PRIOR_DENSE_SAFE_MARGIN_COEF * min(safe_margin, PRIOR_DENSE_SAFE_MARGIN_CLIP)
-            if touching_wall:
-                reward += PRIOR_DENSE_TOUCHING_WALL_BONUS
-
-            stable_here = touching_wall and self._ball_speed < PRIOR_DENSE_QUIET_SPEED
-            if stable_here:
-                self._stable_steps += 1
-                self._ep_quiet_steps += 1
-                reward += self.checkpoint_hold_reward
-            else:
-                self._stable_steps = 0
-            self._stable_steps_max = max(self._stable_steps_max, self._stable_steps)
-            if self._stable_steps >= self.checkpoint_hold_steps:
-                reward += self.checkpoint_stabilize_reward
-                self._success = True
-                self._stable_steps = 0
-        else:
-            # Pre-arrival: no stable-step counting, no quiet bookkeeping.
-            self._stable_steps = 0
-
+        # No Phase B accumulators; keep diagnostics zeroed.
+        self._stable_steps = 0
         self._ep_ball_speed_sum += float(self._ball_speed)
         self._ep_safe_hole_margin_sum += max(
             0.0, float(self._min_hole_distance - HOLE_RADIUS)

@@ -63,6 +63,13 @@ export PATH=/cluster/data/cuda/x86_64/12.9/bin:$PATH
 # ==== Rendering (MuJoCo headless, for the post-training video) ====
 export MUJOCO_GL=egl
 
+# ==== XLA / GPU memory tuning ====
+# Pre-allocate most of HBM up-front (avoids OOM oscillation during long rollouts)
+# and enable Triton GEMM autotuning (often a 1.2-1.5x bump on PPO matmuls).
+export XLA_PYTHON_CLIENT_PREALLOCATE=true
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+export XLA_FLAGS="--xla_gpu_triton_gemm_any=true"
+
 # ==== Conda ====
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate $HOME/envs/cyberrunner_gpu
