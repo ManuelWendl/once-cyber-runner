@@ -160,3 +160,6 @@ bash.exe.stackdump
 # Claude
 .claude/
 CLAUDE.md
+
+# Vendored upstream repos (kept local, not tracked here)
+.vendor/
