@@ -2,7 +2,6 @@
 #
 #SBATCH --job-name=vendor_ppo
 #SBATCH --account=pmlr_jobs
-#SBATCH --gres=gpu:1
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #SBATCH --output=logs/vendor_ppo_%j.out
