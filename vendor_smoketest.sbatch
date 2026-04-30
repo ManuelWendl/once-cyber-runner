@@ -26,6 +26,8 @@ export XLA_FLAGS="--xla_gpu_triton_gemm_any=true"
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate /cluster/courses/pmlr/teams/team06/cyberrunner_ppo
 
+export WANDB_ENTITY=${WANDB_ENTITY:-filippostaffoni-eth-z-rich}
+
 cd "$VENDOR_DIR"
 
-python train.py --num-timesteps 10000000
+python train.py --num-timesteps 10000000 --wandb
