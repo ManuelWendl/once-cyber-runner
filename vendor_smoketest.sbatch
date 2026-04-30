@@ -30,4 +30,4 @@ export WANDB_ENTITY=${WANDB_ENTITY:-filippostaffoni-eth-z-rich}
 
 cd "$VENDOR_DIR"
 
-python train.py --num-timesteps 10000000 --wandb
+python train.py --wandb
