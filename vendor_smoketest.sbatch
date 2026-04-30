@@ -25,7 +25,7 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 export XLA_FLAGS="--xla_gpu_triton_gemm_any=true"
 
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate cyberrunner_ppo
+conda activate /cluster/courses/pmlr/teams/team06/cyberrunner_ppo
 
 cd "$VENDOR_DIR"
 
