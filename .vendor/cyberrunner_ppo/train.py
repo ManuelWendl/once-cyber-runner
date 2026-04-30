@@ -1,0 +1,211 @@
+"""Brax PPO training for Cyberrunner.
+
+Usage:
+    python train.py                          # use config.yaml defaults
+    python train.py --debug                  # quick smoke run (small num_envs, 1M steps)
+    python train.py --num-envs 2048          # override num_envs
+"""
+
+import argparse
+import functools
+import pickle
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict
+
+import jax
+import jax.nn
+import jax.numpy as jnp
+import yaml
+from brax.training.agents.ppo import networks as ppo_networks
+from brax.training.agents.ppo import train as ppo_train
+
+from env_mjx import CyberrunnerMJXEnv
+
+
+_ACTIVATIONS = {
+    "relu": jax.nn.relu,
+    "tanh": jnp.tanh,
+    "elu": jax.nn.elu,
+    "swish": jax.nn.swish,
+    "silu": jax.nn.silu,
+    "gelu": jax.nn.gelu,
+    "leaky_relu": jax.nn.leaky_relu,
+}
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", default="config.yaml")
+    p.add_argument("--num-envs", type=int)
+    p.add_argument("--num-timesteps", type=int)
+    p.add_argument("--checkpoint-dir", default=None)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--debug", action="store_true",
+                   help="Small-scale smoke test: 256 envs, 1M steps, 2 evals.")
+    p.add_argument("--wandb", action="store_true", help="Force-enable wandb logging.")
+    p.add_argument("--no-wandb", action="store_true", help="Disable wandb logging.")
+    return p.parse_args()
+
+
+def load_config(path: str) -> Dict[str, Any]:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def make_network_factory(net_cfg: Dict[str, Any]):
+    activation = _ACTIVATIONS[net_cfg["activation"]]
+    hidden_sizes = tuple(net_cfg["hidden_sizes"])
+
+    def factory(observation_size, action_size, preprocess_observations_fn=lambda x, y: x):
+        return ppo_networks.make_ppo_networks(
+            observation_size=observation_size,
+            action_size=action_size,
+            preprocess_observations_fn=preprocess_observations_fn,
+            policy_hidden_layer_sizes=hidden_sizes,
+            value_hidden_layer_sizes=hidden_sizes,
+            activation=activation,
+            policy_obs_key="state",
+            value_obs_key="state",
+        )
+
+    return factory
+
+
+def main():
+    args = parse_args()
+    config = load_config(args.config)
+
+    # CLI overrides
+    if args.num_envs is not None:
+        config["env"]["num_envs"] = args.num_envs
+    if args.num_timesteps is not None:
+        config["training"]["num_timesteps"] = args.num_timesteps
+    if args.seed is not None:
+        config["seed"] = args.seed
+    if args.checkpoint_dir is not None:
+        config["checkpoint_dir"] = args.checkpoint_dir
+
+    if args.debug:
+        config["env"]["num_envs"] = 256
+        config["training"]["num_timesteps"] = 1_000_000
+        config["training"]["num_evals"] = 2
+
+    use_wandb = config.get("wandb", {}).get("enabled", False) or args.wandb
+    if args.no_wandb:
+        use_wandb = False
+
+    seed = config["seed"]
+    checkpoint_dir = Path(config["checkpoint_dir"])
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------ Banner ------
+    print("=" * 60)
+    print("Cyberrunner Brax PPO training")
+    print("=" * 60)
+    print(f"  num_envs:        {config['env']['num_envs']}")
+    print(f"  episode_length:  {config['env']['episode_length']}")
+    print(f"  num_timesteps:   {config['training']['num_timesteps']:,}")
+    print(f"  num_evals:       {config['training']['num_evals']}")
+    print(f"  jax devices:     {jax.devices()}")
+    print(f"  checkpoint_dir:  {checkpoint_dir}")
+    print(f"  seed:            {seed}")
+    print("=" * 60)
+
+    # ------ Environment ------
+    env = CyberrunnerMJXEnv(
+        episode_length=config["env"]["episode_length"],
+        randomize_init_pos=config["env"]["randomize_init_pos"],
+        num_rays=config["env"].get("num_rays", 32),
+        num_envs_hint=config["env"]["num_envs"],
+        history_length=config["env"].get("history_length", 5),
+        safe_prior=config["env"].get("safe_prior", False),
+        init_ball_speed=config["env"].get("init_ball_speed", 0.0),
+        init_tilt_frac=config["env"].get("init_tilt_frac", 0.0),
+    )
+    print(f"  mjx backend:     {env._mjx_impl}")
+    print(f"  obs size:        {env.observation_size}")
+    print(f"  action size:     {env.action_size}")
+
+    # ------ Wandb (optional) ------
+    if use_wandb:
+        import wandb
+        wandb.init(
+            project=config.get("wandb", {}).get("project", "cyberrunner_ppo"),
+            config=config,
+            name=f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        )
+
+    # ------ Progress callback ------
+    # Brax's progress_fn only receives (step, metrics) — params aren't exposed
+    # mid-training. Final checkpoint is saved after ppo.train returns.
+    t0 = time.time()
+
+    def progress(num_steps: int, metrics: Dict[str, Any]):
+        elapsed = time.time() - t0
+        sps = num_steps / max(elapsed, 1e-6)
+        line = f"step {num_steps:>11,}/{config['training']['num_timesteps']:,}  ({elapsed:6.1f}s, {sps:>7,.0f} sps)"
+        for k in (
+            "eval/episode_reward",
+            "eval/avg_episode_length",
+            "training/policy_loss",
+            "training/v_loss",
+            "training/entropy_loss",
+            "training/sps",
+        ):
+            if k in metrics:
+                v = float(metrics[k])
+                line += f"  {k}={v:.3f}"
+        print(line, flush=True)
+
+        if use_wandb:
+            wandb.log(
+                {k: float(v) for k, v in metrics.items()
+                 if hasattr(v, "__float__") or isinstance(v, (int, float))},
+                step=num_steps,
+            )
+
+    # ------ Brax PPO train ------
+    brax_cfg = config["training"]["brax_ppo"]
+    network_factory = make_network_factory(brax_cfg["network"])
+
+    train_fn = functools.partial(
+        ppo_train.train,
+        environment=env,
+        num_timesteps=config["training"]["num_timesteps"],
+        num_evals=config["training"]["num_evals"],
+        episode_length=config["env"]["episode_length"],
+        num_envs=config["env"]["num_envs"],
+        learning_rate=brax_cfg["learning_rate"],
+        entropy_cost=brax_cfg["entropy_cost"],
+        discounting=brax_cfg["discounting"],
+        unroll_length=brax_cfg["unroll_length"],
+        num_minibatches=brax_cfg["num_minibatches"],
+        num_updates_per_batch=brax_cfg["num_updates_per_batch"],
+        batch_size=brax_cfg["batch_size"],
+        reward_scaling=brax_cfg["reward_scaling"],
+        normalize_observations=brax_cfg["normalize_observations"],
+        action_repeat=1,
+        seed=seed,
+        network_factory=network_factory,
+        progress_fn=progress,
+    )
+
+    make_inference_fn, params, final_metrics = train_fn()
+
+    final_path = checkpoint_dir / "final.pkl"
+    _save_checkpoint(final_path, params=params, step=config["training"]["num_timesteps"], config=config)
+    print(f"\nDone. Saved final checkpoint: {final_path}")
+    if use_wandb:
+        import wandb
+        wandb.finish()
+
+
+def _save_checkpoint(path: Path, params, step: int, config: Dict[str, Any]):
+    with open(path, "wb") as f:
+        pickle.dump({"params": params, "step": step, "config": config}, f)
+
+
+if __name__ == "__main__":
+    main()

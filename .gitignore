@@ -161,5 +161,6 @@ bash.exe.stackdump
 .claude/
 CLAUDE.md
 
-# Vendored upstream repos (kept local, not tracked here)
-.vendor/
+# Vendored upstream repos. cyberrunner_ppo is now an owned snapshot (we modify
+# it in place); other vendors stay local-only.
+.vendor/maxinforl_torch/

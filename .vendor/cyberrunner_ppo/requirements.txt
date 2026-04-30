@@ -1,0 +1,40 @@
+# Dependencies for cyberrunner_ppo (Brax PPO training).
+#
+# Verified working on linux + WSL2 with NVIDIA RTX 4090 / CUDA 12 (CUDA 13 driver).
+# Pin notes:
+#   - mujoco / mujoco-mjx must be 3.5.0+ to pair with mujoco-warp (>=3.5.0).
+#     (mujoco 3.3.7 also works but lacks the warp backend; 3.8.0 broke the
+#     scalar-damping API used in cyberrunner_env.py — avoid.)
+#   - For the warp backend you also need a CUDA-enabled jax (jax[cuda12]).
+
+# Core
+numpy
+pyyaml
+gymnasium
+pillow
+
+# Physics — pin to the Warp-compatible window.
+mujoco==3.5.0
+mujoco-mjx==3.5.0
+mujoco-warp==3.5.0.2
+
+# JAX — pinned to <0.7 because brax 0.14.2 (latest release) still calls the
+# removed `jax.device_put_replicated`. brax `main` has been fixed; once a 0.14.3
+# release lands this pin can be relaxed.
+# Use the CUDA12 wheels for GPU + warp backend.
+jax[cuda12]<0.7
+
+# RL
+brax>=0.10.5,<=0.14.2
+flax
+optax
+
+# Export / eval
+onnx
+onnxruntime
+
+# Logging (optional)
+wandb
+
+# NVIDIA Warp (Python bindings) — pulled in by mujoco-warp, listed for clarity
+warp-lang
