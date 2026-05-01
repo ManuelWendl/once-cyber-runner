@@ -210,7 +210,7 @@ def play_video(
             mj_data.qpos[:] = q
             mj_data.qvel[:] = v
             mujoco.mj_forward(mj_model, mj_data)
-            renderer.update_scene(mj_data)
+            renderer.update_scene(mj_data, camera="board")
             frames.append(renderer.render())
         out_path = outdir / f"episode_{ep_idx + 1}.mp4"
         imageio.mimsave(out_path, frames, fps=fps)
