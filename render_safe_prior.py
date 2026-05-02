@@ -105,6 +105,8 @@ def build_env(cfg: Dict[str, Any]) -> CyberrunnerMJXEnv:
         num_envs_hint=1,
         history_length=env_cfg.get("history_length", 5),
         safe_prior=env_cfg.get("safe_prior", False),
+        safe_prior_strategy=env_cfg.get("safe_prior_strategy", "exp_d"),
+        safe_prior_sigma=env_cfg.get("safe_prior_sigma", 0.02),
         init_ball_speed=env_cfg.get("init_ball_speed", 0.0),
         init_tilt_frac=env_cfg.get("init_tilt_frac", 0.0),
     )
@@ -234,6 +236,8 @@ def main() -> None:
     print(
         f"  trained {checkpoint.get('step', '?')} steps; "
         f"safe_prior={cfg['env'].get('safe_prior')} "
+        f"strategy={cfg['env'].get('safe_prior_strategy', 'exp_d')} "
+        f"sigma={cfg['env'].get('safe_prior_sigma', 0.02)} "
         f"init_ball_speed={cfg['env'].get('init_ball_speed')} "
         f"init_tilt_frac={cfg['env'].get('init_tilt_frac')}"
     )
