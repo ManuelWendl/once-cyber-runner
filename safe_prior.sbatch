@@ -1,8 +1,11 @@
 #!/bin/bash
 #
 # Safe-prior PPO training on the vendored Brax env.
-# Reward = exp(-‖ball - frozen_target‖) to the closest backward strict-corner.
-# Config: .vendor/cyberrunner_ppo/config.yaml (env.safe_prior: true).
+# Strategy is selectable via STRATEGY env var:
+#   sbatch safe_prior.sbatch                                  # exp_d (default)
+#   STRATEGY=exp_d_sigma SIGMA=0.02 sbatch safe_prior.sbatch  # steeper basin
+#   STRATEGY=survival sbatch safe_prior.sbatch                # +1 per alive step
+# Wandb project is tagged with the strategy so curves stay separable.
 #
 #SBATCH --job-name=safe_prior
 #SBATCH --account=pmlr_jobs
@@ -14,6 +17,9 @@ set -euo pipefail
 
 REPO_DIR=$HOME/efficient-exploration-for-cyberrunner-pmlr
 VENDOR_DIR=$REPO_DIR/.vendor/cyberrunner_ppo
+
+STRATEGY=${STRATEGY:-exp_d}
+SIGMA=${SIGMA:-0.02}
 
 mkdir -p "$REPO_DIR/logs"
 
@@ -31,8 +37,8 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate /cluster/courses/pmlr/teams/team06/cyberrunner_ppo
 
 export WANDB_ENTITY=${WANDB_ENTITY:-filippostaffoni-eth-z-rich}
-export WANDB_PROJECT=${WANDB_PROJECT:-cyberrunner_safe_prior}
+export WANDB_PROJECT=${WANDB_PROJECT:-cyberrunner_safe_prior_${STRATEGY}}
 
 cd "$VENDOR_DIR"
 
-python train.py --wandb
+python train.py --wandb --prior-strategy "$STRATEGY" --prior-sigma "$SIGMA"

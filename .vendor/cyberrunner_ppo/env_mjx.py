@@ -401,6 +401,8 @@ class CyberrunnerMJXEnv(envs.Env):
         num_envs_hint: int = 4096,
         history_length: int = 5,
         safe_prior: bool = False,
+        safe_prior_strategy: str = "exp_d",
+        safe_prior_sigma: float = 0.02,
         init_ball_speed: float = 0.0,
         init_tilt_frac: float = 0.0,
     ):
@@ -412,12 +414,33 @@ class CyberrunnerMJXEnv(envs.Env):
         self._frame_dim = 6  # joint(2) + ball(2) + action(2)
 
         # Safe-prior task: when enabled, the env spawns with mild random tilt
-        # and ball velocity, and the reward becomes exp(-‖ball - frozen_target‖)
-        # where the frozen target is the closest backward strict-corner relative
-        # to the spawn position (sampled once at reset). The two next-waypoint
-        # vectors in the obs flip from forward (toward maze end) to backward
-        # (toward the frozen target). Disabled by default → upstream behavior.
+        # and ball velocity. The reward depends on which strategy is selected:
+        #   - "exp_d":       reward = exp(-‖ball - frozen_target‖). Flat over
+        #                    board scale; baseline.
+        #   - "exp_d_sigma": reward = exp(-‖ball - frozen_target‖ / sigma).
+        #                    Sharp basin around the corner; forces the policy
+        #                    to actually reach the target.
+        #   - "survival":    reward = 1.0 per alive step; no target, no obs
+        #                    flip. Hole termination is the only signal —
+        #                    truncation of future reward is the implicit
+        #                    penalty (no per-step zeroing needed).
+        # The two next-waypoint vectors in the obs flip from forward (toward
+        # maze end) to backward (toward the frozen target) for strategies
+        # that USE a target (exp_d, exp_d_sigma); survival keeps the upstream
+        # forward obs since there's no semantic target.
+        valid_strategies = ("exp_d", "exp_d_sigma", "survival")
+        if safe_prior_strategy not in valid_strategies:
+            raise ValueError(
+                f"safe_prior_strategy must be one of {valid_strategies}, "
+                f"got {safe_prior_strategy!r}"
+            )
         self.safe_prior = bool(safe_prior)
+        self.safe_prior_strategy = safe_prior_strategy
+        self.safe_prior_sigma = float(safe_prior_sigma)
+        # Strategies that need a frozen target → corner caching + obs flip.
+        self._uses_target = self.safe_prior and self.safe_prior_strategy in (
+            "exp_d", "exp_d_sigma",
+        )
         self.init_ball_speed = float(init_ball_speed)
         self.init_tilt_frac = float(init_tilt_frac)
         self._range_alpha_lo = float(RANGE_ALPHA[0])
@@ -462,7 +485,8 @@ class CyberrunnerMJXEnv(envs.Env):
         # as JAX constants. Path progress is scaled ×10 to match the convention
         # used by `compute_path_progress_jax` so backward-corner selection at
         # reset can compare directly against the ball's progress output.
-        if self.safe_prior:
+        # Skipped when the strategy does not use a target (e.g. "survival").
+        if self._uses_target:
             corners_np = select_corner_checkpoints(waypoints, holes, walls_h, walls_v)
             if corners_np.shape[0] == 0:
                 raise RuntimeError(
@@ -636,7 +660,7 @@ class CyberrunnerMJXEnv(envs.Env):
         `found=False`, all three are zeroed.
         """
         vec_to_closest = closest_point - ball_pos_noisy
-        if self.safe_prior:
+        if self._uses_target:
             vec_to_next_a, vec_to_next_b = self._backward_next_waypoints(
                 ball_pos_noisy, seg_idx, target_xy, target_seg_idx
             )
@@ -723,7 +747,9 @@ class CyberrunnerMJXEnv(envs.Env):
         # Freeze the safe-prior target: closest backward strict-corner relative
         # to spawn progress, fallback to closest-forward if no backward exists.
         # Stored in info so step() can read without recomputing argmax.
-        if self.safe_prior:
+        # Strategies without a target (e.g. "survival") skip this and store
+        # dummy zeros — never read from step().
+        if self._uses_target:
             EPS = jnp.float32(0.005)
             le_mask = self._corner_progresses <= progress + EPS
             masked = jnp.where(le_mask, self._corner_progresses, -jnp.inf)
@@ -796,12 +822,21 @@ class CyberrunnerMJXEnv(envs.Env):
         target_xy = state.info["safe_prior_target_xy"]
         target_seg_idx = state.info["safe_prior_target_seg_idx"]
         if self.safe_prior:
-            # exp(-‖ball - frozen_target‖). Target was sampled once at reset
-            # from spawn progress; never recomputed (avoids the dynamic-target
-            # failure mode where a forward-moving ball re-acquires fresh
-            # "backward" corners).
-            d_to_target = jnp.linalg.norm(ball_pos_clean - target_xy)
-            reward = jnp.exp(-d_to_target).astype(jnp.float32)
+            # Strategy dispatch — Python `if` over a string set at __init__,
+            # so JIT traces only the selected branch.
+            if self.safe_prior_strategy == "exp_d":
+                # Flat reward landscape (baseline). Target frozen at reset.
+                d_to_target = jnp.linalg.norm(ball_pos_clean - target_xy)
+                reward = jnp.exp(-d_to_target)
+            elif self.safe_prior_strategy == "exp_d_sigma":
+                # Steepened reward: exp(-d/sigma). Sharp basin at the corner.
+                d_to_target = jnp.linalg.norm(ball_pos_clean - target_xy)
+                reward = jnp.exp(-d_to_target / self.safe_prior_sigma)
+            else:  # "survival"
+                # +1 per alive step. Hole termination cuts off future return,
+                # which is the implicit penalty — no per-step zeroing needed.
+                reward = jnp.float32(1.0)
+            reward = reward.astype(jnp.float32)
         else:
             # Upstream reward (env_mujoco.py L1079-1091).
             both_valid = (progress >= 0) & (prev_progress >= 0)

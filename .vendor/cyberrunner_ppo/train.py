@@ -46,6 +46,18 @@ def parse_args():
                    help="Small-scale smoke test: 256 envs, 1M steps, 2 evals.")
     p.add_argument("--wandb", action="store_true", help="Force-enable wandb logging.")
     p.add_argument("--no-wandb", action="store_true", help="Disable wandb logging.")
+    p.add_argument(
+        "--prior-strategy",
+        choices=["exp_d", "exp_d_sigma", "survival"],
+        default=None,
+        help="Override env.safe_prior_strategy from the config.",
+    )
+    p.add_argument(
+        "--prior-sigma",
+        type=float,
+        default=None,
+        help="Override env.safe_prior_sigma (only used by exp_d_sigma).",
+    )
     return p.parse_args()
 
 
@@ -86,6 +98,10 @@ def main():
         config["seed"] = args.seed
     if args.checkpoint_dir is not None:
         config["checkpoint_dir"] = args.checkpoint_dir
+    if args.prior_strategy is not None:
+        config["env"]["safe_prior_strategy"] = args.prior_strategy
+    if args.prior_sigma is not None:
+        config["env"]["safe_prior_sigma"] = args.prior_sigma
 
     if args.debug:
         config["env"]["num_envs"] = 256
@@ -111,6 +127,10 @@ def main():
     print(f"  jax devices:     {jax.devices()}")
     print(f"  checkpoint_dir:  {checkpoint_dir}")
     print(f"  seed:            {seed}")
+    print(f"  safe_prior:      {config['env'].get('safe_prior', False)}")
+    print(f"  prior_strategy:  {config['env'].get('safe_prior_strategy', 'exp_d')}")
+    if config['env'].get('safe_prior_strategy', 'exp_d') == 'exp_d_sigma':
+        print(f"  prior_sigma:     {config['env'].get('safe_prior_sigma', 0.02)}")
     print("=" * 60)
 
     # ------ Environment ------
@@ -121,6 +141,8 @@ def main():
         num_envs_hint=config["env"]["num_envs"],
         history_length=config["env"].get("history_length", 5),
         safe_prior=config["env"].get("safe_prior", False),
+        safe_prior_strategy=config["env"].get("safe_prior_strategy", "exp_d"),
+        safe_prior_sigma=config["env"].get("safe_prior_sigma", 0.02),
         init_ball_speed=config["env"].get("init_ball_speed", 0.0),
         init_tilt_frac=config["env"].get("init_tilt_frac", 0.0),
     )

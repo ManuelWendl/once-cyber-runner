@@ -7,13 +7,21 @@ env:
   num_rays: 32              # raycast rays for path-progress occlusion check
   history_length: 5         # frame-stack depth: each frame is [joint(2), ball(2), action(2)]
   # Safe-prior task. When true:
-  #   - reward = exp(-‖ball - frozen_target‖) where target is the closest
-  #     backward strict-corner relative to spawn (frozen at reset).
   #   - spawn gets mild random tilt (init_tilt_frac × joint range) and ball
   #     velocity (uniform in [0, init_ball_speed]).
-  #   - the two next-waypoint vectors in obs flip from forward (toward maze
-  #     end) to backward (toward the frozen target).
+  #   - reward / obs depend on safe_prior_strategy (below).
   safe_prior: true
+  # Reward strategy. Pick one:
+  #   - exp_d:       reward = exp(-‖ball - frozen_target‖). Baseline.
+  #                  Frozen target = closest backward strict-corner from spawn.
+  #                  Obs flips next-waypoint vectors backward toward target.
+  #   - exp_d_sigma: reward = exp(-‖ball - frozen_target‖ / sigma). Steeper
+  #                  basin around the corner. Same target / obs as exp_d.
+  #   - survival:    reward = 1.0 per alive step. No target, no obs flip.
+  #                  Hole termination is the implicit penalty (truncated
+  #                  future return).
+  safe_prior_strategy: exp_d
+  safe_prior_sigma: 0.02    # only used when strategy == exp_d_sigma
   init_ball_speed: 0.05     # m/s, max planar speed at spawn
   init_tilt_frac: 0.05      # fraction of joint range used for spawn tilt
 
