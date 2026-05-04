@@ -58,6 +58,21 @@ def parse_args():
         default=None,
         help="Override env.safe_prior_sigma (only used by exp_d_sigma).",
     )
+    p.add_argument("--init-ball-speed", type=float, default=None,
+                   help="Override env.init_ball_speed (max spawn ball speed, m/s).")
+    p.add_argument("--init-tilt-frac", type=float, default=None,
+                   help="Override env.init_tilt_frac (fraction of joint range at spawn).")
+    p.add_argument("--tilt-bumps", dest="tilt_bumps", action="store_true",
+                   default=None, help="Enable random mid-episode tilt bumps.")
+    p.add_argument("--no-tilt-bumps", dest="tilt_bumps", action="store_false",
+                   default=None, help="Disable random mid-episode tilt bumps.")
+    p.add_argument("--tilt-bump-prob", type=float, default=None,
+                   help="Per-step probability of a tilt bump.")
+    p.add_argument("--tilt-bump-magnitude", type=float, default=None,
+                   help="Tilt-bump magnitude (fraction of half-joint-range).")
+    p.add_argument("--run-name", default=None,
+                   help="Custom subdir name appended to checkpoint_dir. "
+                        "If unset, a timestamp + strategy + seed is used.")
     return p.parse_args()
 
 
@@ -96,12 +111,20 @@ def main():
         config["training"]["num_timesteps"] = args.num_timesteps
     if args.seed is not None:
         config["seed"] = args.seed
-    if args.checkpoint_dir is not None:
-        config["checkpoint_dir"] = args.checkpoint_dir
     if args.prior_strategy is not None:
         config["env"]["safe_prior_strategy"] = args.prior_strategy
     if args.prior_sigma is not None:
         config["env"]["safe_prior_sigma"] = args.prior_sigma
+    if args.init_ball_speed is not None:
+        config["env"]["init_ball_speed"] = args.init_ball_speed
+    if args.init_tilt_frac is not None:
+        config["env"]["init_tilt_frac"] = args.init_tilt_frac
+    if args.tilt_bumps is not None:
+        config["env"]["tilt_bumps"] = args.tilt_bumps
+    if args.tilt_bump_prob is not None:
+        config["env"]["tilt_bump_prob"] = args.tilt_bump_prob
+    if args.tilt_bump_magnitude is not None:
+        config["env"]["tilt_bump_magnitude"] = args.tilt_bump_magnitude
 
     if args.debug:
         config["env"]["num_envs"] = 256
@@ -113,7 +136,20 @@ def main():
         use_wandb = False
 
     seed = config["seed"]
-    checkpoint_dir = Path(config["checkpoint_dir"])
+    # Per-run checkpoint dir so successive runs don't overwrite each other.
+    # If --checkpoint-dir was passed, treat it as the exact path; otherwise
+    # build <config.checkpoint_dir>/<run_name>.
+    if args.checkpoint_dir is not None:
+        checkpoint_dir = Path(args.checkpoint_dir)
+    else:
+        base_dir = Path(config["checkpoint_dir"])
+        if args.run_name is not None:
+            run_name = args.run_name
+        else:
+            strategy = config["env"].get("safe_prior_strategy", "exp_d")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_name = f"run_{ts}_{strategy}_seed{seed}"
+        checkpoint_dir = base_dir / run_name
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # ------ Banner ------
@@ -131,6 +167,12 @@ def main():
     print(f"  prior_strategy:  {config['env'].get('safe_prior_strategy', 'exp_d')}")
     if config['env'].get('safe_prior_strategy', 'exp_d') == 'exp_d_sigma':
         print(f"  prior_sigma:     {config['env'].get('safe_prior_sigma', 0.02)}")
+    print(f"  init_ball_speed: {config['env'].get('init_ball_speed', 0.0)}")
+    print(f"  init_tilt_frac:  {config['env'].get('init_tilt_frac', 0.0)}")
+    print(f"  tilt_bumps:      {config['env'].get('tilt_bumps', False)}")
+    if config['env'].get('tilt_bumps', False):
+        print(f"  tilt_bump_prob:  {config['env'].get('tilt_bump_prob', 0.0)}")
+        print(f"  tilt_bump_mag:   {config['env'].get('tilt_bump_magnitude', 0.0)}")
     print("=" * 60)
 
     # ------ Environment ------
@@ -145,6 +187,9 @@ def main():
         safe_prior_sigma=config["env"].get("safe_prior_sigma", 0.02),
         init_ball_speed=config["env"].get("init_ball_speed", 0.0),
         init_tilt_frac=config["env"].get("init_tilt_frac", 0.0),
+        tilt_bumps=config["env"].get("tilt_bumps", False),
+        tilt_bump_prob=config["env"].get("tilt_bump_prob", 0.0),
+        tilt_bump_magnitude=config["env"].get("tilt_bump_magnitude", 0.0),
     )
     print(f"  mjx backend:     {env._mjx_impl}")
     print(f"  obs size:        {env.observation_size}")

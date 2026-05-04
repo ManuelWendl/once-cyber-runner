@@ -405,6 +405,9 @@ class CyberrunnerMJXEnv(envs.Env):
         safe_prior_sigma: float = 0.02,
         init_ball_speed: float = 0.0,
         init_tilt_frac: float = 0.0,
+        tilt_bumps: bool = False,
+        tilt_bump_prob: float = 0.0,
+        tilt_bump_magnitude: float = 0.0,
     ):
         self.episode_length = episode_length
         self.randomize_init_pos = randomize_init_pos
@@ -443,6 +446,14 @@ class CyberrunnerMJXEnv(envs.Env):
         )
         self.init_ball_speed = float(init_ball_speed)
         self.init_tilt_frac = float(init_tilt_frac)
+        # Mid-episode tilt bumps (challenge perturbations). Each step, with
+        # probability `tilt_bump_prob`, both joint angles get an additive
+        # delta uniform in [-mag, +mag] × half_joint_range, clipped to the
+        # joint range. JIT-safe: `tilt_bumps` is a compile-time branch via
+        # static_argnums=(0,).
+        self.tilt_bumps = bool(tilt_bumps)
+        self.tilt_bump_prob = float(tilt_bump_prob)
+        self.tilt_bump_magnitude = float(tilt_bump_magnitude)
         self._range_alpha_lo = float(RANGE_ALPHA[0])
         self._range_alpha_hi = float(RANGE_ALPHA[1])
         self._range_beta_lo = float(RANGE_BETA[0])
@@ -806,6 +817,31 @@ class CyberrunnerMJXEnv(envs.Env):
         action = jnp.clip(action, -1.0, 1.0)
         mjx_data = state.pipeline_state.replace(ctrl=action)
 
+        # Optional mid-episode tilt bumps: random additive perturbation on
+        # joint angles before the physics scan. Compile-time branch via
+        # static_argnums=(0,) — costs nothing when disabled.
+        rng_in = state.info["rng"]
+        if self.tilt_bumps:
+            rng_in, k_trig, k_da, k_db = jax.random.split(rng_in, 4)
+            bump_active = jax.random.uniform(k_trig) < self.tilt_bump_prob
+            half_a = 0.5 * (self._range_alpha_hi - self._range_alpha_lo)
+            half_b = 0.5 * (self._range_beta_hi - self._range_beta_lo)
+            delta_a = jax.random.uniform(k_da, minval=-1.0, maxval=1.0) \
+                * self.tilt_bump_magnitude * half_a
+            delta_b = jax.random.uniform(k_db, minval=-1.0, maxval=1.0) \
+                * self.tilt_bump_magnitude * half_b
+            delta_a = jnp.where(bump_active, delta_a, 0.0)
+            delta_b = jnp.where(bump_active, delta_b, 0.0)
+            qpos = mjx_data.qpos
+            new_alpha = jnp.clip(
+                qpos[0] + delta_a, self._range_alpha_lo, self._range_alpha_hi
+            )
+            new_beta = jnp.clip(
+                qpos[1] + delta_b, self._range_beta_lo, self._range_beta_hi
+            )
+            qpos = qpos.at[0].set(new_alpha).at[1].set(new_beta)
+            mjx_data = mjx_data.replace(qpos=qpos)
+
         # Step physics FRAME_SKIP times via scan (avoids unrolled compile bloat)
         def physics_step(d, _):
             return mjx.step(self.mjx_model, d), None
@@ -857,8 +893,9 @@ class CyberrunnerMJXEnv(envs.Env):
         # prev_progress only updates when curr is valid (env_mujoco.py L995)
         new_prev_progress = jnp.where(found, progress, prev_progress)
 
-        # Step RNG split for per-step noise
-        rng, k_step = jax.random.split(state.info["rng"])
+        # Step RNG split for per-step noise (rng_in already advanced by the
+        # tilt-bump branch when enabled; otherwise it's just state.info["rng"]).
+        rng, k_step = jax.random.split(rng_in)
 
         # Build current frame (joint+ball+action), then roll the history buffer.
         new_frame, ball_pos_noisy = self._build_frame(

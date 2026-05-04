@@ -109,6 +109,9 @@ def build_env(cfg: Dict[str, Any]) -> CyberrunnerMJXEnv:
         safe_prior_sigma=env_cfg.get("safe_prior_sigma", 0.02),
         init_ball_speed=env_cfg.get("init_ball_speed", 0.0),
         init_tilt_frac=env_cfg.get("init_tilt_frac", 0.0),
+        tilt_bumps=env_cfg.get("tilt_bumps", False),
+        tilt_bump_prob=env_cfg.get("tilt_bump_prob", 0.0),
+        tilt_bump_magnitude=env_cfg.get("tilt_bump_magnitude", 0.0),
     )
 
 
@@ -239,7 +242,10 @@ def main() -> None:
         f"strategy={cfg['env'].get('safe_prior_strategy', 'exp_d')} "
         f"sigma={cfg['env'].get('safe_prior_sigma', 0.02)} "
         f"init_ball_speed={cfg['env'].get('init_ball_speed')} "
-        f"init_tilt_frac={cfg['env'].get('init_tilt_frac')}"
+        f"init_tilt_frac={cfg['env'].get('init_tilt_frac')} "
+        f"tilt_bumps={cfg['env'].get('tilt_bumps', False)} "
+        f"tilt_bump_prob={cfg['env'].get('tilt_bump_prob', 0.0)} "
+        f"tilt_bump_magnitude={cfg['env'].get('tilt_bump_magnitude', 0.0)}"
     )
 
     print("Building env (this triggers JIT/Warp compile — first call is slow) ...")

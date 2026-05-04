@@ -7,6 +7,17 @@
 #   STRATEGY=survival sbatch safe_prior.sbatch                # +1 per alive step
 # Wandb project is tagged with the strategy so curves stay separable.
 #
+# Optional difficulty knobs (env vars):
+#   INIT_BALL_SPEED   max spawn ball speed (m/s). Empty → use config default.
+#   INIT_TILT_FRAC    fraction of joint range used for spawn tilt.
+#   TILT_BUMPS        "1" to enable random mid-episode tilt bumps.
+#   TILT_BUMP_PROB    per-step bump probability.
+#   TILT_BUMP_MAG     bump magnitude (fraction of half-joint-range).
+#   RUN_NAME          custom subdir under checkpoints/ for this run.
+#
+# Each run lands in checkpoints/run_<timestamp>_<strategy>_seed<seed>/ by
+# default, so consecutive runs do NOT overwrite each other.
+#
 #SBATCH --job-name=safe_prior
 #SBATCH --account=pmlr_jobs
 #SBATCH --mem=32G
@@ -41,4 +52,14 @@ export WANDB_PROJECT=${WANDB_PROJECT:-cyberrunner_safe_prior_${STRATEGY}}
 
 cd "$VENDOR_DIR"
 
-python train.py --wandb --prior-strategy "$STRATEGY" --prior-sigma "$SIGMA"
+EXTRA_ARGS=()
+[[ -n "${INIT_BALL_SPEED:-}" ]] && EXTRA_ARGS+=(--init-ball-speed "$INIT_BALL_SPEED")
+[[ -n "${INIT_TILT_FRAC:-}" ]]  && EXTRA_ARGS+=(--init-tilt-frac  "$INIT_TILT_FRAC")
+if [[ "${TILT_BUMPS:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--tilt-bumps)
+  [[ -n "${TILT_BUMP_PROB:-}" ]] && EXTRA_ARGS+=(--tilt-bump-prob "$TILT_BUMP_PROB")
+  [[ -n "${TILT_BUMP_MAG:-}" ]]  && EXTRA_ARGS+=(--tilt-bump-magnitude "$TILT_BUMP_MAG")
+fi
+[[ -n "${RUN_NAME:-}" ]] && EXTRA_ARGS+=(--run-name "$RUN_NAME")
+
+python train.py --wandb --prior-strategy "$STRATEGY" --prior-sigma "$SIGMA" "${EXTRA_ARGS[@]}"

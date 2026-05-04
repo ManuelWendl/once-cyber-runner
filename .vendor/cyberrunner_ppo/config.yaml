@@ -24,6 +24,12 @@ env:
   safe_prior_sigma: 0.02    # only used when strategy == exp_d_sigma
   init_ball_speed: 0.05     # m/s, max planar speed at spawn
   init_tilt_frac: 0.05      # fraction of joint range used for spawn tilt
+  # Optional mid-episode tilt bumps (challenge perturbations). Each step,
+  # with probability `tilt_bump_prob`, both joint angles get an additive
+  # delta uniform in [-mag, +mag] × half_joint_range, clipped to range.
+  tilt_bumps: false
+  tilt_bump_prob: 0.01           # per-step probability of a bump
+  tilt_bump_magnitude: 0.05      # fraction of half-joint-range
 
 training:
   num_timesteps: 100_000_000
