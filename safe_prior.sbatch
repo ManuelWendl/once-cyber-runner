@@ -18,6 +18,7 @@
 #                     from (curriculum fine-tuning). Optimizer state restarts.
 #   LR                override training learning rate (e.g. 5e-5 for fine-tune).
 #   ENTROPY_COST      override entropy bonus (e.g. 1e-4 for fine-tune).
+#   NUM_TIMESTEPS     override training.num_timesteps (e.g. 200000000).
 #
 # Each run lands in checkpoints/run_<timestamp>_<strategy>_seed<seed>/ by
 # default, so consecutive runs do NOT overwrite each other.
@@ -66,7 +67,8 @@ if [[ "${TILT_BUMPS:-0}" == "1" ]]; then
 fi
 [[ -n "${RUN_NAME:-}" ]]     && EXTRA_ARGS+=(--run-name      "$RUN_NAME")
 [[ -n "${RESUME:-}" ]]       && EXTRA_ARGS+=(--resume        "$RESUME")
-[[ -n "${LR:-}" ]]           && EXTRA_ARGS+=(--learning-rate "$LR")
-[[ -n "${ENTROPY_COST:-}" ]] && EXTRA_ARGS+=(--entropy-cost  "$ENTROPY_COST")
+[[ -n "${LR:-}" ]]            && EXTRA_ARGS+=(--learning-rate "$LR")
+[[ -n "${ENTROPY_COST:-}" ]]  && EXTRA_ARGS+=(--entropy-cost  "$ENTROPY_COST")
+[[ -n "${NUM_TIMESTEPS:-}" ]] && EXTRA_ARGS+=(--num-timesteps "$NUM_TIMESTEPS")
 
 python train.py --wandb --prior-strategy "$STRATEGY" --prior-sigma "$SIGMA" "${EXTRA_ARGS[@]}"
