@@ -14,6 +14,8 @@
 #   TILT_BUMP_PROB    per-step bump probability.
 #   TILT_BUMP_MAG     bump magnitude (fraction of half-joint-range).
 #   RUN_NAME          custom subdir under checkpoints/ for this run.
+#   RESUME            absolute path to a prior best.pkl/final.pkl to warm-start
+#                     from (curriculum fine-tuning). Optimizer state restarts.
 #
 # Each run lands in checkpoints/run_<timestamp>_<strategy>_seed<seed>/ by
 # default, so consecutive runs do NOT overwrite each other.
@@ -61,5 +63,6 @@ if [[ "${TILT_BUMPS:-0}" == "1" ]]; then
   [[ -n "${TILT_BUMP_MAG:-}" ]]  && EXTRA_ARGS+=(--tilt-bump-magnitude "$TILT_BUMP_MAG")
 fi
 [[ -n "${RUN_NAME:-}" ]] && EXTRA_ARGS+=(--run-name "$RUN_NAME")
+[[ -n "${RESUME:-}" ]]   && EXTRA_ARGS+=(--resume   "$RESUME")
 
 python train.py --wandb --prior-strategy "$STRATEGY" --prior-sigma "$SIGMA" "${EXTRA_ARGS[@]}"
