@@ -42,14 +42,7 @@ def make_prior_env(
         hole_penalty = 50.0
     elif prior_version == PRIOR_VERSION_DENSE:
         checkpoint_hold_steps = 6
-        # Tuned down 25 → 10: with the post-arrival stabilize bonuses
-        # (stay + wall-quiet, max ~0.55/step over 500 steps ≈ 275), the
-        # implicit cost of falling (forfeited stay bonus) already dominates
-        # the explicit penalty. Keep a small explicit term for cold-start
-        # navigation safety — without it, a freshly-initialized policy that
-        # hasn't learned the path has no gradient distinguishing "drift
-        # into hole" from "stall near spawn" before reaching the corner.
-        hole_penalty = 10.0
+        hole_penalty = 25.0
     else:  # legacy survival reward
         checkpoint_hold_steps = 6
         hole_penalty = 50.0
@@ -60,7 +53,7 @@ def make_prior_env(
         include_vision=False,
         reward_every_n_waypoints=3,
         hole_penalty=hole_penalty,
-        checkpoint_radius=0.015,
+        checkpoint_radius=0.020,
         checkpoint_hold_steps=checkpoint_hold_steps,
         checkpoint_speed_threshold=0.05,
         checkpoint_arrival_reward=0.0,
@@ -84,7 +77,7 @@ def make_prior_env(
         prior_spawn_merge_radius=0.0,
         checkpoint_progress_reward_scale=progress_scale,
         # Survival prior: keep the ball alive for the full episode rather than
-        # ending early on first stabilization. Matches GPU env behavior.
+        # ending early on first stabilization.
         terminate_on_checkpoint_stabilized=False,
         prior_version=prior_version,
     )
@@ -210,6 +203,7 @@ def main():
         "ep_ball_speed_sum",
         "ep_safe_hole_margin_sum",
         "termination_reason",
+        "spawn_idx",
     )
 
     # Reward normalization OFF for prior versions that emit large terminal
@@ -244,11 +238,7 @@ def main():
         import wandb
 
         class WandbCallback(BaseCallback):
-            """Emit the unified CPU/GPU metric set on a fixed step cadence.
-
-            Metric keys here MUST match those emitted by `train_ppo_gpu.py`'s
-            `progress_fn` so panels overlay across backends.
-            """
+            """Emit episode metrics to wandb on a fixed step cadence."""
 
             EP_LEN_CAP = 500.0
 

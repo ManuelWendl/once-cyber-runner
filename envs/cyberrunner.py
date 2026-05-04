@@ -1455,6 +1455,17 @@ class CyberRunnerEnv(gym.Env):
         self._ep_ball_speed_sum = 0.0
         self._ep_safe_hole_margin_sum = 0.0
 
+    def _sample_spawn_idx(self) -> int:
+        """Pick a uniform random spawn index from the prior_start_points bank."""
+        n = len(self.prior_start_points)
+        return int(self.np_random.integers(0, n))
+
+    def get_num_spawns(self) -> int:
+        return int(len(self.prior_start_points))
+
+    def get_spawn_points(self) -> np.ndarray:
+        return np.asarray(self.prior_start_points, dtype=np.float32).copy()
+
     def _build_prior_start_points(self) -> np.ndarray:
         """Recoverable start states for prior-mode resets."""
         if self.prior_spawn_source == "waypoints":
@@ -1521,7 +1532,17 @@ class CyberRunnerEnv(gym.Env):
             init_pos = np.asarray(options["spawn_point"], dtype=np.float32)
             dists = np.linalg.norm(self.checkpoint_points - init_pos[None], axis=1)
             self._active_checkpoint_idx = int(np.argmin(dists))
+        elif self.prior_mode and self.prior_task != "checkpoint":
+            # Stabilize-task path (used by `dense` / `checkpoint_recovery`):
+            # the spawn bank is already filtered for hole-safety at build time,
+            # so a single uniform sample suffices.
+            idx = self._sample_spawn_idx()
+            init_pos = self.prior_start_points[idx]
+            dists = np.linalg.norm(self.checkpoint_points - init_pos[None], axis=1)
+            self._active_checkpoint_idx = int(np.argmin(dists))
         elif self.prior_mode:
+            # Legacy checkpoint-task path: keep the permutation+retry logic so
+            # the per-candidate distance/safety filter still gates the choice.
             sampled_points = self.prior_start_points[self.np_random.permutation(len(self.prior_start_points))]
             init_pos = None
             chosen_checkpoint_idx = None
@@ -1534,10 +1555,6 @@ class CyberRunnerEnv(gym.Env):
                 recoverable_from_holes = (
                     min_hole_dist > (HOLE_RADIUS + self.prior_spawn_min_hole_margin)
                 )
-                if self.prior_task != "checkpoint":
-                    init_pos = candidate_pos
-                    chosen_checkpoint_idx = nearest_idx
-                    break
                 if (
                     self.prior_min_checkpoint_start_dist <= nearest_dist <= self.prior_max_checkpoint_start_dist
                     and recoverable_from_holes
