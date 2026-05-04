@@ -237,14 +237,21 @@ def main():
         )
 
     # ------ Progress + best-checkpoint callbacks ------
-    # progress_fn(num_steps, metrics) is called after each eval — we record
-    # the latest eval/episode_reward into a closure so policy_params_fn can
-    # decide whether the corresponding params are a new best and pickle them.
+    # Brax PPO calls policy_params_fn(step, params) BEFORE the matching
+    # progress_fn(step, metrics) for the same eval. So we can't decide
+    # "best" inside policy_params_fn — its `latest_reward` would be from
+    # the previous eval. Instead:
+    #   - policy_params_fn just stashes (step, params) in the closure.
+    #   - progress_fn receives the eval metrics, then compares against the
+    #     stashed params and saves them as best.pkl if improved.
+    # This keeps the "best" decision aligned with the reward that was
+    # actually measured for those params.
     t0 = time.time()
+    best_path = checkpoint_dir / "best.pkl"
     best_state: Dict[str, Any] = {
         "best_reward": float("-inf"),
-        "latest_reward": None,
-        "latest_step": 0,
+        "pending_step": None,
+        "pending_params": None,
     }
 
     def progress(num_steps: int, metrics: Dict[str, Any]):
@@ -264,9 +271,27 @@ def main():
                 line += f"  {k}={v:.3f}"
         print(line, flush=True)
 
-        if "eval/episode_reward" in metrics:
-            best_state["latest_reward"] = float(metrics["eval/episode_reward"])
-            best_state["latest_step"] = int(num_steps)
+        if (
+            "eval/episode_reward" in metrics
+            and best_state["pending_params"] is not None
+            and best_state["pending_step"] == int(num_steps)
+        ):
+            latest = float(metrics["eval/episode_reward"])
+            if latest > best_state["best_reward"]:
+                best_state["best_reward"] = latest
+                _save_checkpoint(
+                    best_path,
+                    params=best_state["pending_params"],
+                    step=int(num_steps),
+                    config=config,
+                )
+                print(
+                    f"  [best] step {num_steps:,}  "
+                    f"eval/episode_reward={latest:.3f} → {best_path.name}",
+                    flush=True,
+                )
+            best_state["pending_params"] = None
+            best_state["pending_step"] = None
 
         if use_wandb:
             wandb.log(
@@ -275,28 +300,10 @@ def main():
                 step=num_steps,
             )
 
-    best_path = checkpoint_dir / "best.pkl"
-
     def policy_params_fn(current_step: int, make_policy, params) -> None:
-        """Save params to best.pkl whenever the most recent eval improves.
-
-        Brax invokes this with the just-evaluated params right after each
-        eval (and once before training starts). progress() has already run
-        for that step, so best_state["latest_reward"] reflects this params.
-        """
-        latest = best_state["latest_reward"]
-        if latest is None:
-            return
-        if latest > best_state["best_reward"]:
-            best_state["best_reward"] = latest
-            _save_checkpoint(
-                best_path, params=params, step=int(current_step), config=config
-            )
-            print(
-                f"  [best] step {current_step:,}  "
-                f"eval/episode_reward={latest:.3f} → {best_path.name}",
-                flush=True,
-            )
+        """Stash the just-trained params; progress() decides if they're best."""
+        best_state["pending_step"] = int(current_step)
+        best_state["pending_params"] = params
 
     # ------ Brax PPO train ------
     brax_cfg = config["training"]["brax_ppo"]
