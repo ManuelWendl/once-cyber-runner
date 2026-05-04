@@ -204,10 +204,16 @@ def main():
             name=f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         )
 
-    # ------ Progress callback ------
-    # Brax's progress_fn only receives (step, metrics) — params aren't exposed
-    # mid-training. Final checkpoint is saved after ppo.train returns.
+    # ------ Progress + best-checkpoint callbacks ------
+    # progress_fn(num_steps, metrics) is called after each eval — we record
+    # the latest eval/episode_reward into a closure so policy_params_fn can
+    # decide whether the corresponding params are a new best and pickle them.
     t0 = time.time()
+    best_state: Dict[str, Any] = {
+        "best_reward": float("-inf"),
+        "latest_reward": None,
+        "latest_step": 0,
+    }
 
     def progress(num_steps: int, metrics: Dict[str, Any]):
         elapsed = time.time() - t0
@@ -226,11 +232,38 @@ def main():
                 line += f"  {k}={v:.3f}"
         print(line, flush=True)
 
+        if "eval/episode_reward" in metrics:
+            best_state["latest_reward"] = float(metrics["eval/episode_reward"])
+            best_state["latest_step"] = int(num_steps)
+
         if use_wandb:
             wandb.log(
                 {k: float(v) for k, v in metrics.items()
                  if hasattr(v, "__float__") or isinstance(v, (int, float))},
                 step=num_steps,
+            )
+
+    best_path = checkpoint_dir / "best.pkl"
+
+    def policy_params_fn(current_step: int, make_policy, params) -> None:
+        """Save params to best.pkl whenever the most recent eval improves.
+
+        Brax invokes this with the just-evaluated params right after each
+        eval (and once before training starts). progress() has already run
+        for that step, so best_state["latest_reward"] reflects this params.
+        """
+        latest = best_state["latest_reward"]
+        if latest is None:
+            return
+        if latest > best_state["best_reward"]:
+            best_state["best_reward"] = latest
+            _save_checkpoint(
+                best_path, params=params, step=int(current_step), config=config
+            )
+            print(
+                f"  [best] step {current_step:,}  "
+                f"eval/episode_reward={latest:.3f} → {best_path.name}",
+                flush=True,
             )
 
     # ------ Brax PPO train ------
@@ -257,6 +290,7 @@ def main():
         seed=seed,
         network_factory=network_factory,
         progress_fn=progress,
+        policy_params_fn=policy_params_fn,
     )
 
     make_inference_fn, params, final_metrics = train_fn()
@@ -264,6 +298,10 @@ def main():
     final_path = checkpoint_dir / "final.pkl"
     _save_checkpoint(final_path, params=params, step=config["training"]["num_timesteps"], config=config)
     print(f"\nDone. Saved final checkpoint: {final_path}")
+    if best_state["best_reward"] > float("-inf"):
+        print(
+            f"Best eval/episode_reward: {best_state['best_reward']:.3f}  → {best_path}"
+        )
     if use_wandb:
         import wandb
         wandb.finish()
