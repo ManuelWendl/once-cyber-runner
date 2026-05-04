@@ -73,6 +73,11 @@ def parse_args():
     p.add_argument("--run-name", default=None,
                    help="Custom subdir name appended to checkpoint_dir. "
                         "If unset, a timestamp + strategy + seed is used.")
+    p.add_argument("--resume", default=None,
+                   help="Path to a .pkl checkpoint (saved by this script) to "
+                        "warm-start training from. Loads params only — "
+                        "optimizer state restarts. Useful for curriculum "
+                        "fine-tuning (e.g. survival → bumps).")
     return p.parse_args()
 
 
@@ -151,6 +156,33 @@ def main():
             run_name = f"run_{ts}_{strategy}_seed{seed}"
         checkpoint_dir = base_dir / run_name
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------ Optional warm-start (curriculum fine-tuning) ------
+    # `restore_params` accepts the same params tuple our _save_checkpoint
+    # writes — Brax PPO uses it to seed normalizer + policy + value at the
+    # start of training. Optimizer state is NOT restored; the run begins a
+    # fresh PPO loop with the loaded weights.
+    restore_params = None
+    if args.resume is not None:
+        resume_path = Path(args.resume)
+        if not resume_path.is_file():
+            raise SystemExit(f"--resume path not found: {resume_path}")
+        with open(resume_path, "rb") as f:
+            resume_blob = pickle.load(f)
+        if "params" not in resume_blob:
+            raise SystemExit(
+                f"{resume_path} does not look like a train.py checkpoint "
+                f"(missing 'params'). Keys: {list(resume_blob.keys())}"
+            )
+        restore_params = resume_blob["params"]
+        prev_step = resume_blob.get("step", "?")
+        prev_strategy = (
+            resume_blob.get("config", {}).get("env", {}).get("safe_prior_strategy")
+        )
+        print(
+            f"  resume:          {resume_path}  "
+            f"(prev_step={prev_step}, prev_strategy={prev_strategy})"
+        )
 
     # ------ Banner ------
     print("=" * 60)
@@ -270,6 +302,10 @@ def main():
     brax_cfg = config["training"]["brax_ppo"]
     network_factory = make_network_factory(brax_cfg["network"])
 
+    train_kwargs: Dict[str, Any] = {}
+    if restore_params is not None:
+        train_kwargs["restore_params"] = restore_params
+
     train_fn = functools.partial(
         ppo_train.train,
         environment=env,
@@ -291,6 +327,7 @@ def main():
         network_factory=network_factory,
         progress_fn=progress,
         policy_params_fn=policy_params_fn,
+        **train_kwargs,
     )
 
     make_inference_fn, params, final_metrics = train_fn()
