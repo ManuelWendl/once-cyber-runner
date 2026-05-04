@@ -78,6 +78,13 @@ def parse_args():
                         "warm-start training from. Loads params only — "
                         "optimizer state restarts. Useful for curriculum "
                         "fine-tuning (e.g. survival → bumps).")
+    p.add_argument("--learning-rate", type=float, default=None,
+                   help="Override training.brax_ppo.learning_rate. Useful for "
+                        "fine-tunes (e.g. 5e-5) where the default 3e-4 is too "
+                        "aggressive and erases the warm start.")
+    p.add_argument("--entropy-cost", type=float, default=None,
+                   help="Override training.brax_ppo.entropy_cost. Lower (e.g. "
+                        "1e-4) keeps the policy near the warm start.")
     return p.parse_args()
 
 
@@ -130,6 +137,10 @@ def main():
         config["env"]["tilt_bump_prob"] = args.tilt_bump_prob
     if args.tilt_bump_magnitude is not None:
         config["env"]["tilt_bump_magnitude"] = args.tilt_bump_magnitude
+    if args.learning_rate is not None:
+        config["training"]["brax_ppo"]["learning_rate"] = args.learning_rate
+    if args.entropy_cost is not None:
+        config["training"]["brax_ppo"]["entropy_cost"] = args.entropy_cost
 
     if args.debug:
         config["env"]["num_envs"] = 256
@@ -205,6 +216,8 @@ def main():
     if config['env'].get('tilt_bumps', False):
         print(f"  tilt_bump_prob:  {config['env'].get('tilt_bump_prob', 0.0)}")
         print(f"  tilt_bump_mag:   {config['env'].get('tilt_bump_magnitude', 0.0)}")
+    print(f"  learning_rate:   {config['training']['brax_ppo']['learning_rate']:.2e}")
+    print(f"  entropy_cost:    {config['training']['brax_ppo']['entropy_cost']:.2e}")
     print("=" * 60)
 
     # ------ Environment ------
