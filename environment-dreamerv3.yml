@@ -1,4 +1,4 @@
-name: cyberrunner-world-model
+name: cyberrunner_sooper
 channels:
   - conda-forge
   - defaults
@@ -168,4 +168,3 @@ dependencies:
       - wcwidth==0.6.0
       - websockets==16.0
       - zipp==3.23.0
-prefix: /home/vass/miniconda3/envs/cyberrunner-world-model

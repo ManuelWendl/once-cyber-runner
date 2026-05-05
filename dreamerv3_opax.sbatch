@@ -16,7 +16,7 @@
 #
 # The DreamerV3 stack uses a separate cluster conda env from the Brax PPO
 # stack — JAX/elements/portal pinning differs. Provision once with
-# `conda env create -f environment-dreamerv3.yml -p /cluster/courses/pmlr/teams/team06/cyberrunner_dreamerv3`.
+# `conda env create -f environment-dreamerv3.yml -p /cluster/courses/pmlr/teams/team06/cyberrunner_sooper`.
 #
 #SBATCH --job-name=opax
 #SBATCH --account=pmlr_jobs
@@ -50,7 +50,7 @@ export XLA_FLAGS="--xla_gpu_triton_gemm_any=true"
 export MUJOCO_GL=${MUJOCO_GL:-egl}
 
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate /cluster/courses/pmlr/teams/team06/cyberrunner_dreamerv3
+conda activate /cluster/courses/pmlr/teams/team06/cyberrunner_sooper
 
 cd "$REPO_DIR"
 
