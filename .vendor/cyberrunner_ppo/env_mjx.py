@@ -37,6 +37,7 @@ from env_mujoco import (
     build_model,
     compute_waypoint_distances,
     get_hard_layout,
+    get_layout,
 )
 
 
@@ -400,6 +401,7 @@ class CyberrunnerMJXEnv(envs.Env):
         num_rays: int = 32,
         num_envs_hint: int = 4096,
         history_length: int = 5,
+        maze_layout: str = "hard",
         safe_prior: bool = False,
         safe_prior_strategy: str = "exp_d",
         safe_prior_sigma: float = 0.02,
@@ -415,6 +417,7 @@ class CyberrunnerMJXEnv(envs.Env):
         self.num_envs_hint = num_envs_hint
         self.history_length = history_length
         self._frame_dim = 6  # joint(2) + ball(2) + action(2)
+        self.maze_layout = str(maze_layout)
 
         # Safe-prior task: when enabled, the env spawns with mild random tilt
         # and ball velocity. The reward depends on which strategy is selected:
@@ -459,8 +462,9 @@ class CyberrunnerMJXEnv(envs.Env):
         self._range_beta_lo = float(RANGE_BETA[0])
         self._range_beta_hi = float(RANGE_BETA[1])
 
-        # Build maze and MuJoCo model on the host (numpy + mjSpec)
-        walls_h, walls_v, holes, waypoints = get_hard_layout()
+        # Build maze and MuJoCo model on the host (numpy + mjSpec).
+        # Layout selectable: easy | medium | hard. Validated via get_layout.
+        walls_h, walls_v, holes, waypoints = get_layout(self.maze_layout)
         seg_lengths, cum_distances = compute_waypoint_distances(waypoints)
         mj_model = build_model(walls_h, walls_v, holes, waypoints)
         self.mj_model = mj_model

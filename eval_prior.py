@@ -23,7 +23,12 @@ import numpy as np
 from stable_baselines3 import PPO
 
 # ── constants matching training ──────────────────────────────────────────────
-OBS_DIM = 10  # 10 states (no checkpoint field — pure stabilization prior)
+# Per-frame observation dimensionality by prior_version (must match
+# `_get_obs` in `envs/cyberrunner.py`):
+#   legacy:               13 (states 10 + ckpt 3)
+#   checkpoint_recovery:  12 (states 9  + ckpt 3)
+#   dense:                11 (states 8  + ckpt 3)
+PRIOR_OBS_DIMS = {"legacy": 13, "checkpoint_recovery": 12, "dense": 11}
 DEFAULT_N_STACK = 4
 DEFAULT_LOGDIR = "logdir/ppo_prior_stabilize"
 VIDEO_FPS = 30
@@ -114,11 +119,12 @@ def _run_episode(
     spawn_idx: int,
     n_spawns: int,
     n_stack: int,
+    obs_dim: int,
     seed: int,
     capture_frames: bool = True,
 ) -> EpisodeResult:
     buf: deque[np.ndarray] = deque(
-        [np.zeros(OBS_DIM, dtype=np.float32)] * n_stack, maxlen=n_stack
+        [np.zeros(obs_dim, dtype=np.float32)] * n_stack, maxlen=n_stack
     )
     raw_obs, _ = env.reset(seed=seed, options={"spawn_point": spawn_point})
     total_reward = 0.0
@@ -200,6 +206,12 @@ def main() -> None:
         default="waypoints",
         choices=["waypoints", "dense_path"],
     )
+    parser.add_argument(
+        "--prior_version",
+        type=str,
+        default="legacy",
+        choices=list(PRIOR_OBS_DIMS.keys()),
+    )
     parser.add_argument("--fps", type=int, default=VIDEO_FPS)
     parser.add_argument(
         "--no_video", action="store_true", help="Skip frame capture (stats only)"
@@ -224,7 +236,8 @@ def main() -> None:
     obs_rms_var = vec_norm.obs_rms.var.astype(np.float32)
 
     # The saved stats cover (n_stack * obs_dim,) — broadcast mean/var to match.
-    expected_len = args.n_stack * OBS_DIM
+    obs_dim = PRIOR_OBS_DIMS[args.prior_version]
+    expected_len = args.n_stack * obs_dim
     if obs_rms_mean.shape[0] != expected_len:
         # Tile single-frame stats if saved from a non-stacked env (fallback)
         repeats = expected_len // obs_rms_mean.shape[0]
@@ -242,8 +255,8 @@ def main() -> None:
             randomize_init_pos=False,
             include_vision=False,
             reward_every_n_waypoints=3,
-            hole_penalty=3.0,
-            checkpoint_radius=0.015,
+            hole_penalty=25.0,
+            checkpoint_radius=0.020,
             checkpoint_hold_steps=6,
             checkpoint_speed_threshold=0.05,
             checkpoint_arrival_reward=0.0,
@@ -255,6 +268,7 @@ def main() -> None:
             prior_mode=True,
             prior_task=args.prior_task,
             prior_spawn_source=args.prior_spawn_source,
+            prior_version=args.prior_version,
             prior_start_waypoint_window=3,
             prior_init_ball_speed=0.2,
             prior_init_tilt_frac=0.25,
@@ -267,6 +281,8 @@ def main() -> None:
             terminate_on_checkpoint_stabilized=True,
         ),
         seed=args.seed,
+        prior_version=args.prior_version,
+        obs_dim=obs_dim,
     )
 
     spawn_points = np.asarray(env.unwrapped.prior_start_points, dtype=np.float32)
@@ -291,6 +307,7 @@ def main() -> None:
             spawn_idx=idx,
             n_spawns=n_spawns,
             n_stack=args.n_stack,
+            obs_dim=obs_dim,
             seed=args.seed + idx,
             capture_frames=not args.no_video,
         )

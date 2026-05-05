@@ -85,6 +85,10 @@ def parse_args():
     p.add_argument("--entropy-cost", type=float, default=None,
                    help="Override training.brax_ppo.entropy_cost. Lower (e.g. "
                         "1e-4) keeps the policy near the warm start.")
+    p.add_argument("--maze-layout",
+                   choices=["easy", "medium", "hard"],
+                   default=None,
+                   help="Override env.maze_layout (selects polyline + walls + holes).")
     return p.parse_args()
 
 
@@ -141,6 +145,8 @@ def main():
         config["training"]["brax_ppo"]["learning_rate"] = args.learning_rate
     if args.entropy_cost is not None:
         config["training"]["brax_ppo"]["entropy_cost"] = args.entropy_cost
+    if args.maze_layout is not None:
+        config["env"]["maze_layout"] = args.maze_layout
 
     if args.debug:
         config["env"]["num_envs"] = 256
@@ -206,6 +212,7 @@ def main():
     print(f"  jax devices:     {jax.devices()}")
     print(f"  checkpoint_dir:  {checkpoint_dir}")
     print(f"  seed:            {seed}")
+    print(f"  maze_layout:     {config['env'].get('maze_layout', 'hard')}")
     print(f"  safe_prior:      {config['env'].get('safe_prior', False)}")
     print(f"  prior_strategy:  {config['env'].get('safe_prior_strategy', 'exp_d')}")
     if config['env'].get('safe_prior_strategy', 'exp_d') == 'exp_d_sigma':
@@ -227,6 +234,7 @@ def main():
         num_rays=config["env"].get("num_rays", 32),
         num_envs_hint=config["env"]["num_envs"],
         history_length=config["env"].get("history_length", 5),
+        maze_layout=config["env"].get("maze_layout", "hard"),
         safe_prior=config["env"].get("safe_prior", False),
         safe_prior_strategy=config["env"].get("safe_prior_strategy", "exp_d"),
         safe_prior_sigma=config["env"].get("safe_prior_sigma", 0.02),

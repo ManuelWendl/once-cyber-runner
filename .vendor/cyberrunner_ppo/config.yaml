@@ -6,6 +6,7 @@ env:
   randomize_init_pos: true
   num_rays: 32              # raycast rays for path-progress occlusion check
   history_length: 5         # frame-stack depth: each frame is [joint(2), ball(2), action(2)]
+  maze_layout: hard         # easy | medium | hard — selects polyline + walls + holes
   # Safe-prior task. When true:
   #   - spawn gets mild random tilt (init_tilt_frac × joint range) and ball
   #     velocity (uniform in [0, init_ball_speed]).

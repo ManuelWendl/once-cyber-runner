@@ -8,6 +8,7 @@
 # Wandb project is tagged with the strategy so curves stay separable.
 #
 # Optional difficulty knobs (env vars):
+#   MAZE_LAYOUT       maze layout: easy | medium | hard. Empty → config default.
 #   INIT_BALL_SPEED   max spawn ball speed (m/s). Empty → use config default.
 #   INIT_TILT_FRAC    fraction of joint range used for spawn tilt.
 #   TILT_BUMPS        "1" to enable random mid-episode tilt bumps.
@@ -58,6 +59,7 @@ export WANDB_PROJECT=${WANDB_PROJECT:-cyberrunner_safe_prior_${STRATEGY}}
 cd "$VENDOR_DIR"
 
 EXTRA_ARGS=()
+[[ -n "${MAZE_LAYOUT:-}" ]]     && EXTRA_ARGS+=(--maze-layout    "$MAZE_LAYOUT")
 [[ -n "${INIT_BALL_SPEED:-}" ]] && EXTRA_ARGS+=(--init-ball-speed "$INIT_BALL_SPEED")
 [[ -n "${INIT_TILT_FRAC:-}" ]]  && EXTRA_ARGS+=(--init-tilt-frac  "$INIT_TILT_FRAC")
 if [[ "${TILT_BUMPS:-0}" == "1" ]]; then
