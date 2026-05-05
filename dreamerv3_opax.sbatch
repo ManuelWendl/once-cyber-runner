@@ -25,7 +25,17 @@
 #SBATCH --time=12:00:00
 #SBATCH --output=logs/opax_%j.out
 
+# Force line-buffered stdout/stderr so partial output survives even if the
+# script aborts in the first few seconds (slurm block-buffers redirects).
+exec 1> >(stdbuf -oL cat)
+exec 2> >(stdbuf -oL cat >&2)
+
+# Print every command to stderr BEFORE running it. With set -e below, the
+# last echoed line is the one that failed.
+set -x
 set -euo pipefail
+
+echo "[boot] $(date)  jobid=${SLURM_JOB_ID:-?}  node=${SLURM_NODELIST:-?}  cwd=$(pwd)"
 
 REPO_DIR=$HOME/efficient-exploration-for-cyberrunner-pmlr
 
