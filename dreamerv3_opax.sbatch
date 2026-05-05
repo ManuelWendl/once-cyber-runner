@@ -51,11 +51,18 @@ nvidia-smi
 
 . /etc/profile.d/modules.sh
 module load cuda/12.9
-export PATH=/cluster/data/cuda/x86_64/12.9/bin:$PATH
+
+# Point JAX at the system CUDA toolkit (newer ptxas) instead of the
+# pip-shipped one inside the conda env, which is too old for the GPU
+# and triggers `ptxas too old. Falling back to the driver` → UNIMPLEMENTED.
+CUDA_DIR=/cluster/data/cuda/x86_64/12.9
+export PATH=$CUDA_DIR/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_DIR/lib64:${LD_LIBRARY_PATH:-}
+export CUDA_HOME=$CUDA_DIR
 
 export XLA_PYTHON_CLIENT_PREALLOCATE=true
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
-export XLA_FLAGS="--xla_gpu_triton_gemm_any=true"
+export XLA_FLAGS="--xla_gpu_triton_gemm_any=true --xla_gpu_cuda_data_dir=$CUDA_DIR"
 # Headless GPU rendering for the CPU env's vision pipeline.
 export MUJOCO_GL=${MUJOCO_GL:-egl}
 
