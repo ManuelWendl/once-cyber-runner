@@ -40,7 +40,7 @@ defaults:
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False, length: 36000}
     dmc: {size: [64, 64], repeat: 1, proprio: True, image: True, camera: -1}
     loconav: {size: [64, 64], repeat: 1, camera: -1}
-    cyberrunner: {size: [64, 64], episode_length: 6000, randomize_init_pos: False, include_vision: True, frame_stack: 1, layout: hard, grayscale: True}
+    cyberrunner: {size: [64, 64], episode_length: 2000, randomize_init_pos: False, include_vision: True, frame_stack: 1, layout: hard, grayscale: True}
 
   replay:
     size: 5e6
@@ -198,7 +198,7 @@ dmc_proprio:
 cyberrunner_state:
   <<: *size12m
   task: cyberrunner_default
-  env.cyberrunner: {episode_length: 6000, randomize_init_pos: False, include_vision: False, frame_stack: 1}
+  env.cyberrunner: {episode_length: 2000, randomize_init_pos: False, include_vision: False, frame_stack: 1}
   run: {steps: 1.1e6, envs: 8, train_ratio: 512}
   agent.opt.lr: 1e-4
 
