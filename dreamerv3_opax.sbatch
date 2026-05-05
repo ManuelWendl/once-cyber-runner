@@ -85,6 +85,23 @@ export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-30}
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate /cluster/courses/pmlr/teams/team06/cyberrunner_sooper
 
+# JAX picks the pip-shipped nvidia-cuda-nvcc/bin/ptxas via Python package
+# discovery, ignoring XLA_FLAGS. That ptxas is too old for the GPU →
+# JAX warns "ptxas too old", falls back to the driver, then driver-side
+# compilation fails with UNIMPLEMENTED. Replace the bundled ptxas with a
+# symlink to the system (cuda/12.9) ptxas. Idempotent; the .bak guard means
+# subsequent runs are no-ops.
+PTXAS_BUNDLED=/cluster/courses/pmlr/teams/team06/cyberrunner_sooper/lib/python3.11/site-packages/nvidia/cuda_nvcc/bin/ptxas
+PTXAS_SYSTEM=$CUDA_DIR/bin/ptxas
+if [ -e "$PTXAS_BUNDLED" ] && [ ! -L "$PTXAS_BUNDLED" ] && [ -x "$PTXAS_SYSTEM" ]; then
+  echo "[ptxas-fix] backing up bundled ptxas → ${PTXAS_BUNDLED}.bak"
+  mv "$PTXAS_BUNDLED" "${PTXAS_BUNDLED}.bak"
+  ln -s "$PTXAS_SYSTEM" "$PTXAS_BUNDLED"
+fi
+echo "[ptxas-check] which: $(command -v ptxas || echo none)"
+echo "[ptxas-check] bundled resolves to: $(readlink -f "$PTXAS_BUNDLED" || echo missing)"
+"$PTXAS_BUNDLED" --version 2>&1 | head -2 || true
+
 cd "$REPO_DIR"
 
 echo "============================================================"
