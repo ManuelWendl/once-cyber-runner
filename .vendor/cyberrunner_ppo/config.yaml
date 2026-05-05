@@ -1,7 +1,8 @@
 # Brax PPO training config for cyberrunner_ppo.
 
 env:
-  episode_length: 2000      # 60Hz control * 33s — matches cleaned env default
+  episode_length: 6000      # 60 Hz control * 100 s — long enough for SOOPER's
+                            # explore → fallback (≥5 s) → resume cycles. Was 2000.
   num_envs: 4096            # Brax will VmapWrapper this many copies
   randomize_init_pos: true
   num_rays: 32              # raycast rays for path-progress occlusion check

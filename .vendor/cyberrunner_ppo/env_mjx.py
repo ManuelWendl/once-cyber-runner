@@ -802,10 +802,19 @@ class CyberrunnerMJXEnv(envs.Env):
             "safe_prior_target_idx": target_idx,
             "safe_prior_target_xy": target_xy,
             "safe_prior_target_seg_idx": target_seg_idx,
+            # Episode-level aggregates for SOOPER monitoring. Updated in step()
+            # and surfaced via state.metrics; layout-agnostic.
+            "max_progress": jnp.float32(0.0),
+            "had_hole": jnp.float32(0.0),
+            "visited_seg_mask": jnp.zeros(self._num_waypoints - 1, dtype=jnp.bool_),
         }
         metrics = {
             "reward": jnp.float32(0.0),
             "path_progress": prev_progress,
+            # SOOPER monitoring — averaged over episode steps by Brax Evaluator.
+            "path_max_progress": jnp.float32(0.0),
+            "hole_terminated": jnp.float32(0.0),
+            "coverage_frac": jnp.float32(0.0),
         }
         return envs.State(
             pipeline_state=mjx_data,
@@ -897,6 +906,29 @@ class CyberrunnerMJXEnv(envs.Env):
         # prev_progress only updates when curr is valid (env_mujoco.py L995)
         new_prev_progress = jnp.where(found, progress, prev_progress)
 
+        # === SOOPER episode aggregates ===
+        # max_progress: monotonic running max of path progress (only updated when
+        # the path lookup succeeded, so we don't get stuck at the -1 sentinel).
+        new_max_progress = jnp.where(
+            found,
+            jnp.maximum(state.info["max_progress"], progress),
+            state.info["max_progress"],
+        )
+        # had_hole: latches to 1 the step the marble enters a hole. Stays 1 for
+        # the rest of the episode (auto-reset wrapper rebuilds info on next ep).
+        new_had_hole = jnp.where(in_hole, jnp.float32(1.0), state.info["had_hole"])
+        # visited_seg_mask: bitmask of segments the ball has been seen on.
+        # `.at[seg_idx].set(True)` is JIT-safe because seg_idx is a scalar int32.
+        seg_idx_safe = jnp.clip(seg_idx, 0, self._num_waypoints - 2)
+        prev_mask = state.info["visited_seg_mask"]
+        new_mask = jnp.where(
+            found,
+            prev_mask.at[seg_idx_safe].set(True),
+            prev_mask,
+        )
+        coverage_frac = (new_mask.sum().astype(jnp.float32)
+                         / jnp.float32(self._num_waypoints - 1))
+
         # Step RNG split for per-step noise (rng_in already advanced by the
         # tilt-bump branch when enabled; otherwise it's just state.info["rng"]).
         rng, k_step = jax.random.split(rng_in)
@@ -918,10 +950,16 @@ class CyberrunnerMJXEnv(envs.Env):
             "rng": rng,
             "prev_progress": new_prev_progress,
             "obs_history": history,
+            "max_progress": new_max_progress,
+            "had_hole": new_had_hole,
+            "visited_seg_mask": new_mask,
         }
         metrics = {
             "reward": reward,
             "path_progress": progress,
+            "path_max_progress": new_max_progress,
+            "hole_terminated": new_had_hole,
+            "coverage_frac": coverage_frac,
         }
         return state.replace(
             pipeline_state=mjx_data,

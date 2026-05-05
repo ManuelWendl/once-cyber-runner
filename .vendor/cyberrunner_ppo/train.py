@@ -291,6 +291,20 @@ def main():
                 v = float(metrics[k])
                 line += f"  {k}={v:.3f}"
         print(line, flush=True)
+        # SOOPER monitoring metrics — averaged over eval-episode steps by Brax
+        # Evaluator. Coverage and max-progress are running aggregates, so the
+        # average over an episode underestimates the final-step value, but the
+        # signal is still monotonic in training quality.
+        sooper_keys = (
+            "eval/path_max_progress",
+            "eval/hole_terminated",
+            "eval/coverage_frac",
+        )
+        if any(k in metrics for k in sooper_keys):
+            extras = "  ".join(
+                f"{k}={float(metrics[k]):.3f}" for k in sooper_keys if k in metrics
+            )
+            print(f"  [sooper] {extras}", flush=True)
 
         if (
             "eval/episode_reward" in metrics
