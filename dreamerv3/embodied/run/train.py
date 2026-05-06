@@ -184,9 +184,18 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
   # the survival prior under hysteresis. See dreamerv3/dreamerv3/sooper.py.
   sooper_cfg = getattr(args, 'sooper', None)
   if sooper_cfg is not None and bool(getattr(sooper_cfg, 'enabled', False)):
-    from dreamerv3.dreamerv3.sooper import (
-        PolicySwitcher, PriorObsAdapter, load_survival_prior,
-    )
+    # main.py rewrites sys.path so the *inner* dreamerv3/dreamerv3/ becomes
+    # the top-level `dreamerv3` package. The laptop unit-test driver, by
+    # contrast, adds the repo root and imports `dreamerv3.dreamerv3.sooper`.
+    # Try both — first form for cluster runs, second for laptop.
+    try:
+      from dreamerv3.sooper import (
+          PolicySwitcher, PriorObsAdapter, load_survival_prior,
+      )
+    except ImportError:
+      from dreamerv3.dreamerv3.sooper import (  # type: ignore[no-redef]
+          PolicySwitcher, PriorObsAdapter, load_survival_prior,
+      )
     print(f'[sooper] enabled — prior_pkl={sooper_cfg.prior_pkl}', flush=True)
     prior_fn = load_survival_prior(sooper_cfg.prior_pkl)
     adapter = PriorObsAdapter(num_envs=args.envs)
