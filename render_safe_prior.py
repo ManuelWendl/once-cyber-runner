@@ -104,6 +104,9 @@ def build_env(cfg: Dict[str, Any]) -> CyberrunnerMJXEnv:
         # Single-env rollout — small warp buffer is enough.
         num_envs_hint=1,
         history_length=env_cfg.get("history_length", 5),
+        # maze_layout is honored if present (easy/medium/hard); older
+        # checkpoints saved before the layout flag default to "hard".
+        maze_layout=env_cfg.get("maze_layout", "hard"),
         safe_prior=env_cfg.get("safe_prior", False),
         safe_prior_strategy=env_cfg.get("safe_prior_strategy", "exp_d"),
         safe_prior_sigma=env_cfg.get("safe_prior_sigma", 0.02),
