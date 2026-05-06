@@ -73,16 +73,33 @@ def load_survival_prior(pkl_path: str) -> Callable:
 
     # Lazy import: brax may not be installed in the dreamer conda env. We
     # raise a helpful error rather than ImportError-ing at module import.
+    #
+    # brax's __init__.py imports `from mujoco import mjx` at module load,
+    # but the dreamer conda env's mujoco doesn't ship the mjx submodule.
+    # We never USE mjx (only ppo.networks for inference), so stub it before
+    # the brax import. Hacky but safe — mjx is never touched downstream.
+    import sys
+    import types
+    if 'mujoco' in sys.modules and not hasattr(sys.modules['mujoco'], 'mjx'):
+        _stub = types.ModuleType('mujoco.mjx')
+        sys.modules['mujoco.mjx'] = _stub
+        sys.modules['mujoco'].mjx = _stub  # type: ignore[attr-defined]
+    elif 'mujoco' not in sys.modules:
+        # Force a partial mujoco import + stub before brax loads.
+        import mujoco  # noqa: F401
+        if not hasattr(sys.modules['mujoco'], 'mjx'):
+            _stub = types.ModuleType('mujoco.mjx')
+            sys.modules['mujoco.mjx'] = _stub
+            sys.modules['mujoco'].mjx = _stub  # type: ignore[attr-defined]
     try:
         from brax.training.agents.ppo import networks as ppo_networks
     except ImportError as e:  # pragma: no cover — env-specific
         raise ImportError(
             "SOOPER needs brax in the dreamer conda env to load the "
             "survival prior. Run: "
-            "`pip install brax==0.11.0` (or whatever version "
-            "`.vendor/cyberrunner_ppo` was trained with) inside the "
-            "cyberrunner_sooper env. If brax conflicts with the dreamer "
-            "jax pin, see the plan's Path B (manual flax reimplementation)."
+            "`pip install --no-deps brax==0.14.2` "
+            "inside the cyberrunner_sooper env (and `flax==0.9.0` "
+            "with --no-deps so neither pulls a newer jax)."
         ) from e
 
     import jax
