@@ -117,17 +117,24 @@ def load_survival_prior(pkl_path: str) -> Callable:
 
     import jax
 
-    factory = ppo_networks.make_ppo_networks(
-        observation_size=36,
-        action_size=2,
-        policy_hidden_layer_sizes=hidden,
-        value_hidden_layer_sizes=hidden,
-        activation=activation,
-        policy_obs_key='state',
-        value_obs_key='state',
-    )
-    raw_inference = ppo_networks.make_inference_fn(factory)(
-        blob['params'], deterministic=True)
+    # DreamerV3's main.py sets a JAX transfer_guard that blocks host→device
+    # copies during training. Brax's make_policy_network does an explicit
+    # `jnp.zeros((1, obs_size))` for shape inference, which trips the guard.
+    # Allow transfers locally just for this one-time setup; the jitted
+    # prior_fn below doesn't introduce any new transfers and stays subject
+    # to the global guard.
+    with jax.transfer_guard('allow'):
+        factory = ppo_networks.make_ppo_networks(
+            observation_size=36,
+            action_size=2,
+            policy_hidden_layer_sizes=hidden,
+            value_hidden_layer_sizes=hidden,
+            activation=activation,
+            policy_obs_key='state',
+            value_obs_key='state',
+        )
+        raw_inference = ppo_networks.make_inference_fn(factory)(
+            blob['params'], deterministic=True)
 
     @jax.jit
     def prior_fn(obs_36):
