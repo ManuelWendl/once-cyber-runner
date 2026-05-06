@@ -356,24 +356,29 @@ class PolicySwitcher:
             self.cooldown[first]     = 0
             self.adapter.reset_envs(first)
 
-        # 1. Run the agent's jitted policy_with_risk: returns OPAX action,
-        #    risk_horizon, and the new RSSM/encoder/decoder carry.
-        carry, opax_act, risk, out = self.agent.policy_with_risk(
-            carry, obs, K=self.cfg.K, **kwargs)
-        risk_np = np.asarray(risk).astype(np.float32)            # (B,)
+        # 1. Run the agent's jitted policy in 'sooper' mode: returns OPAX
+        #    action dict + outs containing the K-step risk_horizon.
+        # The 'sooper' mode is interpreted by Agent.policy() in
+        # dreamerv3/dreamerv3/agent.py — it adds out['risk'] when set.
+        # We don't pass cfg.K as a CLI knob anymore; K is hardcoded inside
+        # policy() at 10 to keep the JIT compile path stable.
+        kwargs = {k: v for k, v in kwargs.items() if k != 'mode'}
+        carry, opax_act_dict, out = self.agent.policy(
+            carry, obs, mode='sooper', **kwargs)
+        if 'risk' not in out:
+            raise RuntimeError(
+                "Expected agent.policy(mode='sooper') to populate out['risk']."
+                " Was Agent.policy() patched with the SOOPER branch?")
+        risk_np = np.asarray(out['risk']).astype(np.float32)     # (B,)
 
         # OPAX action shape conventions in Dreamer: dict {key: (B, A)}.
-        opax_act_np = jax.tree.map(np.asarray, opax_act)
-        if isinstance(opax_act_np, dict):
-            # Single continuous action key for cyberrunner.
-            assert len(opax_act_np) == 1, (
-                f"PolicySwitcher assumes one action key, got "
-                f"{list(opax_act_np.keys())}"
-            )
-            (act_key, opax_act_arr), = opax_act_np.items()
-        else:
-            act_key = 'action'
-            opax_act_arr = np.asarray(opax_act_np)
+        opax_act_np = jax.tree.map(np.asarray, opax_act_dict)
+        assert isinstance(opax_act_np, dict) and len(opax_act_np) == 1, (
+            f"PolicySwitcher assumes one action key, got "
+            f"{type(opax_act_np).__name__} / "
+            f"{list(opax_act_np.keys()) if isinstance(opax_act_np, dict) else None}"
+        )
+        (act_key, opax_act_arr), = opax_act_np.items()
 
         # 2. Build the prior obs (un-scale states, ring-buffer history).
         # `prev_action` semantics: the action that PRECEDED this obs.

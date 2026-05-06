@@ -160,53 +160,21 @@ class Agent(embodied.jax.Agent):
     out['finite'] = elements.tree.flatdict(jax.tree.map(
         lambda x: jnp.isfinite(x).all(range(1, x.ndim)),
         dict(obs=obs, carry=carry, tokens=tokens, feat=feat, act=act)))
+    # SOOPER: when mode=='sooper', additionally compute K-step risk_horizon
+    # under the OPAX actor and expose it to the PolicySwitcher via outs.
+    # Plain OPAX (mode='train' / 'eval') doesn't pay the imagination cost.
+    if mode == 'sooper':
+      K = 10  # imagination horizon — keep small so the JIT scan is cheap
+      actor_fn = lambda c: sample(self.pol(self.feat2tensor(c), bdims=1))
+      _, feat_imag, _ = self.dyn.imagine(
+          dyn_carry, actor_fn, length=K, training=False)
+      cont_probs = self.con(self.feat2tensor(feat_imag), bdims=2).prob(1)
+      out['risk'] = 1.0 - jnp.prod(cont_probs, axis=1)            # (B,)
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:
       out.update(elements.tree.flatdict(dict(
           enc=enc_entry, dyn=dyn_entry, dec=dec_entry)))
     return carry, act, out
-
-  def policy_with_risk(self, carry, obs, K=10, mode='train'):
-    """Mirror of policy() that ALSO returns a K-step risk_horizon
-    estimated by imagining forward under the OPAX actor and reading
-    the continuation head.
-
-    Used by the SOOPER PolicySwitcher (see dreamerv3/dreamerv3/sooper.py).
-
-      risk = 1 - prod_{k=1..K} P(alive at step t+k | OPAX actor)
-
-    Returns: (carry, act, risk, out) — same contract as policy() plus
-    a (B,) risk array. JIT-callable through ninjax exactly like policy.
-    """
-    (enc_carry, dyn_carry, dec_carry, prevact) = carry
-    kw = dict(training=False, single=True)
-    reset = obs['is_first']
-    enc_carry, enc_entry, tokens = self.enc(enc_carry, obs, reset, **kw)
-    dyn_carry, dyn_entry, feat = self.dyn.observe(
-        dyn_carry, tokens, prevact, reset, **kw)
-    dec_entry = {}
-    if dec_carry:
-      dec_carry, dec_entry, _ = self.dec(dec_carry, feat, reset, **kw)
-    pol_dist = self.pol(self.feat2tensor(feat), bdims=1)
-    act = sample(pol_dist)
-
-    # K-step imagination under the OPAX actor → continuation probs.
-    actor_fn = lambda c: sample(self.pol(self.feat2tensor(c), bdims=1))
-    _, feat_imag, _ = self.dyn.imagine(
-        dyn_carry, actor_fn, length=K, training=False)
-    # feat_imag is dict-of-arrays shaped (B, K, ...); con returns Bernoulli.
-    cont_probs = self.con(self.feat2tensor(feat_imag), bdims=2).prob(1)  # (B, K)
-    risk = 1.0 - jnp.prod(cont_probs, axis=1)                             # (B,)
-
-    out = {}
-    out['finite'] = elements.tree.flatdict(jax.tree.map(
-        lambda x: jnp.isfinite(x).all(range(1, x.ndim)),
-        dict(obs=obs, carry=carry, tokens=tokens, feat=feat, act=act)))
-    carry = (enc_carry, dyn_carry, dec_carry, act)
-    if self.config.replay_context:
-      out.update(elements.tree.flatdict(dict(
-          enc=enc_entry, dyn=dyn_entry, dec=dec_entry)))
-    return carry, act, risk, out
 
   def train(self, carry, data):
     carry, obs, prevact, stepid = self._apply_replay_context(carry, data)
