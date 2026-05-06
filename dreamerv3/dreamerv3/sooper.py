@@ -369,7 +369,11 @@ class PolicySwitcher:
             raise RuntimeError(
                 "Expected agent.policy(mode='sooper') to populate out['risk']."
                 " Was Agent.policy() patched with the SOOPER branch?")
-        risk_np = np.asarray(out['risk']).astype(np.float32)     # (B,)
+        # Pop risk so it doesn't flow into the driver's `trans` dict and
+        # land in the replay buffer with an unrecognized schema key. We
+        # re-emit it as 'log/gate/risk_horizon' below where logfn picks
+        # it up automatically.
+        risk_np = np.asarray(out.pop('risk')).astype(np.float32)  # (B,)
 
         # OPAX action shape conventions in Dreamer: dict {key: (B, A)}.
         opax_act_np = jax.tree.map(np.asarray, opax_act_dict)
@@ -409,9 +413,12 @@ class PolicySwitcher:
 
         # 5. Action mux. Overwrite carry's prevact so the world model
         # next step conditions on the action that actually executed.
+        # NB: carry[3] is a DICT keyed by act_space (per agent.init_policy
+        # → `jax.tree.map(zeros, self.act_space)`). Replacing it with a
+        # bare array would break the next step's dyn.observe (DictConcat).
         final_act = np.where(self.prior_active[:, None],
                              prior_act_np, opax_act_arr).astype(np.float32)
-        new_carry = (*carry[:3], jnp.asarray(final_act))
+        new_carry = (*carry[:3], {act_key: jnp.asarray(final_act)})
         acts = {act_key: final_act}
 
         out = dict(out) if out else {}

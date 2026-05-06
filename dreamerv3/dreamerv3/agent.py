@@ -116,7 +116,10 @@ class Agent(embodied.jax.Agent):
 
   @property
   def policy_keys(self):
-    return '^(enc|dyn|dec|pol)/'
+    # `con` (continuation head) is included so SOOPER's mode='sooper' branch
+    # in policy() can compute risk_horizon. The head is small (~2 MLP layers);
+    # plain OPAX runs pay negligible extra memory.
+    return '^(enc|dyn|dec|pol|con)/'
 
   @property
   def ext_space(self):
