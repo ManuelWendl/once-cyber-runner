@@ -143,6 +143,14 @@ def load_survival_prior(pkl_path: str) -> Callable:
         action, _ = raw_inference({'state': obs_36}, rng)
         return action
 
+    # Pre-warm the JIT inside transfer_guard('allow') because the first
+    # call materializes the params as constants in the lowered graph,
+    # which JAX implements via a device→host fetch — blocked by
+    # DreamerV3's global transfer guard. After this warm-up the compiled
+    # binary is cached, so runtime calls don't trigger the same fetch.
+    with jax.transfer_guard('allow'):
+        _ = prior_fn(jax.numpy.zeros((1, 36), dtype=jax.numpy.float32))
+
     return prior_fn
 
 
@@ -397,7 +405,11 @@ class PolicySwitcher:
         prior_obs = self.adapter.transform(obs, opax_act_arr)    # (B, 36)
 
         # 3. Run the jitted prior. Output (B, 2) in [-1, 1].
-        prior_act_np = np.asarray(self.prior_fn(jnp.asarray(prior_obs)))
+        # transfer_guard('allow') in case the warm-up didn't catch every
+        # device⇄host edge (e.g. when batch size differs from warm-up).
+        with jax.transfer_guard('allow'):
+            prior_act_np = np.asarray(
+                self.prior_fn(jnp.asarray(prior_obs)))
 
         # 4. Pure-numpy state machine. Trigger and release ONLY on p(cont).
         (new_active, new_hold, new_cool,
