@@ -85,6 +85,13 @@ export JAX_DEFAULT_MATMUL_PRECISION=float32
 export MUJOCO_GL=${MUJOCO_GL:-egl}
 # Wandb tolerance for cluster startup latency.
 export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-30}
+# Redirect wandb's per-run data dir out of the repo root. Default
+# behavior is to create ./wandb/, which shadows `import wandb` (the
+# package) the next time anyone runs python from the repo root and
+# silently breaks wandb logging with `module 'wandb' has no attribute
+# '__version__'`. Putting it under logdir/.wandb keeps it isolated.
+export WANDB_DIR=${WANDB_DIR:-$REPO_DIR/logdir/.wandb}
+mkdir -p "$WANDB_DIR"
 # Route wandb runs to our team's OPAX project; matches the convention used by
 # safe_prior.sbatch (which tags WANDB_PROJECT per strategy). Without these,
 # dreamerv3/dreamerv3/main.py falls back to project=debug.

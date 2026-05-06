@@ -183,9 +183,15 @@ def make_logger(config):
       import wandb
       name = '/'.join(logdir.split('/')[-4:])
       try:
-        outputs.append(elements.logger.WandBOutput(
-            name,
-            settings=wandb.Settings(init_timeout=30)))
+        # `wandb.Settings(init_timeout=30)` was removed/relocated in some
+        # wandb versions. Try the kwarg form first, fall back to the
+        # equivalent env-var path (WANDB__INIT_TIMEOUT) and skip settings.
+        kwargs = {}
+        if hasattr(wandb, 'Settings'):
+          kwargs['settings'] = wandb.Settings(init_timeout=30)
+        else:
+          os.environ.setdefault('WANDB__INIT_TIMEOUT', '30')
+        outputs.append(elements.logger.WandBOutput(name, **kwargs))
       except Exception as e:
         print(f'WARNING: WandB init failed ({e}), continuing without WandB')
     elif output == 'scope':
