@@ -61,6 +61,23 @@ def load_survival_prior(pkl_path: str) -> Callable:
     pkl = Path(pkl_path)
     if not pkl.is_file():
         raise FileNotFoundError(f"survival-prior pkl not found: {pkl}")
+
+    # ---- Install the mjx stub BEFORE pickle.load -----------------------
+    # The pickle contains references to classes in `brax.*`, so the very
+    # act of unpickling triggers `import brax`. brax's __init__ does
+    # `from mujoco import mjx`, and the dreamer conda env's mujoco
+    # package doesn't ship the mjx submodule. We never USE mjx (only
+    # ppo.networks for inference), so stub it here. Hacky but safe —
+    # mjx is never touched downstream.
+    import sys
+    import types
+    import mujoco  # noqa: F401  — populates sys.modules['mujoco']
+    if not hasattr(sys.modules['mujoco'], 'mjx'):
+        _stub = types.ModuleType('mujoco.mjx')
+        sys.modules['mujoco.mjx'] = _stub
+        sys.modules['mujoco'].mjx = _stub  # type: ignore[attr-defined]
+    # --------------------------------------------------------------------
+
     with open(pkl, 'rb') as f:
         blob = pickle.load(f)
     if 'params' not in blob:
@@ -71,26 +88,6 @@ def load_survival_prior(pkl_path: str) -> Callable:
     activation = _activations()[net_cfg['activation']]
     hidden = tuple(net_cfg['hidden_sizes'])
 
-    # Lazy import: brax may not be installed in the dreamer conda env. We
-    # raise a helpful error rather than ImportError-ing at module import.
-    #
-    # brax's __init__.py imports `from mujoco import mjx` at module load,
-    # but the dreamer conda env's mujoco doesn't ship the mjx submodule.
-    # We never USE mjx (only ppo.networks for inference), so stub it before
-    # the brax import. Hacky but safe — mjx is never touched downstream.
-    import sys
-    import types
-    if 'mujoco' in sys.modules and not hasattr(sys.modules['mujoco'], 'mjx'):
-        _stub = types.ModuleType('mujoco.mjx')
-        sys.modules['mujoco.mjx'] = _stub
-        sys.modules['mujoco'].mjx = _stub  # type: ignore[attr-defined]
-    elif 'mujoco' not in sys.modules:
-        # Force a partial mujoco import + stub before brax loads.
-        import mujoco  # noqa: F401
-        if not hasattr(sys.modules['mujoco'], 'mjx'):
-            _stub = types.ModuleType('mujoco.mjx')
-            sys.modules['mujoco.mjx'] = _stub
-            sys.modules['mujoco'].mjx = _stub  # type: ignore[attr-defined]
     try:
         from brax.training.agents.ppo import networks as ppo_networks
     except ImportError as e:  # pragma: no cover — env-specific
