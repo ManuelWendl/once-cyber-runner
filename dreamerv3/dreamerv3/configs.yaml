@@ -26,7 +26,7 @@ defaults:
 
   logger:
     outputs: [jsonl, wandb]
-    filter: 'score|length|fps|ratio|train/loss/|train/rand/|exploration/|gpu/|path_progress'
+    filter: 'score|length|fps|ratio|train/loss/|train/rand/|exploration/|gpu/|path_progress|hole_terminated|goal_terminated|timeout_terminated|gate'
     timer: True
     fps: 15
     user: ''
@@ -88,6 +88,21 @@ defaults:
     expect_devices: 0
     enable_policy: True
     coordinator_address: ''
+
+  # SOOPER fallback gate. When enabled=true, the policy is wrapped by
+  # PolicySwitcher (dreamerv3/dreamerv3/sooper.py): it routes control
+  # between the OPAX explorer and a frozen Brax-PPO survival prior
+  # based on the world model's K-step risk_horizon (continuation head).
+  # Default disabled → plain OPAX runs unchanged.
+  sooper:
+    enabled: False
+    prior_pkl: ''       # absolute path to survival prior best.pkl
+    K: 10               # imagination horizon for risk_horizon
+    tau_high: 0.3       # trigger threshold (OPAX → prior)
+    tau_low: 0.1        # release threshold (prior → OPAX)
+    H_min: 300          # ≥ 5 s @ 60 Hz — minimum hold per project memory
+    H_max: 600          # hard release ceiling (≈ 10 s)
+    cooldown: 60        # ≈ 1 s post-release lockout
 
   agent:
     loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, ensemble: 1.0, ball_pos: 1.0, ball_vel: 1.0}

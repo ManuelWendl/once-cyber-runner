@@ -80,6 +80,15 @@ class CyberRunner(embodied.Env):
             is_terminal=elements.Space(bool),
         )
         spaces['log/path_progress'] = elements.Space(np.float32)
+        # Per-step termination-reason flags. Non-zero only on the episode's
+        # terminal step (is_last=True). The train loop's logfn auto-aggregates
+        # any `log/...` key as avg/max/sum per episode — `.../max` reads as
+        # "did this episode end in <reason>" → averaged across episodes gives
+        # the per-cause termination rate (the SOOPER baseline-vs-treatment
+        # signal).
+        spaces['log/hole_terminated']    = elements.Space(np.float32)
+        spaces['log/goal_terminated']    = elements.Space(np.float32)
+        spaces['log/timeout_terminated'] = elements.Space(np.float32)
         return spaces
 
     @functools.cached_property
@@ -123,14 +132,21 @@ class CyberRunner(embodied.Env):
 
     def _obs(self, obs, reward, is_first=False, is_last=False, is_terminal=False):
         out = {k: np.asarray(v) for k, v in obs.items()}
-        pp = self._info.get('path_progress', 0.0) if self._info else 0.0
+        info = self._info or {}
+        pp = info.get('path_progress', 0.0)
+        # Termination-reason flags (only meaningful at episode end). The CPU
+        # env writes info["termination_reason"] in {"hole", "goal", "timeout"}.
+        reason = info.get('termination_reason', '') if is_last else ''
         out.update(
             reward=np.float32(reward),
             is_first=is_first,
             is_last=is_last,
             is_terminal=is_terminal,
         )
-        out['log/path_progress'] = np.float32(pp)
+        out['log/path_progress']      = np.float32(pp)
+        out['log/hole_terminated']    = np.float32(1.0 if reason == 'hole' else 0.0)
+        out['log/goal_terminated']    = np.float32(1.0 if reason == 'goal' else 0.0)
+        out['log/timeout_terminated'] = np.float32(1.0 if reason == 'timeout' else 0.0)
         return out
 
     def render(self):

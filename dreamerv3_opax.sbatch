@@ -5,9 +5,10 @@
 # OPAX recipe. See .claude/rules/sooper-plan.md.
 #
 # Usage:
-#   sbatch dreamerv3_opax.sbatch                                # easy, size25m, pure exploration
+#   sbatch dreamerv3_opax.sbatch                                # plain OPAX, easy, size25m
 #   LAYOUT=medium sbatch dreamerv3_opax.sbatch
 #   SIZE=size12m sbatch dreamerv3_opax.sbatch                   # smaller model
+#   SOOPER_PKL=/.../best.pkl sbatch dreamerv3_opax.sbatch       # OPAX + SOOPER fallback
 #   EXTRA="--run.steps 200000 --run.envs 4" sbatch dreamerv3_opax.sbatch
 #
 # Optional env vars (defaults match luca's known-working setup):
@@ -18,7 +19,10 @@
 #   RUN_NAME    custom logdir name                   (default: opax_<ts>_<layout>)
 #   CONFIGS     full --configs preset list           (default: defaults <SIZE> <EXPLORE>)
 #   TASK        Dreamer task name                    (default: cyberrunner_default)
-#   EPISODE_LEN env.cyberrunner.episode_length       (default: 6000 — matches our MJX env)
+#   EPISODE_LEN env.cyberrunner.episode_length       (default: 2000 — matches luca's recipe)
+#   SOOPER_PKL  abs path to a Brax-PPO survival best.pkl. When set, enables
+#               the SOOPER fallback gate (dreamerv3/dreamerv3/sooper.py).
+#               Leave unset for plain OPAX.
 #   EXTRA       any extra `--key value` flags forwarded to main.py
 #
 # The DreamerV3 stack uses a separate cluster conda env from the Brax PPO
@@ -81,6 +85,11 @@ export JAX_DEFAULT_MATMUL_PRECISION=float32
 export MUJOCO_GL=${MUJOCO_GL:-egl}
 # Wandb tolerance for cluster startup latency.
 export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-30}
+# Route wandb runs to our team's OPAX project; matches the convention used by
+# safe_prior.sbatch (which tags WANDB_PROJECT per strategy). Without these,
+# dreamerv3/dreamerv3/main.py falls back to project=debug.
+export WANDB_ENTITY=${WANDB_ENTITY:-filippostaffoni-eth-z-rich}
+export WANDB_PROJECT=${WANDB_PROJECT:-cyberrunner_opax}
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate /cluster/courses/pmlr/teams/team06/cyberrunner_sooper
@@ -104,6 +113,16 @@ echo "[ptxas-check] bundled resolves to: $(readlink -f "$PTXAS_BUNDLED" || echo 
 
 cd "$REPO_DIR"
 
+# SOOPER fallback gate. When SOOPER_PKL is set to a Brax-PPO best.pkl
+# path, dreamer wraps its policy with PolicySwitcher (see
+# dreamerv3/dreamerv3/sooper.py). Defaults: prior holds ≥5 s on trigger,
+# release threshold tau_low=0.1, hard release at H_max. Plain OPAX run
+# = leave SOOPER_PKL unset.
+SOOPER_ARGS=()
+if [[ -n "${SOOPER_PKL:-}" ]]; then
+  SOOPER_ARGS+=(--sooper.enabled True --sooper.prior_pkl "$SOOPER_PKL")
+fi
+
 echo "============================================================"
 echo "DreamerV3 OPAX run (mirrors world-model-luca:train.sbatch)"
 echo "  configs:        $CONFIGS"
@@ -111,6 +130,7 @@ echo "  task:           $TASK"
 echo "  layout:         $LAYOUT"
 echo "  episode_length: $EPISODE_LEN"
 echo "  logdir:         $LOGDIR"
+echo "  sooper_pkl:     ${SOOPER_PKL:-<disabled>}"
 echo "  extra:          ${EXTRA:-<none>}"
 echo "============================================================"
 
@@ -130,4 +150,5 @@ python dreamerv3/dreamerv3/main.py \
     --replay.size 5e5 \
     --agent.opt.lr 4e-5 \
     --env.cyberrunner.episode_length "$EPISODE_LEN" \
+    "${SOOPER_ARGS[@]}" \
     ${EXTRA:-}

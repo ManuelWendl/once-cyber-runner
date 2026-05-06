@@ -69,6 +69,9 @@ def main(argv=None):
       consec_train=config.consec_train,
       consec_report=config.consec_report,
       replay_context=config.replay_context,
+      # SOOPER fallback gate config (defaults set sooper.enabled=False, so
+      # this is a no-op for plain OPAX runs).
+      sooper=config.sooper,
   )
 
   if config.script == 'train':

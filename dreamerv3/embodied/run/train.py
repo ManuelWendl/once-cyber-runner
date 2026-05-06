@@ -178,7 +178,21 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
 
   start_time = time.time()
   print('Start training loop')
-  policy = lambda *args: agent.policy(*args, mode='train')
+  # SOOPER fallback gate (off by default → plain OPAX). When sooper.enabled
+  # is True, wrap the policy with PolicySwitcher: it runs OPAX, computes a
+  # K-step risk_horizon from the continuation head, and routes control to
+  # the survival prior under hysteresis. See dreamerv3/dreamerv3/sooper.py.
+  sooper_cfg = getattr(args, 'sooper', None)
+  if sooper_cfg is not None and bool(getattr(sooper_cfg, 'enabled', False)):
+    from dreamerv3.dreamerv3.sooper import (
+        PolicySwitcher, PriorObsAdapter, load_survival_prior,
+    )
+    print(f'[sooper] enabled — prior_pkl={sooper_cfg.prior_pkl}', flush=True)
+    prior_fn = load_survival_prior(sooper_cfg.prior_pkl)
+    adapter = PriorObsAdapter(num_envs=args.envs)
+    policy = PolicySwitcher(agent, prior_fn, adapter, sooper_cfg)
+  else:
+    policy = lambda *args: agent.policy(*args, mode='train')
   driver.reset(agent.init_policy)
   while step < args.steps:
 
