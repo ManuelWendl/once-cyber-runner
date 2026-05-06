@@ -62,18 +62,34 @@ def load_survival_prior(pkl_path: str) -> Callable:
     if not pkl.is_file():
         raise FileNotFoundError(f"survival-prior pkl not found: {pkl}")
 
-    # ---- Install the mjx stub BEFORE pickle.load -----------------------
+    # ---- Ensure mjx is loaded BEFORE pickle.load ----------------------
     # The pickle contains references to classes in `brax.*`, so the very
     # act of unpickling triggers `import brax`. brax's __init__ does
-    # `from mujoco import mjx`, and the dreamer conda env's mujoco
-    # package doesn't ship the mjx submodule. We never USE mjx (only
-    # ppo.networks for inference), so stub it here. Hacky but safe —
-    # mjx is never touched downstream.
+    # `from mujoco import mjx` and brax/base.py does
+    #   class Contact(mjx.Contact, Base): ...
+    # so mjx must be actually-loaded (not just present as a stub) before
+    # the unpickle. Note: a bare `import mujoco` does NOT auto-bind the
+    # mjx submodule — we have to explicitly `from mujoco import mjx`.
+    #
+    # If mjx genuinely isn't installed (the original failure mode that
+    # prompted this stub), fall back to a permissive stub module that
+    # returns a fresh class for any attribute access — enough for brax
+    # to define its mjx-derived classes; we never call any mjx code.
     import sys
     import types
-    import mujoco  # noqa: F401  — populates sys.modules['mujoco']
-    if not hasattr(sys.modules['mujoco'], 'mjx'):
-        _stub = types.ModuleType('mujoco.mjx')
+    try:
+        from mujoco import mjx as _real_mjx  # noqa: F401
+    except Exception:
+        import mujoco  # noqa: F401  — populates sys.modules['mujoco']
+
+        class _StubMjx(types.ModuleType):
+            """Permissive stub: any attribute is a fresh dynamic class."""
+            def __getattr__(self, name):  # type: ignore[override]
+                cls = type(name, (), {})
+                setattr(self, name, cls)
+                return cls
+
+        _stub = _StubMjx('mujoco.mjx')
         sys.modules['mujoco.mjx'] = _stub
         sys.modules['mujoco'].mjx = _stub  # type: ignore[attr-defined]
     # --------------------------------------------------------------------
