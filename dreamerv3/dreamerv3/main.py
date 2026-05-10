@@ -72,6 +72,7 @@ def main(argv=None):
       # SOOPER fallback gate config (defaults set sooper.enabled=False, so
       # this is a no-op for plain OPAX runs).
       sooper=config.sooper,
+      log_video=config.log_video,
   )
 
   if config.script == 'train':

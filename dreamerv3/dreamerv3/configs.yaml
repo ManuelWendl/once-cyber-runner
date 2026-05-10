@@ -94,6 +94,8 @@ defaults:
   # between the OPAX explorer and a frozen Brax-PPO survival prior
   # based on the world model's K-step risk_horizon (continuation head).
   # Default disabled → plain OPAX runs unchanged.
+  log_video: True       # set False to skip video/heatmap logging (avoids wandb moviepy dep)
+
   sooper:
     enabled: False
     prior_pkl: ''       # absolute path to survival prior best.pkl

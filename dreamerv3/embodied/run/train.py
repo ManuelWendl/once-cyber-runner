@@ -240,12 +240,24 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
           print(f'Heatmap generation failed: {e}')
       result.pop('_heatmap_disagree', None)
       result.pop('_heatmap_states', None)
+      log_video = getattr(args, 'log_video', True)
       for key in list(result):
         v = np.asarray(result[key]) if hasattr(result[key], 'shape') else result[key]
         if isinstance(v, np.ndarray) and v.ndim == 3 and v.shape[-1] == 3:
-          result[key] = v[None]  # (H,W,3) -> (1,H,W,3) so logger treats as single-frame video
+          # Heatmap wrapped as single-frame video — drop entirely if
+          # videos are off, otherwise keep wandb.Video happy with (1,H,W,3).
+          if not log_video:
+            result.pop(key)
+          else:
+            result[key] = v[None]
         elif isinstance(v, np.ndarray) and v.ndim == 4 and v.shape[-1] == 1:
-          result[key] = np.repeat(v, 3, axis=-1)
+          if not log_video:
+            result.pop(key)
+          else:
+            result[key] = np.repeat(v, 3, axis=-1)
+        elif isinstance(v, np.ndarray) and v.ndim >= 4 and not log_video:
+          # Any other multi-frame video (e.g. openloop comparisons).
+          result.pop(key)
       logger.add(result, prefix='report')
 
     if should_log(step):
@@ -267,8 +279,10 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
       # GPU memory
       logger.add(_gpu_memory_stats())
 
-      # Policy rollout video (full episode from worker 0)
-      if completed_video[0] is not None:
+      # Policy rollout video (full episode from worker 0). Off-switch
+      # via --run.log_video false for runs where wandb video deps aren't
+      # installed or you just don't want the upload cost.
+      if getattr(args, 'log_video', True) and completed_video[0] is not None:
         vid = completed_video[0]
         if vid.shape[-1] == 1:
           vid = np.repeat(vid, 3, axis=-1)
