@@ -25,9 +25,10 @@ Typical wiring (in dreamerv3/embodied/run/train.py):
 """
 from __future__ import annotations
 
+import json
 import pickle
 from pathlib import Path
-from typing import Any, Callable, Dict, Protocol, Tuple
+from typing import Any, Callable, Dict, Optional, Protocol, Tuple
 
 import numpy as np
 
@@ -449,7 +450,8 @@ class PolicySwitcher:
 
     def __init__(self, agent, prior_fn: Callable, adapter: PriorObsAdapter,
                  cfg, risk_source: RiskSource,
-                 value_fn: Callable | None = None):
+                 value_fn: Callable | None = None,
+                 dump_path: Optional[str] = None):
         self.agent = agent
         self.prior_fn = prior_fn
         self.adapter = adapter
@@ -463,12 +465,78 @@ class PolicySwitcher:
         self.prior_active = None    # bool[B]
         self.hold_count = None      # int32[B]
         self.cooldown = None        # int32[B]
+        # Per-step calibration dump (one jsonl line per env per step). Off
+        # when dump_path is None / empty. The file is opened in append mode
+        # with line buffering so analysis can read it while the run is live
+        # and a crash doesn't lose buffered records.
+        self._dump_path = dump_path or None
+        self._dump_file = None
+        if self._dump_path:
+            Path(self._dump_path).parent.mkdir(parents=True, exist_ok=True)
+            self._dump_file = open(self._dump_path, 'a', buffering=1)
+        # Per-env trackers for the dump. Initialised lazily in _ensure_state
+        # once we know B. episode_id starts at -1 so the first is_first=True
+        # increments it to 0, then each subsequent reset bumps by 1.
+        self._episode_id = None     # int64[B]
+        self._step_in_ep = None     # int64[B]
 
     def _ensure_state(self, B: int) -> None:
         if self.prior_active is None or self.prior_active.shape[0] != B:
             self.prior_active = np.zeros(B, dtype=bool)
             self.hold_count   = np.zeros(B, dtype=np.int32)
             self.cooldown     = np.zeros(B, dtype=np.int32)
+            self._episode_id  = np.full(B, -1, dtype=np.int64)
+            self._step_in_ep  = np.zeros(B, dtype=np.int64)
+
+    # Optional log/* keys we try to surface from obs. Missing keys are
+    # silently skipped — the env may not expose all of them.
+    _OBS_LOG_KEYS: Tuple[str, ...] = (
+        'is_first', 'is_last', 'is_terminal',
+        'log/hole_terminated', 'log/goal_terminated', 'log/timeout_terminated',
+        'log/path_progress',
+    )
+
+    def _dump_steps(self, obs: Dict[str, Any], first: np.ndarray,
+                    log_signals: Dict[str, np.ndarray],
+                    triggered: np.ndarray, released: np.ndarray,
+                    hard_released: np.ndarray) -> None:
+        """Write one jsonl line per env for this step. Counters for
+        episode_id / step_in_ep are advanced here.
+        """
+        if self._dump_file is None:
+            return
+        # Counter update: bump episode_id on is_first, reset step_in_ep there.
+        self._episode_id = np.where(first, self._episode_id + 1,
+                                    self._episode_id)
+        self._step_in_ep = np.where(first, 0, self._step_in_ep + 1)
+
+        # Materialise obs flags once.
+        obs_flags: Dict[str, np.ndarray] = {}
+        for k in self._OBS_LOG_KEYS:
+            if k in obs:
+                obs_flags[k] = np.asarray(obs[k]).reshape(-1)
+
+        B = self.prior_active.shape[0]
+        for i in range(B):
+            rec: Dict[str, Any] = {
+                'env': int(i),
+                'episode': int(self._episode_id[i]),
+                'step_in_ep': int(self._step_in_ep[i]),
+                'prior_active': bool(self.prior_active[i]),
+                'hold_count': int(self.hold_count[i]),
+                'cooldown': int(self.cooldown[i]),
+                'triggered': bool(triggered[i]),
+                'released': bool(released[i]),
+                'hard_released': bool(hard_released[i]),
+            }
+            for name, arr in log_signals.items():
+                rec[name] = float(arr[i])
+            for name, arr in obs_flags.items():
+                # Drop the 'log/' prefix in the dump for brevity.
+                key = name[4:] if name.startswith('log/') else name
+                v = arr[i]
+                rec[key] = bool(v) if name.startswith('is_') else float(v)
+            self._dump_file.write(json.dumps(rec) + '\n')
 
     def _gate_log(self, prior_active: np.ndarray, risk: np.ndarray,
                   triggered: np.ndarray, released: np.ndarray,
@@ -614,4 +682,14 @@ class PolicySwitcher:
             triggered_flag, released_flag, hard_released_flag,
             log_signals,
         ))
+
+        # Per-step jsonl dump (off unless dump_path was set). Captures the
+        # post-gate state (prior_active, hold/cooldown updated) plus all
+        # risk signals and the env's termination flags so post-hoc analysis
+        # can bucket steps by "distance to fall" within each episode.
+        self._dump_steps(
+            obs, first, log_signals,
+            triggered_flag, released_flag, hard_released_flag,
+        )
+
         return new_carry, acts, out

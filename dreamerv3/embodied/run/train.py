@@ -208,9 +208,17 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
     value_fn = load_survival_prior_value(sooper_cfg.prior_pkl)
     risk_source = make_risk_source(risk_mode)
     adapter = PriorObsAdapter(num_envs=args.envs)
+    # Per-step calibration dump. When sooper.dump_steps=true, write one
+    # jsonl line per env per control step into the run's logdir. Plain
+    # str(...) so PolicySwitcher (no elements.Path dep) can open() it.
+    dump_path = None
+    if bool(getattr(sooper_cfg, 'dump_steps', False)):
+      dump_path = str(logdir / 'sooper_steps.jsonl')
+      print(f'[sooper] dump_steps enabled → {dump_path}', flush=True)
     policy = PolicySwitcher(
         agent, prior_fn, adapter, sooper_cfg,
         risk_source=risk_source, value_fn=value_fn,
+        dump_path=dump_path,
     )
   else:
     policy = lambda *args: agent.policy(*args, mode='train')

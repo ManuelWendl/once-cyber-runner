@@ -114,6 +114,11 @@ defaults:
     H_min: 300          # ≥ 5 s @ 60 Hz — minimum hold per project memory
     H_max: 600          # hard release ceiling (≈ 10 s)
     cooldown: 60        # ≈ 1 s post-release lockout
+    # Per-step calibration dump: when True, PolicySwitcher writes one jsonl
+    # line per env per control step to <logdir>/sooper_steps.jsonl with all
+    # risk signals + termination flags. Used to histogram-pick tau_high /
+    # tau_low. Off by default (file size is ~300 B/line × envs × steps).
+    dump_steps: False
 
   agent:
     loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, ensemble: 1.0, ball_pos: 1.0, ball_vel: 1.0}
