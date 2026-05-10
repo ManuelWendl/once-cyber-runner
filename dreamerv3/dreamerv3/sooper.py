@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import pickle
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Protocol, Tuple
 
 import numpy as np
 
@@ -50,13 +50,15 @@ def _activations() -> Dict[str, Callable]:
     }
 
 
-def load_survival_prior(pkl_path: str) -> Callable:
-    """Load a Brax-PPO best.pkl saved by .vendor/cyberrunner_ppo/train.py
-    and return a jitted inference function `prior_fn(obs_36) -> action_2`.
+def _load_brax_factory(pkl_path: str) -> Tuple[Any, Any]:
+    """Shared loader for the Brax-PPO survival-prior pickle.
 
-    The pickle is `{"params": ..., "step": ..., "config": {...}}` —
-    `params` is the (normalizer, policy, value) tuple Brax serializes.
-    Network architecture is read from `config["training"]["brax_ppo"]["network"]`.
+    Returns (factory, blob). `factory` is the PPONetworks namedtuple from
+    brax.training.agents.ppo.networks; `blob` is the unpickled checkpoint
+    dict (`{"params": ..., "step": ..., "config": {...}}`).
+
+    `params` is the (normalizer, policy, value) tuple Brax serializes
+    via `_save_checkpoint` in .vendor/cyberrunner_ppo/train.py.
     """
     pkl = Path(pkl_path)
     if not pkl.is_file():
@@ -133,12 +135,23 @@ def load_survival_prior(pkl_path: str) -> Callable:
             policy_obs_key='state',
             value_obs_key='state',
         )
+    return factory, blob
+
+
+def load_survival_prior(pkl_path: str) -> Callable:
+    """Load the survival-prior actor and return a jitted
+    `prior_fn(obs_36) -> action_2`.
+    """
+    import jax
+
+    factory, blob = _load_brax_factory(pkl_path)
+    from brax.training.agents.ppo import networks as ppo_networks
+    with jax.transfer_guard('allow'):
         raw_inference = ppo_networks.make_inference_fn(factory)(
             blob['params'], deterministic=True)
 
     @jax.jit
     def prior_fn(obs_36):
-        # Brax expects {'state': obs}; deterministic=True ignores the rng.
         rng = jax.random.PRNGKey(0)
         action, _ = raw_inference({'state': obs_36}, rng)
         return action
@@ -152,6 +165,48 @@ def load_survival_prior(pkl_path: str) -> Callable:
         _ = prior_fn(jax.numpy.zeros((1, 36), dtype=jax.numpy.float32))
 
     return prior_fn
+
+
+def load_survival_prior_value(pkl_path: str) -> Callable:
+    """Load the survival-prior CRITIC and return a jitted
+    `value_fn(obs_36) -> V (scalar per env)`.
+
+    V_prior(s) is the discounted survival time under the prior's policy
+    (reward = 1 if alive, 0 on hole-fall). With Brax PPO's default
+    gamma=0.99, V is bounded by 1/(1-gamma) = 100 in the limit of an
+    immortal trajectory; states a few steps from a fall have V close to
+    that step count. This is the signal the SOOPER 'prior_critic' risk
+    mode consumes.
+    """
+    import jax
+
+    factory, blob = _load_brax_factory(pkl_path)
+    # Brax PPO _save_checkpoint pickles params as
+    #   (normalizer_params, policy_params, value_params)
+    try:
+        normalizer_params, _policy_params, value_params = blob['params']
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"Unexpected params layout in {pkl_path}: expected a 3-tuple "
+            f"(normalizer, policy, value); got {type(blob['params'])}"
+        ) from e
+
+    with jax.transfer_guard('allow'):
+        # FeedForwardNetwork.apply signature in brax is
+        #   apply(processor_params, params, obs)
+        # where obs is the dict the value_obs_key points at.
+        value_apply = factory.value_network.apply
+
+    @jax.jit
+    def value_fn(obs_36):
+        v = value_apply(normalizer_params, value_params, {'state': obs_36})
+        # Brax value head returns shape (B, 1); squeeze to (B,).
+        return v.squeeze(-1) if v.ndim > 1 else v
+
+    with jax.transfer_guard('allow'):
+        _ = value_fn(jax.numpy.zeros((1, 36), dtype=jax.numpy.float32))
+
+    return value_fn
 
 
 # --------------------------------------------------------------------------
@@ -264,6 +319,83 @@ class PriorObsAdapter:
 
 
 # --------------------------------------------------------------------------
+# Risk sources — pluggable signals fed to the gate state machine
+# --------------------------------------------------------------------------
+
+RISK_MODES = ('cont_product', 'cont_max', 'prior_critic')
+
+
+class RiskSource(Protocol):
+    """Computes a per-env "danger" scalar in [0, 1] (higher = riskier).
+
+    Inputs are the agent's policy outputs (`out`, after popping anything
+    we don't want to leak to replay) and the prior-format obs already
+    built by PriorObsAdapter for the current step. Concrete sources may
+    use either or both.
+    """
+
+    name: str
+
+    def __call__(self, out: Dict[str, Any], prior_obs: np.ndarray) -> np.ndarray:
+        ...
+
+
+class ContProductRiskSource:
+    """`risk = 1 - prod_k c_phi(z_{t+k})` over the K-step OPAX imagination.
+
+    Bounded in [0, 1]. Multiplicative — sensitive to per-step c_phi bias.
+    """
+    name = 'cont_product'
+
+    def __call__(self, out, prior_obs):
+        return np.asarray(out['risk_cont_product'], dtype=np.float32)
+
+
+class ContMaxRiskSource:
+    """`risk = max_k (1 - c_phi(z_{t+k}))`.
+
+    Single worst-step over the imagined horizon. No multiplicative
+    blowup; one alarming step in the K imagined ones triggers fallback.
+    """
+    name = 'cont_max'
+
+    def __call__(self, out, prior_obs):
+        return np.asarray(out['risk_cont_max'], dtype=np.float32)
+
+
+class PriorCriticRiskSource:
+    """`risk = clip(1 - V_prior(o_t)/V_norm, 0, 1)`.
+
+    V_prior is the safe policy's value head; the switcher computes it
+    once (under transfer_guard) and hands it to this source via
+    `out['risk_critic']` so we don't double-evaluate. Naturally
+    infinite-horizon discounted, no imagination drift, evaluated on the
+    REAL current obs.
+    """
+    name = 'prior_critic'
+
+    def __call__(self, out, prior_obs):
+        if 'risk_critic' not in out:
+            raise RuntimeError(
+                "prior_critic risk_mode needs the switcher to populate "
+                "out['risk_critic'] (computed from value_fn). Was "
+                "PolicySwitcher constructed with value_fn=None?")
+        return np.asarray(out['risk_critic'], dtype=np.float32)
+
+
+def make_risk_source(mode: str) -> RiskSource:
+    """Factory for the configured risk source. Raises on unknown mode."""
+    if mode == 'cont_product':
+        return ContProductRiskSource()
+    if mode == 'cont_max':
+        return ContMaxRiskSource()
+    if mode == 'prior_critic':
+        return PriorCriticRiskSource()
+    raise ValueError(
+        f"Unknown sooper.risk_mode={mode!r}; expected one of {RISK_MODES}")
+
+
+# --------------------------------------------------------------------------
 # Pure-numpy gate state machine (laptop-testable; no JAX needed)
 # --------------------------------------------------------------------------
 
@@ -315,11 +447,19 @@ class PolicySwitcher:
     Cooldown blocks immediate re-trigger after release.
     """
 
-    def __init__(self, agent, prior_fn: Callable, adapter: PriorObsAdapter, cfg):
+    def __init__(self, agent, prior_fn: Callable, adapter: PriorObsAdapter,
+                 cfg, risk_source: RiskSource,
+                 value_fn: Callable | None = None):
         self.agent = agent
         self.prior_fn = prior_fn
         self.adapter = adapter
         self.cfg = cfg
+        self.risk_source = risk_source
+        # Optional value_fn kept around so we can ALWAYS log V alongside
+        # the cont signals, even when the active risk_mode isn't critic.
+        # That way a single run produces comparable histograms for all
+        # three sources without needing to repeat the experiment.
+        self._value_fn = value_fn
         self.prior_active = None    # bool[B]
         self.hold_count = None      # int32[B]
         self.cooldown = None        # int32[B]
@@ -332,12 +472,17 @@ class PolicySwitcher:
 
     def _gate_log(self, prior_active: np.ndarray, risk: np.ndarray,
                   triggered: np.ndarray, released: np.ndarray,
-                  hard_released: np.ndarray) -> Dict[str, np.ndarray]:
+                  hard_released: np.ndarray,
+                  extra_signals: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """Per-env log entries. The driver/logfn aggregates each
         `log/...` key as avg/max/sum per episode. We use float32 for all
         of them so the aggregation is well-defined.
+
+        `risk` is the active source (drives the gate); `extra_signals`
+        carries the OTHER risk signals so a single run produces
+        comparable histograms across sources.
         """
-        return {
+        log = {
             'log/gate/prior_active':  prior_active.astype(np.float32),
             'log/gate/risk_horizon':  risk.astype(np.float32),
             'log/gate/triggered':     triggered.astype(np.float32),
@@ -346,6 +491,9 @@ class PolicySwitcher:
             'log/gate/hold_count':    self.hold_count.astype(np.float32),
             'log/gate/cooldown':      self.cooldown.astype(np.float32),
         }
+        for name, arr in extra_signals.items():
+            log[f'log/gate/{name}'] = arr.astype(np.float32)
+        return log
 
     def __call__(self, carry, obs, **kwargs):
         # Lazy-imported here so module import doesn't pull in JAX (lets
@@ -373,15 +521,19 @@ class PolicySwitcher:
         kwargs = {k: v for k, v in kwargs.items() if k != 'mode'}
         carry, opax_act_dict, out = self.agent.policy(
             carry, obs, mode='sooper', **kwargs)
-        if 'risk' not in out:
-            raise RuntimeError(
-                "Expected agent.policy(mode='sooper') to populate out['risk']."
-                " Was Agent.policy() patched with the SOOPER branch?")
-        # Pop risk so it doesn't flow into the driver's `trans` dict and
-        # land in the replay buffer with an unrecognized schema key. We
-        # re-emit it as 'log/gate/risk_horizon' below where logfn picks
-        # it up automatically.
-        risk_np = np.asarray(out.pop('risk')).astype(np.float32)  # (B,)
+        # Pop both cont signals so they don't flow into the driver's
+        # `trans` dict (replay rejects unknown keys). They re-emerge
+        # below as 'log/gate/risk_cont_*' for logging.
+        for key in ('risk_cont_product', 'risk_cont_max'):
+            if key not in out:
+                raise RuntimeError(
+                    f"Expected agent.policy(mode='sooper') to populate "
+                    f"out[{key!r}]. Was Agent.policy() patched with the "
+                    f"new SOOPER branch?")
+        risk_cont_product = np.asarray(
+            out.pop('risk_cont_product'), dtype=np.float32)  # (B,)
+        risk_cont_max = np.asarray(
+            out.pop('risk_cont_max'), dtype=np.float32)      # (B,)
 
         # OPAX action shape conventions in Dreamer: dict {key: (B, A)}.
         opax_act_np = jax.tree.map(np.asarray, opax_act_dict)
@@ -411,7 +563,30 @@ class PolicySwitcher:
             prior_act_np = np.asarray(
                 self.prior_fn(jnp.asarray(prior_obs)))
 
-        # 4. Pure-numpy state machine. Trigger and release ONLY on p(cont).
+        # 3b. Compute the critic signal once when value_fn is available
+        # (reused for both the gate and the logs), then build the source
+        # input dict with all candidate signals so the active source can
+        # pick its own.
+        signals_for_source: Dict[str, np.ndarray] = {
+            'risk_cont_product': risk_cont_product,
+            'risk_cont_max':     risk_cont_max,
+        }
+        log_signals: Dict[str, np.ndarray] = {
+            'risk_cont_product': risk_cont_product,
+            'risk_cont_max':     risk_cont_max,
+        }
+        if self._value_fn is not None:
+            with jax.transfer_guard('allow'):
+                V = np.asarray(self._value_fn(jnp.asarray(prior_obs)),
+                               dtype=np.float32)
+            V_norm = float(getattr(self.cfg, 'V_norm', 100.0))
+            risk_critic = np.clip(1.0 - V / V_norm, 0.0, 1.0).astype(np.float32)
+            signals_for_source['risk_critic'] = risk_critic
+            log_signals['V_prior'] = V
+            log_signals['risk_critic'] = risk_critic
+        risk_np = self.risk_source(signals_for_source, prior_obs)
+
+        # 4. Pure-numpy state machine. Trigger/release on the active risk.
         (new_active, new_hold, new_cool,
          triggered_flag, released_flag, hard_released_flag) = gate_step(
             self.prior_active, self.hold_count, self.cooldown, risk_np,
@@ -437,5 +612,6 @@ class PolicySwitcher:
         out.update(self._gate_log(
             self.prior_active, risk_np,
             triggered_flag, released_flag, hard_released_flag,
+            log_signals,
         ))
         return new_carry, acts, out

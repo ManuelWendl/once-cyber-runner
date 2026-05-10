@@ -190,16 +190,28 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
     # Try both — first form for cluster runs, second for laptop.
     try:
       from dreamerv3.sooper import (
-          PolicySwitcher, PriorObsAdapter, load_survival_prior,
+          PolicySwitcher, PriorObsAdapter,
+          load_survival_prior, load_survival_prior_value, make_risk_source,
       )
     except ImportError:
       from dreamerv3.dreamerv3.sooper import (  # type: ignore[no-redef]
-          PolicySwitcher, PriorObsAdapter, load_survival_prior,
+          PolicySwitcher, PriorObsAdapter,
+          load_survival_prior, load_survival_prior_value, make_risk_source,
       )
-    print(f'[sooper] enabled — prior_pkl={sooper_cfg.prior_pkl}', flush=True)
+    risk_mode = getattr(sooper_cfg, 'risk_mode', 'cont_product')
+    print(f'[sooper] enabled — prior_pkl={sooper_cfg.prior_pkl} '
+          f'risk_mode={risk_mode}', flush=True)
     prior_fn = load_survival_prior(sooper_cfg.prior_pkl)
+    # Always load the critic — costs ~1 MLP forward per step but gives us
+    # V_prior and risk_critic in the logs alongside the cont signals so a
+    # single run produces comparable histograms for all three risk sources.
+    value_fn = load_survival_prior_value(sooper_cfg.prior_pkl)
+    risk_source = make_risk_source(risk_mode)
     adapter = PriorObsAdapter(num_envs=args.envs)
-    policy = PolicySwitcher(agent, prior_fn, adapter, sooper_cfg)
+    policy = PolicySwitcher(
+        agent, prior_fn, adapter, sooper_cfg,
+        risk_source=risk_source, value_fn=value_fn,
+    )
   else:
     policy = lambda *args: agent.policy(*args, mode='train')
   driver.reset(agent.init_policy)

@@ -97,9 +97,18 @@ defaults:
   sooper:
     enabled: False
     prior_pkl: ''       # absolute path to survival prior best.pkl
-    K: 10               # imagination horizon for risk_horizon
-    tau_high: 0.3       # trigger threshold (OPAX → prior)
-    tau_low: 0.1        # release threshold (prior → OPAX)
+    K: 10               # imagination horizon for cont-derived risks
+    # Risk source for the gate trigger. The agent ALWAYS computes the cont
+    # signals (cheap relative to the OPAX policy) and the switcher logs all
+    # three (cont_product, cont_max, critic) every step regardless of mode,
+    # so a single run gives comparison data across all sources.
+    #   cont_product : 1 - prod_k c_phi(z_{t+k})   (legacy default)
+    #   cont_max     : max_k (1 - c_phi(z_{t+k}))  (no multiplicative blowup)
+    #   prior_critic : clip(1 - V_prior(o_t)/V_norm, 0, 1)
+    risk_mode: cont_product
+    V_norm: 100.0       # ≈ 1/(1-gamma) for gamma=0.99; maps V to [0,1] danger
+    tau_high: 0.3       # trigger threshold (mode-specific units; tune per mode)
+    tau_low: 0.1        # release threshold (mode-specific units; tune per mode)
     H_min: 300          # ≥ 5 s @ 60 Hz — minimum hold per project memory
     H_max: 600          # hard release ceiling (≈ 10 s)
     cooldown: 60        # ≈ 1 s post-release lockout

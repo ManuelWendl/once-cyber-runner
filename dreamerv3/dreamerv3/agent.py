@@ -172,7 +172,10 @@ class Agent(embodied.jax.Agent):
       _, feat_imag, _ = self.dyn.imagine(
           dyn_carry, actor_fn, length=K, training=False)
       cont_probs = self.con(self.feat2tensor(feat_imag), bdims=2).prob(1)
-      out['risk'] = 1.0 - jnp.prod(cont_probs, axis=1)            # (B,)
+      # Expose both cont-derived risks so the PolicySwitcher can pick one
+      # at runtime (and log all of them simultaneously for comparison).
+      out['risk_cont_product'] = 1.0 - jnp.prod(cont_probs, axis=1)  # (B,)
+      out['risk_cont_max'] = jnp.max(1.0 - cont_probs, axis=1)        # (B,)
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:
       out.update(elements.tree.flatdict(dict(
