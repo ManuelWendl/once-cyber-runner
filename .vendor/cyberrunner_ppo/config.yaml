@@ -32,6 +32,12 @@ env:
   tilt_bumps: false
   tilt_bump_prob: 0.01           # per-step probability of a bump
   tilt_bump_magnitude: 0.05      # fraction of half-joint-range
+  # Per-episode physics randomization for sim-to-real transfer (see
+  # domain_randomization.py). When true, every reset resamples actuator
+  # gear/dynprm, joint damping/frictionloss, marble friction/mass/inertia
+  # and solref by a multiplicative factor in [1-pct, 1+pct]. Off by default.
+  domain_randomization: false
+  domain_randomization_pct: 0.15
 
 training:
   num_timesteps: 100_000_000

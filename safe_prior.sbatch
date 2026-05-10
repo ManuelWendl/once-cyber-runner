@@ -14,6 +14,9 @@
 #   TILT_BUMPS        "1" to enable random mid-episode tilt bumps.
 #   TILT_BUMP_PROB    per-step bump probability.
 #   TILT_BUMP_MAG     bump magnitude (fraction of half-joint-range).
+#   DOMAIN_RANDOMIZATION  "1" to enable per-episode physics randomization
+#                         (sim-to-real). Empty/0 → use config default.
+#   DOMAIN_RAND_PCT   ±fraction for DR (e.g. 0.15 for ±15%).
 #   RUN_NAME          custom subdir under checkpoints/ for this run.
 #   RESUME            absolute path to a prior best.pkl/final.pkl to warm-start
 #                     from (curriculum fine-tuning). Optimizer state restarts.
@@ -66,6 +69,10 @@ if [[ "${TILT_BUMPS:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--tilt-bumps)
   [[ -n "${TILT_BUMP_PROB:-}" ]] && EXTRA_ARGS+=(--tilt-bump-prob "$TILT_BUMP_PROB")
   [[ -n "${TILT_BUMP_MAG:-}" ]]  && EXTRA_ARGS+=(--tilt-bump-magnitude "$TILT_BUMP_MAG")
+fi
+if [[ "${DOMAIN_RANDOMIZATION:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--domain-randomization)
+  [[ -n "${DOMAIN_RAND_PCT:-}" ]] && EXTRA_ARGS+=(--domain-randomization-pct "$DOMAIN_RAND_PCT")
 fi
 [[ -n "${RUN_NAME:-}" ]]     && EXTRA_ARGS+=(--run-name      "$RUN_NAME")
 [[ -n "${RESUME:-}" ]]       && EXTRA_ARGS+=(--resume        "$RESUME")

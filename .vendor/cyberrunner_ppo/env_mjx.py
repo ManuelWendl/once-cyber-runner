@@ -39,6 +39,24 @@ from env_mujoco import (
     get_hard_layout,
     get_layout,
 )
+from domain_randomization import DomainRandomizer
+
+
+# Fields randomized by DomainRandomizer.randomize. Stored in state.info as
+# per-env tensors when domain_randomization=True, then re-applied on top of
+# self.mjx_model at every step via .replace(**dr_params). Only these leaves
+# get vmapped per env — the rest of the model stays shared (closure constant),
+# which keeps the per-env memory cost to a few hundred floats.
+_DR_FIELDS: Tuple[str, ...] = (
+    "actuator_gear",
+    "actuator_dynprm",
+    "dof_damping",
+    "dof_frictionloss",
+    "geom_friction",
+    "body_mass",
+    "body_inertia",
+    "geom_solref",
+)
 
 
 # ============================================================================
@@ -410,6 +428,8 @@ class CyberrunnerMJXEnv(envs.Env):
         tilt_bumps: bool = False,
         tilt_bump_prob: float = 0.0,
         tilt_bump_magnitude: float = 0.0,
+        domain_randomization: bool = False,
+        domain_randomization_pct: float = 0.15,
     ):
         self.episode_length = episode_length
         self.randomize_init_pos = randomize_init_pos
@@ -457,6 +477,18 @@ class CyberrunnerMJXEnv(envs.Env):
         self.tilt_bumps = bool(tilt_bumps)
         self.tilt_bump_prob = float(tilt_bump_prob)
         self.tilt_bump_magnitude = float(tilt_bump_magnitude)
+        # Domain randomization: per-episode ±pct multiplicative noise on a fixed
+        # set of physics parameters (actuator gear/dynprm, joint damping/friction,
+        # marble friction/mass/inertia/solref). Sampled at reset, fixed for the
+        # whole episode. Compile-time branch via static_argnums=(0,) — costs
+        # nothing when disabled. See domain_randomization.py.
+        self.domain_randomization = bool(domain_randomization)
+        self.domain_randomization_pct = float(domain_randomization_pct)
+        self._randomizer = (
+            DomainRandomizer(randomization_percent=self.domain_randomization_pct)
+            if self.domain_randomization
+            else None
+        )
         self._range_alpha_lo = float(RANGE_ALPHA[0])
         self._range_alpha_hi = float(RANGE_ALPHA[1])
         self._range_beta_lo = float(RANGE_BETA[0])
@@ -704,6 +736,19 @@ class CyberrunnerMJXEnv(envs.Env):
 
         mjx_data = self._make_data()
 
+        # Domain randomization: sample per-episode physics. Returns a dict of
+        # randomized leaves (small arrays); the rest of the model stays in the
+        # closure constant `self.mjx_model`. The dict is stashed in info and
+        # re-applied at every step via `self.mjx_model.replace(**dr_params)`.
+        if self.domain_randomization:
+            rng, k_dr = jax.random.split(rng)
+            rand_model = self._randomizer.randomize(self.mjx_model, k_dr)
+            dr_params = {k: getattr(rand_model, k) for k in _DR_FIELDS}
+            ep_model = rand_model
+        else:
+            dr_params = None
+            ep_model = self.mjx_model
+
         # Initial marble position (uniform over waypoints when randomize_init_pos)
         if self.randomize_init_pos:
             idx = jax.random.randint(k_init, (), 0, self._num_waypoints)
@@ -744,7 +789,7 @@ class CyberrunnerMJXEnv(envs.Env):
         else:
             mjx_data = mjx_data.replace(qpos=qpos)
 
-        mjx_data = mjx.forward(self.mjx_model, mjx_data)
+        mjx_data = mjx.forward(ep_model, mjx_data)
 
         # Per-episode bias (frozen for whole episode), env_mujoco.py L949-952
         obs_bias_ball = jax.random.uniform(
@@ -808,6 +853,12 @@ class CyberrunnerMJXEnv(envs.Env):
             "had_hole": jnp.float32(0.0),
             "visited_seg_mask": jnp.zeros(self._num_waypoints - 1, dtype=jnp.bool_),
         }
+        # Per-episode physics params, vmapped per env by VmapWrapper. Only added
+        # when DR is on so the AutoReset wrapper sees consistent info schemas
+        # across reset()/step() (the static `self.domain_randomization` keeps
+        # both branches identical at trace time).
+        if self.domain_randomization:
+            info["dr_params"] = dr_params
         metrics = {
             "reward": jnp.float32(0.0),
             "path_progress": prev_progress,
@@ -829,6 +880,15 @@ class CyberrunnerMJXEnv(envs.Env):
     def step(self, state: envs.State, action: jnp.ndarray) -> envs.State:
         action = jnp.clip(action, -1.0, 1.0)
         mjx_data = state.pipeline_state.replace(ctrl=action)
+
+        # Pick the model: when DR is on, rebuild a per-env model by overlaying
+        # the per-episode randomized leaves stored in info onto the shared
+        # closure model. Only the small DR fields are vmapped; the rest stays
+        # un-vmapped via the closure, keeping per-env memory tiny.
+        if self.domain_randomization:
+            ep_model = self.mjx_model.replace(**state.info["dr_params"])
+        else:
+            ep_model = self.mjx_model
 
         # Optional mid-episode tilt bumps: random additive perturbation on
         # joint angles before the physics scan. Compile-time branch via
@@ -857,7 +917,7 @@ class CyberrunnerMJXEnv(envs.Env):
 
         # Step physics FRAME_SKIP times via scan (avoids unrolled compile bloat)
         def physics_step(d, _):
-            return mjx.step(self.mjx_model, d), None
+            return mjx.step(ep_model, d), None
 
         mjx_data, _ = jax.lax.scan(physics_step, mjx_data, None, length=FRAME_SKIP)
 

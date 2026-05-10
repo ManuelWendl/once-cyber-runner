@@ -89,6 +89,14 @@ def parse_args():
                    choices=["easy", "medium", "hard"],
                    default=None,
                    help="Override env.maze_layout (selects polyline + walls + holes).")
+    p.add_argument("--domain-randomization",
+                   dest="domain_randomization", action="store_true", default=None,
+                   help="Enable per-episode physics randomization (sim-to-real).")
+    p.add_argument("--no-domain-randomization",
+                   dest="domain_randomization", action="store_false", default=None,
+                   help="Disable per-episode physics randomization.")
+    p.add_argument("--domain-randomization-pct", type=float, default=None,
+                   help="Override env.domain_randomization_pct (e.g. 0.15 for ±15%%).")
     return p.parse_args()
 
 
@@ -147,6 +155,10 @@ def main():
         config["training"]["brax_ppo"]["entropy_cost"] = args.entropy_cost
     if args.maze_layout is not None:
         config["env"]["maze_layout"] = args.maze_layout
+    if args.domain_randomization is not None:
+        config["env"]["domain_randomization"] = args.domain_randomization
+    if args.domain_randomization_pct is not None:
+        config["env"]["domain_randomization_pct"] = args.domain_randomization_pct
 
     if args.debug:
         config["env"]["num_envs"] = 256
@@ -223,6 +235,9 @@ def main():
     if config['env'].get('tilt_bumps', False):
         print(f"  tilt_bump_prob:  {config['env'].get('tilt_bump_prob', 0.0)}")
         print(f"  tilt_bump_mag:   {config['env'].get('tilt_bump_magnitude', 0.0)}")
+    print(f"  domain_random:   {config['env'].get('domain_randomization', False)}")
+    if config['env'].get('domain_randomization', False):
+        print(f"  domain_rand_pct: {config['env'].get('domain_randomization_pct', 0.15)}")
     print(f"  learning_rate:   {config['training']['brax_ppo']['learning_rate']:.2e}")
     print(f"  entropy_cost:    {config['training']['brax_ppo']['entropy_cost']:.2e}")
     print("=" * 60)
@@ -243,6 +258,8 @@ def main():
         tilt_bumps=config["env"].get("tilt_bumps", False),
         tilt_bump_prob=config["env"].get("tilt_bump_prob", 0.0),
         tilt_bump_magnitude=config["env"].get("tilt_bump_magnitude", 0.0),
+        domain_randomization=config["env"].get("domain_randomization", False),
+        domain_randomization_pct=config["env"].get("domain_randomization_pct", 0.15),
     )
     print(f"  mjx backend:     {env._mjx_impl}")
     print(f"  obs size:        {env.observation_size}")
