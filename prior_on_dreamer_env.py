@@ -370,8 +370,12 @@ def main() -> None:
             cpu_term[tr_cpu["termination"]] = cpu_term.get(tr_cpu["termination"], 0) + 1
             cpu_steps[tr_cpu["termination"]].append(tr_cpu["steps"])
             cpu_trajs.append(tr_cpu)
+            # qpos[0] of the rollout buffer is the spawn (set by _force_cpu_state
+            # when paired with MJX, otherwise by env.reset). Final position is
+            # cpu_env.data.qpos[2:4] but we want to show the spawn here.
+            spawn_xy = tr_cpu["qpos"][0]
             print(
-                f"  CPU  spawn=({cpu_env.data.qpos[2]:.3f},{cpu_env.data.qpos[3]:.3f}) "
+                f"  CPU  spawn=({spawn_xy[2]:.3f},{spawn_xy[3]:.3f}) "
                 f"steps={tr_cpu['steps']:4d} term={tr_cpu['termination']:8s} "
                 f"({time.time()-t0:.1f}s)"
             )
