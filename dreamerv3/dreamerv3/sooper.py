@@ -108,6 +108,7 @@ def _load_brax_factory(pkl_path: str) -> Tuple[Any, Any]:
     hidden = tuple(net_cfg['hidden_sizes'])
 
     try:
+        from brax.training.acme import running_statistics
         from brax.training.agents.ppo import networks as ppo_networks
     except ImportError as e:  # pragma: no cover — env-specific
         raise ImportError(
@@ -126,10 +127,22 @@ def _load_brax_factory(pkl_path: str) -> Tuple[Any, Any]:
     # Allow transfers locally just for this one-time setup; the jitted
     # prior_fn below doesn't introduce any new transfers and stays subject
     # to the global guard.
+    #
+    # `observation_size` MUST be the dict form `{"state": (36,)}` (not a
+    # bare `36`) so the running-stats normalizer is keyed by "state" the
+    # same way the vendor's train.py trained it. `preprocess_observations_fn`
+    # MUST be `running_statistics.normalize` because the prior was trained
+    # with `normalize_observations=True` (vendor train.py / config.yaml).
+    # Without normalization the policy receives raw obs with non-zero means
+    # and outputs garbage actions with a strong directional bias — that was
+    # the root cause of the SOOPER gate's "marble dies in every fallback"
+    # behaviour and of prior_on_dreamer_env.py's 40% hole rate. The fix
+    # mirrors render_safe_prior.build_policy, which has always worked.
     with jax.transfer_guard('allow'):
         factory = ppo_networks.make_ppo_networks(
-            observation_size=36,
+            observation_size={'state': (36,)},
             action_size=2,
+            preprocess_observations_fn=running_statistics.normalize,
             policy_hidden_layer_sizes=hidden,
             value_hidden_layer_sizes=hidden,
             activation=activation,
