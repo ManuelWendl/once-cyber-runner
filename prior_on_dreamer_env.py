@@ -42,7 +42,7 @@ sys.path.insert(0, str(VENDOR_DIR))
 
 # cyberrunner_env_vision.py lives at the repo root — same module DreamerV3's
 # embodied wrapper imports.
-from cyberrunner_env_vision import CyberRunnerEnv  # noqa: E402
+from cyberrunner_env_vision import CyberRunnerEnv, compute_path_progress  # noqa: E402
 
 # env_mjx is the vendored MJX env the prior was trained on.
 from env_mjx import CyberrunnerMJXEnv  # noqa: E402
@@ -99,17 +99,53 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _force_cpu_state(
+    env: CyberRunnerEnv,
+    qpos: np.ndarray,
+    qvel: np.ndarray,
+) -> Dict[str, Any]:
+    """Overwrite the CPU env's MuJoCo state with the given qpos/qvel,
+    recompute derived quantities + the env's internal trackers, and
+    return a fresh obs from `_get_obs()`. Call AFTER `env.reset(seed=...)`
+    so per-episode obs_bias has been sampled.
+    """
+    import mujoco
+
+    env.data.qpos[:] = qpos
+    env.data.qvel[:] = qvel
+    mujoco.mj_forward(env.model, env.data)
+    env._step_count = 0
+    ball_pos = env._get_ball_pos_board_frame()
+    progress, env._seg_idx, _, env._closest_point = compute_path_progress(
+        ball_pos, env.waypoints, env.seg_lengths, env.cum_distances,
+        env.walls_h, env.walls_v, env.holes,
+    )
+    env._prev_progress = progress
+    env._path_detected = progress >= 0
+    return env._get_obs()
+
+
 def rollout_cpu(
     env: CyberRunnerEnv,
     prior_fn,
     adapter: PriorObsAdapter,
     seed: int,
     max_steps: int,
+    spawn_qpos: np.ndarray | None = None,
+    spawn_qvel: np.ndarray | None = None,
 ) -> Dict[str, Any]:
-    """Run one CPU-env episode driven by prior_fn(adapter(obs))."""
+    """Run one CPU-env episode driven by prior_fn(adapter(obs)).
+
+    If `spawn_qpos`/`spawn_qvel` are provided, the CPU env's physical
+    state is overwritten with them after reset (so the rollout shares a
+    byte-identical spawn with another env). The per-episode obs_bias is
+    sampled by env.reset() before the override and kept.
+    """
     import jax.numpy as jnp
 
     obs, _ = env.reset(seed=seed)
+    if spawn_qpos is not None:
+        obs = _force_cpu_state(env, spawn_qpos, spawn_qvel)
     adapter.reset_envs(np.array([True]))
     prev_action = np.zeros(2, dtype=np.float32)
 
@@ -149,13 +185,16 @@ def rollout_mjx(
 ) -> Dict[str, Any]:
     """Run one env_mjx episode driven by the prior reading the env's
     native 36-dim obs. Same prior network as rollout_cpu — only the
-    obs construction differs."""
+    obs construction differs. Returns the spawn qpos/qvel so a paired
+    CPU rollout can be forced to the same physical start."""
     import jax
     import jax.numpy as jnp
 
     state = env.reset(jax.random.PRNGKey(seed))
-    qpos_buf: List[np.ndarray] = [np.asarray(state.pipeline_state.qpos)]
-    qvel_buf: List[np.ndarray] = [np.asarray(state.pipeline_state.qvel)]
+    spawn_qpos = np.asarray(state.pipeline_state.qpos).copy()
+    spawn_qvel = np.asarray(state.pipeline_state.qvel).copy()
+    qpos_buf: List[np.ndarray] = [spawn_qpos.copy()]
+    qvel_buf: List[np.ndarray] = [spawn_qvel.copy()]
     termination = "timeout"
     steps = 0
 
@@ -178,6 +217,8 @@ def rollout_mjx(
         "qvel": np.stack(qvel_buf),
         "termination": termination,
         "steps": steps,
+        "spawn_qpos": spawn_qpos,
+        "spawn_qvel": spawn_qvel,
     }
 
 
@@ -248,21 +289,30 @@ def main() -> None:
     adapter = None
 
     if not args.skip_cpu:
-        print("\nBuilding CPU CyberRunnerEnv (randomize_init_pos=False) ...")
+        # CPU env: when paired with MJX we'll force its physical state to
+        # match MJX's random spawn (randomize_init_pos doesn't matter).
+        # When running CPU alone (--skip-mjx), let it pick its own random
+        # waypoint so we still get spawn diversity.
+        cpu_randomize = bool(args.skip_mjx)
+        print(f"\nBuilding CPU CyberRunnerEnv (randomize_init_pos={cpu_randomize}) ...")
         cpu_env = CyberRunnerEnv(
             layout=layout,
             episode_length=args.episode_length,
-            randomize_init_pos=False,
+            randomize_init_pos=cpu_randomize,
             include_vision=False,
         )
         adapter = PriorObsAdapter(num_envs=1)
         print(f"  states_dim={cpu_env.observation_space['states'].shape}")
 
     if not args.skip_mjx:
-        print("Building env_mjx (randomize_init_pos=False, training-time init noise) ...")
+        print("Building env_mjx (randomize_init_pos=True, training-time init noise) ...")
         mjx_env = CyberrunnerMJXEnv(
             episode_length=args.episode_length,
-            randomize_init_pos=False,
+            # Match the training distribution: random waypoint spawn + safe-prior
+            # init tilt + ball velocity. The CPU rollout below is forced to
+            # whatever physical state env_mjx ends up in, so the pair starts
+            # byte-identically and only the per-step noise RNG differs.
+            randomize_init_pos=True,
             num_envs_hint=1,
             history_length=env_cfg.get("history_length", 5),
             maze_layout=layout,
@@ -294,21 +344,37 @@ def main() -> None:
         seed_i = int(rng.integers(0, 2**31 - 1))
         print(f"\n=== episode {ep+1}/{args.episodes} (seed={seed_i}) ===")
 
-        if cpu_env is not None:
-            t0 = time.time()
-            tr = rollout_cpu(cpu_env, prior_fn, adapter, seed_i, args.episode_length)
-            cpu_term[tr["termination"]] = cpu_term.get(tr["termination"], 0) + 1
-            cpu_steps[tr["termination"]].append(tr["steps"])
-            cpu_trajs.append(tr)
-            print(f"  CPU  steps={tr['steps']:4d} term={tr['termination']:8s} ({time.time()-t0:.1f}s)")
-
+        # Run env_mjx FIRST so the CPU rollout can be forced to the same
+        # spawn (random waypoint + safe-prior init tilt + velocity).
+        spawn_qpos = spawn_qvel = None
         if mjx_env is not None:
             t0 = time.time()
-            tr = rollout_mjx(mjx_env, prior_fn, seed_i, args.episode_length)
-            mjx_term[tr["termination"]] = mjx_term.get(tr["termination"], 0) + 1
-            mjx_steps[tr["termination"]].append(tr["steps"])
-            mjx_trajs.append(tr)
-            print(f"  MJX  steps={tr['steps']:4d} term={tr['termination']:8s} ({time.time()-t0:.1f}s)")
+            tr_mjx = rollout_mjx(mjx_env, prior_fn, seed_i, args.episode_length)
+            mjx_term[tr_mjx["termination"]] = mjx_term.get(tr_mjx["termination"], 0) + 1
+            mjx_steps[tr_mjx["termination"]].append(tr_mjx["steps"])
+            mjx_trajs.append(tr_mjx)
+            spawn_qpos = tr_mjx["spawn_qpos"]
+            spawn_qvel = tr_mjx["spawn_qvel"]
+            print(
+                f"  MJX  spawn=({spawn_qpos[2]:.3f},{spawn_qpos[3]:.3f}) "
+                f"steps={tr_mjx['steps']:4d} term={tr_mjx['termination']:8s} "
+                f"({time.time()-t0:.1f}s)"
+            )
+
+        if cpu_env is not None:
+            t0 = time.time()
+            tr_cpu = rollout_cpu(
+                cpu_env, prior_fn, adapter, seed_i, args.episode_length,
+                spawn_qpos=spawn_qpos, spawn_qvel=spawn_qvel,
+            )
+            cpu_term[tr_cpu["termination"]] = cpu_term.get(tr_cpu["termination"], 0) + 1
+            cpu_steps[tr_cpu["termination"]].append(tr_cpu["steps"])
+            cpu_trajs.append(tr_cpu)
+            print(
+                f"  CPU  spawn=({cpu_env.data.qpos[2]:.3f},{cpu_env.data.qpos[3]:.3f}) "
+                f"steps={tr_cpu['steps']:4d} term={tr_cpu['termination']:8s} "
+                f"({time.time()-t0:.1f}s)"
+            )
 
     n = args.episodes
     if cpu_env is not None:
