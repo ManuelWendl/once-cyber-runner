@@ -267,15 +267,23 @@ class PriorObsAdapter:
         self._history = np.zeros(
             (self.num_envs, HISTORY_LENGTH, FRAME_DIM), dtype=np.float32,
         )
+        # Envs that were just reset and need their next transform() to
+        # TILE the new frame across all 5 history slots (matching how
+        # env_mjx.py seeds history at reset: `jnp.tile(frame0, (H, 1))`).
+        # Without this, the prior's first ~H actions read from a history
+        # with 4 zero frames + 1 real frame — OOD vs its training data
+        # and a likely source of the SOOPER directional-bias bug.
+        self._needs_prefill = np.zeros(self.num_envs, dtype=bool)
 
     def reset_envs(self, mask: np.ndarray) -> None:
-        """Zero the history for envs where `mask[i] == True` (e.g. on
-        is_first). Match what env_mjx.py does on reset (frame0 with
-        zero action tiled HISTORY_LENGTH times).
+        """Mark envs where `mask[i] == True` for tile-prefill on their
+        next transform() call. We can't pre-fill here because we don't
+        have the spawn frame yet — that arrives in the next transform().
         """
         if not mask.any():
             return
         self._history[mask] = 0.0
+        self._needs_prefill[mask] = True
 
     def transform(self, obs: Dict[str, Any], prev_action: np.ndarray) -> np.ndarray:
         """Build the 36-dim Brax prior obs.
@@ -308,10 +316,25 @@ class PriorObsAdapter:
         new_frame = np.concatenate(
             [alpha, beta, ball_xy, pa], axis=-1
         ).astype(np.float32)                                   # (B, 6)
-        # Roll the ring buffer.
-        self._history = np.concatenate(
-            [self._history[:, 1:], new_frame[:, None, :]], axis=1
-        )                                                      # (B, H, 6)
+        # Pre-fill on the first call after reset: tile the new frame
+        # across all H history slots, matching env_mjx's spawn-frame
+        # tiling. Other envs use the normal ring-buffer roll.
+        if self._needs_prefill.any():
+            prefill = self._needs_prefill
+            # (M, 6) -> (M, H, 6) by repeating along axis=1
+            tiled = np.repeat(new_frame[prefill, None, :], HISTORY_LENGTH, axis=1)
+            self._history[prefill] = tiled
+            self._needs_prefill[prefill] = False
+            keep = ~prefill
+            if keep.any():
+                self._history[keep] = np.concatenate(
+                    [self._history[keep, 1:], new_frame[keep, None, :]],
+                    axis=1,
+                )
+        else:
+            self._history = np.concatenate(
+                [self._history[:, 1:], new_frame[:, None, :]], axis=1
+            )                                                  # (B, H, 6)
         flat_history = self._history.reshape(self.num_envs, -1)  # (B, 30)
         prior_obs = np.concatenate(
             [flat_history, vec_close, vec_next, vec_nn], axis=-1,

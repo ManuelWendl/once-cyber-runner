@@ -187,14 +187,11 @@ def main() -> None:
 
     adapter = PriorObsAdapter(num_envs=1)
     adapter.reset_envs(np.array([True]))
-
-    # Match env_mjx's reset-time history initialisation: it tiles the
-    # spawn frame 5x. PriorObsAdapter starts with all zeros and rolls in.
-    # If we don't pre-fill, dims 0..23 will trivially diverge at step 1.
-    # Pre-fill by calling adapter.transform 5 times on the spawn obs +
-    # zero prev_action — same content env_mjx would have produced.
-    for _ in range(5):
-        adapter.transform({"states": obs["states"][None, :]}, np.zeros((1, 2), dtype=np.float32))
+    # PriorObsAdapter now tiles the spawn frame across all 5 history
+    # slots on the first transform() after reset_envs (matching
+    # env_mjx's `jnp.tile(frame0, (H, 1))` at reset). No manual
+    # pre-fill needed here — and if dims 0..29 diverge at step 1,
+    # the auto-tile is broken.
 
     # Sanity print: spawn-state physical readings from both sides.
     qpos_mjx = np.asarray(mjx_state.pipeline_state.qpos[:5])
