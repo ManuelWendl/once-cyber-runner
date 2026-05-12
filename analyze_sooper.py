@@ -253,6 +253,7 @@ def extract_intervals(eps: Dict[Tuple[int, int], List[Dict[str, Any]]]) -> List[
 
 
 DISTANCE_BUCKETS = [
+    "safe (timeout episode)",
     "safe (60+ before fall)",
     "30-60 before fall",
     "10-30 before fall",
@@ -262,30 +263,50 @@ DISTANCE_BUCKETS = [
 
 def _bucket_of(d: int) -> str:
     if d > 60:
-        return DISTANCE_BUCKETS[0]
-    if d > 30:
         return DISTANCE_BUCKETS[1]
-    if d > 10:
+    if d > 30:
         return DISTANCE_BUCKETS[2]
-    return DISTANCE_BUCKETS[3]
+    if d > 10:
+        return DISTANCE_BUCKETS[3]
+    return DISTANCE_BUCKETS[4]
 
 
 def distance_to_fall_buckets(eps, signals: List[str]) -> Dict[str, Dict[str, np.ndarray]]:
-    """For each terminated episode, bin steps by distance to terminal and
-    return per-bucket arrays for each signal. Steps where prior is driving
-    are EXCLUDED — we want the WM's natural risk reading, not perturbed by
-    gate intervention.
+    """Bin OPAX-driven steps by distance-to-fall.
+
+    Population is split into two cohorts of "safe" plus three pre-fall
+    distance buckets:
+      - "safe (timeout episode)"     — episodes that survived to timeout.
+                                       The cleanest no-fall sample.
+      - "safe (60+ before fall)"    — early/middle steps of episodes that
+                                       eventually fell. Often elevated
+                                       risk_critic vs. timeout episodes
+                                       because these episodes were near
+                                       the boundary throughout.
+      - 30-60 / 10-30 / 0-10 before fall — the doom approach in terminated
+                                            episodes.
+
+    Splitting both safe populations explicitly avoids the bias of treating
+    "safe-looking steps in doomed eps" as representative of all safe steps.
+    Steps where the prior is driving are excluded from every bucket — we
+    want the WM's natural risk reading, not the gate's perturbation.
     """
     buckets: Dict[str, List[Dict[str, Any]]] = {b: [] for b in DISTANCE_BUCKETS}
     for key, traj in eps.items():
-        if not traj[-1]["is_terminal"]:
-            continue
-        T = len(traj)
-        for r in traj:
-            if r["prior_active"]:
-                continue
-            d = T - 1 - r["step_in_ep"]
-            buckets[_bucket_of(d)].append(r)
+        last = traj[-1]
+        if last["is_terminal"]:
+            T = len(traj)
+            for r in traj:
+                if r["prior_active"]:
+                    continue
+                d = T - 1 - r["step_in_ep"]
+                buckets[_bucket_of(d)].append(r)
+        elif last.get("is_last"):
+            for r in traj:
+                if r["prior_active"]:
+                    continue
+                buckets["safe (timeout episode)"].append(r)
+        # Incomplete episodes (file ended mid-episode) are skipped.
     out: Dict[str, Dict[str, np.ndarray]] = {label: {} for label in buckets}
     for label, rs in buckets.items():
         for sig in signals:
@@ -296,7 +317,14 @@ def distance_to_fall_buckets(eps, signals: List[str]) -> Dict[str, Dict[str, np.
 
 def fp_detection_table(buckets: Dict[str, Dict[str, np.ndarray]], sig: str,
                         taus: Iterable[float]) -> None:
-    safe = buckets["safe (60+ before fall)"][sig]
+    # Pool both safe cohorts for an unbiased FP estimate. Previously only
+    # the 'safe (60+ before fall)' bucket was used, which excluded all
+    # timeout episodes — biasing the FP rate downward by ~25%.
+    safe_timeout = buckets["safe (timeout episode)"][sig]
+    safe_far = buckets["safe (60+ before fall)"][sig]
+    safe = np.concatenate([safe_timeout, safe_far]) if (
+        safe_timeout.size + safe_far.size > 0
+    ) else np.array([])
     near = buckets["10-30 before fall"][sig]
     doom = buckets["0-10 before fall (doom)"][sig]
     if min(safe.size, near.size, doom.size) == 0:
@@ -516,7 +544,7 @@ def plot_per_step(
     outdir.mkdir(parents=True, exist_ok=True)
 
     # ---- Calibration histograms (risk signals vs distance-to-fall) ----
-    bucket_colors = ["tab:blue", "tab:cyan", "tab:orange", "tab:red"]
+    bucket_colors = ["tab:green", "tab:blue", "tab:cyan", "tab:orange", "tab:red"]
     signals = [
         ("risk_cont_max", (0, 1), None),
         ("risk_cont_product", (0, 1), None),
