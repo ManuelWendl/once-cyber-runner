@@ -176,19 +176,17 @@ class Agent(embodied.jax.Agent):
       # at runtime (and log all of them simultaneously for comparison).
       out['risk_cont_product'] = 1.0 - jnp.prod(cont_probs, axis=1)  # (B,)
       out['risk_cont_max'] = jnp.max(1.0 - cont_probs, axis=1)        # (B,)
-      # One-step ensemble disagreement on the executed action — the
-      # epistemic uncertainty σ_n(s_t, a_t) used by the paper's
-      # pessimism penalty Q_pess = Q^π̃_c + λ·σ. Concat over act_space
-      # in sorted-key order so the dict-vs-array layout matches what
-      # the ensemble was trained against in loss_actor. Skip when no
-      # ensemble exists (exploration_reward='none'); cost-tracking gate
-      # will fall back to λ_pessimism=0 in that case.
-      if hasattr(self, 'ensemble'):
-        act_concat = jnp.concatenate(
-            [act[k] for k in sorted(act)], axis=-1) if isinstance(act, dict) \
-            else act
-        ens_preds = self.ensemble(self.feat2tensor(feat), act_concat)
-        out['sigma_disagreement'] = expl.disagreement(ens_preds)      # (B,)
+      # NOTE: σ_n(s_t, a_t) exposure intentionally omitted here. Calling
+      # self.ensemble(...) during policy() triggers Ninjax's "create new
+      # state outside init" guard during the train.py:228 warmup
+      # (driver(policy, steps=10) runs BEFORE any train_step, so the
+      # ensemble's lazily-created params don't exist yet). PolicySwitcher
+      # falls back to σ=0 when 'sigma_disagreement' is absent from out,
+      # which makes the λ_pessimism term identically zero — fine for the
+      # default config. Re-introduce σ later by either (a) computing it
+      # inside the imagination loop where the ensemble already runs, or
+      # (b) eager-initialising ensemble params before warmup data
+      # collection.
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:
       out.update(elements.tree.flatdict(dict(
