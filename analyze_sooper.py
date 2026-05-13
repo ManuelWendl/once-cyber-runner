@@ -12,9 +12,13 @@ Two subcommands matching the diagnostic passes used during Phase-3 tuning:
     python analyze_sooper.py per-step metrics/sooper_steps_v3.jsonl
 
 The macro pass prints:
-  - per-run summary (hole rate, coverage, gate trigger/release counts, V_prior
-    range, etc.)
-  - hole-rate-by-chunk and coverage-by-chunk tables across all files
+  - per-run summary including BOTH per-episode and per-step normalisations
+    (hole/goal counts per 100k env-steps + mean steps between fall/goal).
+    Per-step is the right unit for fixed-compute comparisons; per-episode
+    is the right unit for "given the marble is alive, will it fall?"
+  - hole-rate-by-chunk, holes-per-100k-by-chunk, goals-per-100k-by-chunk,
+    coverage-by-chunk tables across all files
+  - gate trigger/release counts, V_prior range, etc. (SOOPER runs only)
 
 The per-step pass prints:
   - episode termination breakdown (hole/timeout/incomplete)
@@ -61,6 +65,12 @@ def steps_col(rows: List[Dict[str, Any]], key: str) -> Tuple[np.ndarray, np.ndar
     return np.array(s), np.array(v, dtype=float)
 
 
+def total_env_steps(rows: List[Dict[str, Any]]) -> int:
+    """Return the env-step horizon covered by this metrics file."""
+    steps = [r["step"] for r in rows if "step" in r]
+    return int(max(steps)) if steps else 0
+
+
 # --------------------------------------------------------------------------
 # Macro analysis (one row per metrics flush window)
 # --------------------------------------------------------------------------
@@ -73,15 +83,49 @@ def report_macro(label: str, rows: List[Dict[str, Any]]) -> None:
     total = hole + goal + timeout
     cov = col(rows, "exploration/coverage")
     prog = col(rows, "exploration/mean_max_path_progress")
+    env_steps = total_env_steps(rows)
+
+    h_sum, g_sum, t_sum = float(hole.sum()), float(goal.sum()), float(timeout.sum())
+    e_sum = float(total.sum())
+
+    # Macro counts can come out fractional because event totals get averaged
+    # across the eval-window log flushes — print one decimal so a single goal
+    # logged as 0.33 doesn't round to 0 and disappear.
+    def _fmt(x: float) -> str:
+        return f"{x:.0f}" if abs(x - round(x)) < 1e-6 else f"{x:.2f}"
 
     print(f"\n=== {label} ===")
+    print(f"  env-steps: {env_steps:,}")
     print(
-        f"  episodes: tot={int(total.sum())} hole={int(hole.sum())} "
-        f"goal={int(goal.sum())} timeout={int(timeout.sum())}"
+        f"  episodes: tot={_fmt(e_sum)} hole={_fmt(h_sum)} "
+        f"goal={_fmt(g_sum)} timeout={_fmt(t_sum)}"
     )
-    if total.sum() > 0:
-        print(f"  hole rate:    {hole.sum() / total.sum():.3f}")
-        print(f"  timeout rate: {timeout.sum() / total.sum():.3f}")
+    if e_sum > 0:
+        print(f"  hole rate (per-episode):    {h_sum / e_sum:.3f}")
+        print(f"  goal rate (per-episode):    {g_sum / e_sum:.3f}")
+        print(f"  timeout rate (per-episode): {t_sum / e_sum:.3f}")
+        avg_len = env_steps / e_sum if e_sum > 0 else 0
+        print(f"  mean episode length:        {avg_len:.0f} env-steps")
+
+    # Per-step normalisation — fair comparison across runs with different
+    # episode-length distributions. Both metrics are reported because they
+    # answer different questions:
+    #   - hole_rate (per-episode): "given an episode, P(it falls)?"
+    #   - holes_per_100k: "fixed compute budget, # of fall events?"
+    # The latter is the relevant unit for Phase-4 world-model training and
+    # for the actual safety question ("how often does the marble die?").
+    if env_steps > 0:
+        per_100k = 100_000 / env_steps
+        h_100k = h_sum * per_100k
+        g_100k = g_sum * per_100k
+        steps_per_hole = env_steps / h_sum if h_sum > 0 else float("inf")
+        steps_per_goal = env_steps / g_sum if g_sum > 0 else float("inf")
+        print(f"  holes per 100k env-steps:   {h_100k:.1f}")
+        print(f"  goals per 100k env-steps:   {g_100k:.2f}")
+        print(f"  mean steps between falls:   {steps_per_hole:,.0f}")
+        if g_sum > 0:
+            print(f"  mean steps between goals:   {steps_per_goal:,.0f}")
+
     if len(cov):
         print(f"  final coverage (last 5):       {cov[-5:].mean():.3f}")
         print(f"  final max_path_progress (l5):  {prog[-5:].mean():.3f}")
@@ -159,6 +203,43 @@ def coverage_chunks(rows: List[Dict[str, Any]], n: int):
     return [v[c].mean() for c in chunks]
 
 
+def _events_per_100k_chunks(rows: List[Dict[str, Any]], key: str, n: int):
+    """Normalise an episode-event count by the env-step span of each chunk.
+
+    Returns the rate at which `key` events fire per 100k env-steps within
+    each equal slice of the run. Robust to runs where window-flush cadence
+    varies — divides by actual step delta inside the chunk.
+    """
+    s, v = steps_col(rows, key)
+    if len(s) == 0:
+        return None
+    order = np.argsort(s)
+    s_sorted = s[order]
+    v_sorted = v[order]
+    chunks = np.array_split(np.arange(len(s_sorted)), n)
+    out = []
+    for c in chunks:
+        if len(c) == 0:
+            out.append(0.0)
+            continue
+        # span = last step - first step in chunk; fall back to chunk-share
+        # of the global span if the chunk has only one window.
+        span = s_sorted[c[-1]] - s_sorted[c[0]] if len(c) > 1 else (
+            s_sorted[-1] / n
+        )
+        span = max(span, 1.0)
+        out.append(float(v_sorted[c].sum()) * 100_000.0 / span)
+    return out
+
+
+def holes_per_100k_chunks(rows: List[Dict[str, Any]], n: int):
+    return _events_per_100k_chunks(rows, "epstats/log/hole_terminated/sum", n)
+
+
+def goals_per_100k_chunks(rows: List[Dict[str, Any]], n: int):
+    return _events_per_100k_chunks(rows, "epstats/log/goal_terminated/sum", n)
+
+
 def prior_active_chunks(rows: List[Dict[str, Any]], n: int):
     s, v = steps_col(rows, "epstats/log/gate/prior_active/avg")
     if len(s) == 0:
@@ -191,7 +272,11 @@ def cmd_macro(args: argparse.Namespace) -> None:
     for label, rows in runs:
         report_macro(label, rows)
 
-    chunk_table("Hole rate by chunk", runs, hole_rate_chunks)
+    chunk_table("Hole rate by chunk (per-episode)", runs, hole_rate_chunks)
+    chunk_table("Holes per 100k env-steps by chunk", runs,
+                holes_per_100k_chunks, fmt=".1f")
+    chunk_table("Goals per 100k env-steps by chunk", runs,
+                goals_per_100k_chunks, fmt=".2f")
     chunk_table("Coverage by chunk", runs, coverage_chunks)
     chunk_table("max_path_progress by chunk", runs, progress_chunks)
     # Only meaningful for SOOPER runs; safe to print zeros for plain.
@@ -338,6 +423,23 @@ def fp_detection_table(buckets: Dict[str, Dict[str, np.ndarray]], sig: str,
         print(f"  {tau:>6.2f} {fp:>10.3f} {det_near:>12.3f} {det_doom:>12.3f}")
 
 
+def cmd_report(args: argparse.Namespace) -> None:
+    runs = []
+    for path in args.files:
+        p = Path(path)
+        if not p.is_file():
+            print(f"WARNING: {p} not found, skipping", file=sys.stderr)
+            continue
+        runs.append((p.stem, load_jsonl(p)))
+    if not runs:
+        raise SystemExit("No metrics files loaded.")
+    outdir = Path(args.plot_dir)
+    p1 = plot_report(runs, outdir)
+    p2 = plot_report_final_summary(runs, outdir)
+    print(f"Wrote: {p1}")
+    print(f"Wrote: {p2}")
+
+
 def cmd_per_step(args: argparse.Namespace) -> None:
     path = Path(args.file)
     if not path.is_file():
@@ -481,25 +583,25 @@ def plot_macro(runs: List[Tuple[str, List[Dict[str, Any]]]], outdir: Path) -> No
     ax.set_xlabel("step"); ax.set_ylabel("coverage")
     ax.legend(fontsize=8); ax.grid(alpha=0.3)
 
-    # Hole rate per window (smoothed ratio)
+    # Holes per 100k env-steps (rate per fixed compute, NOT per-episode rate).
+    # Per-episode rate hides SOOPER's win because SOOPER lengthens episodes,
+    # so fewer-but-longer episodes can have the same "hole rate" with half
+    # the absolute fall count.
     ax = axes[0, 1]
     for label, rows in runs:
         s, hole_v = steps_col(rows, "epstats/log/hole_terminated/sum")
-        _, goal_v = steps_col(rows, "epstats/log/goal_terminated/sum")
-        _, to_v = steps_col(rows, "epstats/log/timeout_terminated/sum")
         if len(s) == 0:
             continue
-        tot = hole_v + goal_v + to_v
-        mask = tot > 0
-        if not mask.any():
-            continue
-        rates = np.where(mask, hole_v / np.where(mask, tot, 1), np.nan)
         order = np.argsort(s)
-        ax.plot(s[order], _ema(np.nan_to_num(rates[order], nan=0.0)),
-                lw=2, label=label)
-    ax.set_title("hole rate per window")
-    ax.set_xlabel("step"); ax.set_ylabel("hole / total")
-    ax.set_ylim(0, 1.05); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        s_o, h_o = s[order], hole_v[order]
+        # Per-window rate: holes in window / step delta to next window.
+        deltas = np.diff(s_o, prepend=0.0)
+        deltas = np.where(deltas <= 0, 1.0, deltas)
+        per_100k = h_o * 100_000.0 / deltas
+        ax.plot(s_o, _ema(per_100k), lw=2, label=label)
+    ax.set_title("holes per 100k env-steps")
+    ax.set_xlabel("env-step"); ax.set_ylabel("holes per 100k steps")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
 
     # max_path_progress
     ax = axes[1, 0]
@@ -529,6 +631,294 @@ def plot_macro(runs: List[Tuple[str, List[Dict[str, Any]]]], outdir: Path) -> No
     plt.tight_layout()
     plt.savefig(outdir / "macro_comparison.png", dpi=110)
     plt.close(fig)
+
+
+def _cumulative_episodes(rows: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (steps, cum_episode_count) per window flush, sorted by step."""
+    s_h, h = steps_col(rows, "epstats/log/hole_terminated/sum")
+    s_g, g = steps_col(rows, "epstats/log/goal_terminated/sum")
+    s_t, t = steps_col(rows, "epstats/log/timeout_terminated/sum")
+    # All three should be aligned with the same step grid; trust hole's grid.
+    if len(s_h) == 0:
+        return np.array([]), np.array([])
+    order = np.argsort(s_h)
+    s = s_h[order]
+    per_window = h[order] + (
+        g[order] if g.size == h.size else 0
+    ) + (t[order] if t.size == h.size else 0)
+    return s, np.cumsum(per_window)
+
+
+def _cumulative_holes(rows: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray]:
+    s, h = steps_col(rows, "epstats/log/hole_terminated/sum")
+    if len(s) == 0:
+        return np.array([]), np.array([])
+    order = np.argsort(s)
+    return s[order], np.cumsum(h[order])
+
+
+def _cumulative_goals(rows: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray]:
+    s, g = steps_col(rows, "epstats/log/goal_terminated/sum")
+    if len(s) == 0:
+        return np.array([]), np.array([])
+    order = np.argsort(s)
+    return s[order], np.cumsum(g[order])
+
+
+def _label_for(stem: str) -> str:
+    """Pretty-print run filenames for plot legends."""
+    mapping = {
+        "metrics": "plain OPAX (baseline)",
+        "metrics_sooper_v3": "SOOPER v3 (τ=0.65, H_min=300)",
+        "metrics_sooper_v4": "SOOPER v4 (τ=0.65, H_min=100)",
+        "metrics_sooper_v5": "SOOPER v5 (τ=0.50, H_max=300)",
+        "metrics_sooper_v6": "SOOPER v6 (τ=0.70, cd=150)",
+        "metrics_sooper_v7": "SOOPER v7 (τ=0.70, cd=60)",
+        "metrics_sooper_v8": "SOOPER v8 (τ=0.65, τ_low=0.25)",
+    }
+    return mapping.get(stem, stem)
+
+
+def _running_max(v: np.ndarray) -> np.ndarray:
+    out = np.empty_like(v)
+    cur = -np.inf
+    for i, x in enumerate(v):
+        cur = max(cur, x)
+        out[i] = cur
+    return out
+
+
+def _final_stats(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    hole = col(rows, "epstats/log/hole_terminated/sum")
+    goal = col(rows, "epstats/log/goal_terminated/sum")
+    timeout = col(rows, "epstats/log/timeout_terminated/sum")
+    cov = col(rows, "exploration/coverage")
+    prog = col(rows, "exploration/mean_max_path_progress")
+    eps = float((hole + goal + timeout).sum())
+    return {
+        "episodes": eps,
+        "holes": float(hole.sum()),
+        "goals": float(goal.sum()),
+        "coverage": float(cov[-5:].mean()) if len(cov) else 0.0,
+        "progress": float(prog[-5:].mean()) if len(prog) else 0.0,
+        "env_steps": float(total_env_steps(rows)),
+    }
+
+
+def plot_report(
+    runs: List[Tuple[str, List[Dict[str, Any]]]],
+    outdir: Path,
+) -> Path:
+    """Episode-efficiency dashboard: same coverage with fewer episodes.
+
+    Four panels:
+      1. Coverage (running max of EMA) vs cumulative episodes — monotone
+         curves so 'further left wins' reads at a glance.
+      2. Max-path-progress (running max of EMA) vs cumulative episodes.
+      3. Cumulative holes vs cumulative episodes — slope = holes/episode.
+      4. Cumulative episodes vs env-steps — flatter = longer episodes per
+         fixed compute.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(2, 2, figsize=(15, 11))
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(runs)))
+    pretty = {label: _label_for(label) for label, _ in runs}
+    handles = {label: c for (label, _), c in zip(runs, colors)}
+
+    # --- Panel 1: coverage vs cumulative episodes (running max) ----------
+    ax = axes[0, 0]
+    max_eps_seen = 0
+    for label, rows in runs:
+        s_steps, cum_eps = _cumulative_episodes(rows)
+        s_cov, cov = steps_col(rows, "exploration/coverage")
+        if len(s_steps) == 0 or len(s_cov) == 0:
+            continue
+        order = np.argsort(s_cov)
+        s_cov_o, cov_o = s_cov[order], cov[order]
+        eps_at = np.interp(s_cov_o, s_steps, cum_eps)
+        cov_smooth = _running_max(_ema(cov_o))
+        ax.plot(eps_at, cov_smooth, lw=2.5, color=handles[label],
+                label=pretty[label])
+        # mark the final point with a dot + episode-count annotation
+        ax.scatter(eps_at[-1], cov_smooth[-1], s=60, color=handles[label],
+                   zorder=5, edgecolor="white", linewidth=1.5)
+        ax.annotate(f" {int(eps_at[-1])} eps",
+                    (eps_at[-1], cov_smooth[-1]),
+                    fontsize=9, color=handles[label])
+        max_eps_seen = max(max_eps_seen, eps_at[-1])
+    ax.set_xlim(0, max_eps_seen * 1.10)
+    ax.set_title("Coverage vs episodes consumed\n"
+                 "(curves further LEFT reach the same coverage with FEWER episodes)",
+                 fontsize=12)
+    ax.set_xlabel("cumulative episodes", fontsize=11)
+    ax.set_ylabel("coverage (running max of EMA)", fontsize=11)
+    ax.set_ylim(0, 1.0); ax.legend(fontsize=10, loc="lower right")
+    ax.grid(alpha=0.3)
+
+    # --- Panel 2: max progress vs cumulative episodes (running max) ------
+    ax = axes[0, 1]
+    max_eps_seen = 0
+    for label, rows in runs:
+        s_steps, cum_eps = _cumulative_episodes(rows)
+        s_p, prog = steps_col(rows, "exploration/mean_max_path_progress")
+        if len(s_steps) == 0 or len(s_p) == 0:
+            continue
+        order = np.argsort(s_p)
+        s_p_o, prog_o = s_p[order], prog[order]
+        eps_at = np.interp(s_p_o, s_steps, cum_eps)
+        prog_smooth = _running_max(_ema(prog_o))
+        ax.plot(eps_at, prog_smooth, lw=2.5, color=handles[label],
+                label=pretty[label])
+        ax.scatter(eps_at[-1], prog_smooth[-1], s=60, color=handles[label],
+                   zorder=5, edgecolor="white", linewidth=1.5)
+        ax.annotate(f" {int(eps_at[-1])} eps",
+                    (eps_at[-1], prog_smooth[-1]),
+                    fontsize=9, color=handles[label])
+        max_eps_seen = max(max_eps_seen, eps_at[-1])
+    ax.set_xlim(0, max_eps_seen * 1.10)
+    ax.set_title("Max-path-progress vs episodes consumed\n"
+                 "(curves further LEFT make the same progress with FEWER episodes)",
+                 fontsize=12)
+    ax.set_xlabel("cumulative episodes", fontsize=11)
+    ax.set_ylabel("max_path_progress (running max of EMA)", fontsize=11)
+    ax.legend(fontsize=10, loc="lower right"); ax.grid(alpha=0.3)
+
+    # --- Panel 3: cumulative holes vs cumulative episodes ----------------
+    ax = axes[1, 0]
+    max_eps_seen = 0
+    for label, rows in runs:
+        s_steps, cum_eps = _cumulative_episodes(rows)
+        s_h, cum_h = _cumulative_holes(rows)
+        if len(cum_eps) == 0 or len(cum_h) == 0:
+            continue
+        eps_at_h = np.interp(s_h, s_steps, cum_eps)
+        ax.plot(eps_at_h, cum_h, lw=2.5, color=handles[label],
+                label=pretty[label])
+        ax.scatter(eps_at_h[-1], cum_h[-1], s=60, color=handles[label],
+                   zorder=5, edgecolor="white", linewidth=1.5)
+        max_eps_seen = max(max_eps_seen, eps_at_h[-1])
+    upper = max_eps_seen * 1.05
+    ax.plot([0, upper], [0, upper], color="black", linestyle="--", alpha=0.4,
+            lw=1.2, label="hole/episode = 1 (every episode falls)")
+    ax.set_xlim(0, upper)
+    ax.set_title("Cumulative holes vs episodes\n"
+                 "(steeper slope = more fall-prone)",
+                 fontsize=12)
+    ax.set_xlabel("cumulative episodes", fontsize=11)
+    ax.set_ylabel("cumulative fall events", fontsize=11)
+    ax.legend(fontsize=10, loc="upper left"); ax.grid(alpha=0.3)
+
+    # --- Panel 4: episodes vs env-steps ----------------------------------
+    ax = axes[1, 1]
+    for label, rows in runs:
+        s_steps, cum_eps = _cumulative_episodes(rows)
+        if len(s_steps) == 0:
+            continue
+        ax.plot(s_steps, cum_eps, lw=2.5, color=handles[label],
+                label=pretty[label])
+        ax.scatter(s_steps[-1], cum_eps[-1], s=60, color=handles[label],
+                   zorder=5, edgecolor="white", linewidth=1.5)
+    ax.set_title("Episodes consumed vs env-steps (compute budget)\n"
+                 "(flatter line = LONGER episodes per compute unit)",
+                 fontsize=12)
+    ax.set_xlabel("env-steps", fontsize=11)
+    ax.set_ylabel("cumulative episodes", fontsize=11)
+    ax.legend(fontsize=10, loc="upper left"); ax.grid(alpha=0.3)
+
+    plt.suptitle(
+        "SOOPER episode-efficiency: reaching the same coverage with fewer episodes",
+        fontsize=14, fontweight="bold",
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    out = outdir / "report_episode_efficiency.png"
+    plt.savefig(out, dpi=130)
+    plt.close(fig)
+    return out
+
+
+def plot_report_final_summary(
+    runs: List[Tuple[str, List[Dict[str, Any]]]],
+    outdir: Path,
+) -> Path:
+    """Compact summary: coverage and progress achieved per N episodes.
+
+    One bar per run, grouped by metric. Above each bar the episode count
+    is annotated; runs that reach similar y values with smaller annotated
+    counts are the headline SOOPER win.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    stats = [(label, _final_stats(rows)) for label, rows in runs]
+    labels = [_label_for(s[0]) for s in stats]
+    cov = [s[1]["coverage"] for s in stats]
+    prog = [s[1]["progress"] for s in stats]
+    eps = [int(s[1]["episodes"]) for s in stats]
+    holes = [int(round(s[1]["holes"])) for s in stats]
+    goals = [s[1]["goals"] for s in stats]
+    colors = plt.cm.tab10(np.linspace(0, 1, len(stats)))
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 6))
+
+    # Panel A: final coverage with #episodes annotation
+    ax = axes[0]
+    bars = ax.bar(range(len(stats)), cov, color=colors)
+    for i, (b, e) in enumerate(zip(bars, eps)):
+        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.01,
+                f"{e} eps", ha="center", fontsize=10, fontweight="bold")
+    ax.set_xticks(range(len(stats)))
+    ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9)
+    ax.set_ylabel("final coverage (last 5 windows)")
+    ax.set_title("Coverage achieved (lower #eps with same height = win)",
+                 fontsize=11)
+    ax.set_ylim(0, max(cov) * 1.15 if cov else 1.0)
+    ax.grid(alpha=0.3, axis="y")
+
+    # Panel B: final max progress with #episodes annotation
+    ax = axes[1]
+    bars = ax.bar(range(len(stats)), prog, color=colors)
+    for i, (b, e) in enumerate(zip(bars, eps)):
+        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.1,
+                f"{e} eps", ha="center", fontsize=10, fontweight="bold")
+    ax.set_xticks(range(len(stats)))
+    ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9)
+    ax.set_ylabel("final max_path_progress (last 5 windows)")
+    ax.set_title("Max progress achieved (lower #eps with same height = win)",
+                 fontsize=11)
+    ax.set_ylim(0, max(prog) * 1.15 if prog else 1.0)
+    ax.grid(alpha=0.3, axis="y")
+
+    # Panel C: holes + goals
+    ax = axes[2]
+    x = np.arange(len(stats))
+    w = 0.4
+    ax.bar(x - w / 2, holes, w, color=colors, label="falls")
+    ax.bar(x + w / 2, goals, w, color="gold", edgecolor="black",
+           label="goals")
+    for i, (h, g) in enumerate(zip(holes, goals)):
+        ax.text(i - w / 2, h + 0.5, str(h), ha="center", fontsize=9)
+        if g > 0.01:
+            ax.text(i + w / 2, g + 0.5, f"{g:.2f}", ha="center",
+                    fontsize=9, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9)
+    ax.set_ylabel("event count (per 100k env-steps)")
+    ax.set_title("Falls vs goals per fixed compute budget", fontsize=11)
+    ax.legend(fontsize=9); ax.grid(alpha=0.3, axis="y")
+
+    plt.suptitle("SOOPER final-state summary", fontsize=14, fontweight="bold")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    out = outdir / "report_final_summary.png"
+    plt.savefig(out, dpi=130)
+    plt.close(fig)
+    return out
 
 
 def plot_per_step(
@@ -620,6 +1010,18 @@ def parse_args() -> argparse.Namespace:
     pm.add_argument("--plot-dir", default="metrics/plots",
                     help="Output directory for plots. Default: metrics/plots.")
     pm.set_defaults(func=cmd_macro)
+
+    pr = sub.add_parser(
+        "report",
+        help="Generate publication-style plots for the SOOPER report.",
+    )
+    pr.add_argument(
+        "files", nargs="+",
+        help="One or more dreamer metrics.jsonl files.",
+    )
+    pr.add_argument("--plot-dir", default="metrics/plots",
+                    help="Output directory for plots. Default: metrics/plots.")
+    pr.set_defaults(func=cmd_report)
 
     pp = sub.add_parser(
         "per-step",
