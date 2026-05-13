@@ -119,6 +119,15 @@ defaults:
     # risk signals + termination flags. Used to histogram-pick tau_high /
     # tau_low. Off by default (file size is ~300 B/line × envs × steps).
     dump_steps: False
+    # Gate algorithm selector. 'threshold' = legacy hysteresis gate using
+    # tau_high/tau_low/H_min/H_max/cooldown. 'cost_tracking' = SOOPER paper
+    # Algorithm 1: monotone latch on Φ = c_<t + γ^t · Q_pess vs budget_d,
+    # using log/hole_terminated as the per-step cost. Cost-tracking ignores
+    # tau_high/tau_low/H_min/H_max/cooldown entirely.
+    gate_mode: threshold        # 'threshold' | 'cost_tracking'
+    budget_d: 0.05              # cost budget d for cost_tracking gate
+    gamma_cost: 0.99            # discount for c_<t accumulation
+    lambda_pessimism: 0.0       # weight on σ_n pessimism (0 = no σ used)
 
   agent:
     loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, ensemble: 1.0, ball_pos: 1.0, ball_vel: 1.0}

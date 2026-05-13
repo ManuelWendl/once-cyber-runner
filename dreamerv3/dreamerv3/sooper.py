@@ -470,6 +470,40 @@ def gate_step(prior_active: np.ndarray,
             trigger, release, hard_release & prior_active)
 
 
+def cost_tracking_gate_step(
+    prior_active: np.ndarray,   # bool[B]    monotone latch
+    cost_accum:   np.ndarray,   # float32[B] discounted cost-so-far c_<t
+    step_idx:     np.ndarray,   # int32[B]   t since episode start
+    q_pess:       np.ndarray,   # float32[B] Q^π̃_c(s_t) + λ·σ_n(s_t, a_t)
+    cost_t:       np.ndarray,   # float32[B] c(s_t, a_t), binary terminal here
+    budget_d:     float,
+    gamma:        float,
+):
+    """One step of the SOOPER paper's Algorithm 1.
+
+    Switching test: ``Φ = c_<t + γ^t · q_pess ≥ d``. If satisfied, the
+    gate latches into the prior. Monotone — once active, stays active
+    until the caller resets ``prior_active`` on the next ``is_first``
+    boundary.
+
+    Cost accumulates regardless of which policy ran (as in the paper),
+    so the budget is a property of the *episode*, not of the explorer.
+
+    Returns:
+        new_active      (bool[B])    gate state after this step
+        new_cost_accum  (float32[B]) updated c_<t+1
+        new_step_idx    (int32[B])   updated t+1
+        triggered       (bool[B])    OPAX→prior transitions THIS step
+    """
+    gamma_t = np.power(np.float32(gamma), step_idx.astype(np.float32))
+    phi = cost_accum + gamma_t * q_pess
+    trigger = (phi >= budget_d) & ~prior_active
+    new_active = prior_active | trigger
+    new_cost_accum = (cost_accum + gamma_t * cost_t).astype(np.float32)
+    new_step_idx = (step_idx + 1).astype(np.int32)
+    return new_active, new_cost_accum, new_step_idx, trigger
+
+
 # --------------------------------------------------------------------------
 # PolicySwitcher — non-blocking gate
 # --------------------------------------------------------------------------
@@ -523,6 +557,10 @@ class PolicySwitcher:
             self.cooldown     = np.zeros(B, dtype=np.int32)
             self._episode_id  = np.full(B, -1, dtype=np.int64)
             self._step_in_ep  = np.zeros(B, dtype=np.int64)
+            # Cost-tracking gate state (only used when gate_mode='cost_tracking',
+            # but allocated unconditionally so the dispatch branch is cheap).
+            self.cost_accum   = np.zeros(B, dtype=np.float32)
+            self.step_idx     = np.zeros(B, dtype=np.int32)
 
     # Optional log/* keys we try to surface from obs. Missing keys are
     # silently skipped — the env may not expose all of them.
@@ -614,6 +652,8 @@ class PolicySwitcher:
             self.prior_active[first] = False
             self.hold_count[first]   = 0
             self.cooldown[first]     = 0
+            self.cost_accum[first]   = 0.0
+            self.step_idx[first]     = 0
             self.adapter.reset_envs(first)
 
         # 1. Run the agent's jitted policy in 'sooper' mode: returns OPAX
@@ -638,6 +678,12 @@ class PolicySwitcher:
             out.pop('risk_cont_product'), dtype=np.float32)  # (B,)
         risk_cont_max = np.asarray(
             out.pop('risk_cont_max'), dtype=np.float32)      # (B,)
+        # OPAX disagreement σ_n(s_t, a_t) — optional, only present when the
+        # agent has an ensemble (exploration_reward != 'none'). When absent,
+        # the cost-tracking gate falls back to λ_pessimism·σ = 0.
+        sigma_raw = out.pop('sigma_disagreement', None)
+        sigma_np = (np.asarray(sigma_raw, dtype=np.float32)
+                    if sigma_raw is not None else None)
 
         # OPAX action shape conventions in Dreamer: dict {key: (B, A)}.
         opax_act_np = jax.tree.map(np.asarray, opax_act_dict)
@@ -690,17 +736,61 @@ class PolicySwitcher:
             log_signals['risk_critic'] = risk_critic
         risk_np = self.risk_source(signals_for_source, prior_obs)
 
-        # 4. Pure-numpy state machine. Trigger/release on the active risk.
-        (new_active, new_hold, new_cool,
-         triggered_flag, released_flag, hard_released_flag) = gate_step(
-            self.prior_active, self.hold_count, self.cooldown, risk_np,
-            tau_high=self.cfg.tau_high, tau_low=self.cfg.tau_low,
-            H_min=self.cfg.H_min, H_max=self.cfg.H_max,
-            cool_steps=self.cfg.cooldown,
-        )
-        self.prior_active = new_active
-        self.hold_count   = new_hold
-        self.cooldown     = new_cool
+        # 4. Pure-numpy state machine. Dispatch on cfg.gate_mode.
+        gate_mode = str(getattr(self.cfg, 'gate_mode', 'threshold'))
+        if gate_mode == 'cost_tracking':
+            # SOOPER paper Algorithm 1: cumulative cost vs budget, monotone
+            # latch. Requires risk_critic (Q^π̃_c) — error out clearly if
+            # the user picked cost_tracking without a value_fn.
+            if 'risk_critic' not in signals_for_source:
+                raise RuntimeError(
+                    "sooper.gate_mode='cost_tracking' requires risk_critic "
+                    "(Q^π̃_c from value_fn). PolicySwitcher was constructed "
+                    "with value_fn=None.")
+            cost_t = np.asarray(
+                obs.get('log/hole_terminated', 0.0),
+                dtype=np.float32).reshape(-1)
+            lam = float(getattr(self.cfg, 'lambda_pessimism', 0.0))
+            sigma = (sigma_np if sigma_np is not None
+                     else np.zeros_like(risk_critic))
+            q_pess = risk_critic + lam * sigma
+            (new_active, new_cost_accum, new_step_idx,
+             triggered_flag) = cost_tracking_gate_step(
+                self.prior_active, self.cost_accum, self.step_idx,
+                q_pess, cost_t,
+                budget_d=float(getattr(self.cfg, 'budget_d', 0.05)),
+                gamma=float(getattr(self.cfg, 'gamma_cost', 0.99)),
+            )
+            # Compute phi for logging (matches what triggered_flag tested).
+            gamma_t = np.power(
+                np.float32(float(getattr(self.cfg, 'gamma_cost', 0.99))),
+                self.step_idx.astype(np.float32))
+            phi = self.cost_accum + gamma_t * q_pess
+            self.prior_active = new_active
+            self.cost_accum = new_cost_accum
+            self.step_idx = new_step_idx
+            # Algorithm 1 is monotone — no release, no cooldown. Keep
+            # legacy fields zeroed so downstream logging schema is stable.
+            self.hold_count = np.zeros_like(self.hold_count)
+            self.cooldown = np.zeros_like(self.cooldown)
+            released_flag = np.zeros_like(triggered_flag)
+            hard_released_flag = np.zeros_like(triggered_flag)
+            # Surface algorithm internals so the per-step dump captures them.
+            log_signals['cost_accum'] = self.cost_accum.copy()
+            log_signals['q_pess'] = q_pess
+            log_signals['sigma'] = sigma
+            log_signals['phi'] = phi
+        else:
+            (new_active, new_hold, new_cool,
+             triggered_flag, released_flag, hard_released_flag) = gate_step(
+                self.prior_active, self.hold_count, self.cooldown, risk_np,
+                tau_high=self.cfg.tau_high, tau_low=self.cfg.tau_low,
+                H_min=self.cfg.H_min, H_max=self.cfg.H_max,
+                cool_steps=self.cfg.cooldown,
+            )
+            self.prior_active = new_active
+            self.hold_count   = new_hold
+            self.cooldown     = new_cool
 
         # 5. Action mux. Overwrite carry's prevact so the world model
         # next step conditions on the action that actually executed.

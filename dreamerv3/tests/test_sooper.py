@@ -26,6 +26,7 @@ from dreamerv3.dreamerv3.sooper import (  # noqa: E402
     FRAME_DIM,
     STATE_SCALES,
     PriorObsAdapter,
+    cost_tracking_gate_step,
     gate_step,
 )
 
@@ -216,6 +217,143 @@ def test_adapter_reset_clears_history():
     # Env 1 should have non-zero entries in its first 4 frames.
     history_1_old = history_1[: (HISTORY_LENGTH - 1) * FRAME_DIM]
     assert (history_1_old != 0).any()
+
+
+# ============================================================================
+# Cost-tracking gate (SOOPER paper Algorithm 1)
+# ============================================================================
+
+def _ctg_state(B: int):
+    return (
+        np.zeros(B, dtype=bool),       # prior_active
+        np.zeros(B, dtype=np.float32), # cost_accum
+        np.zeros(B, dtype=np.int32),   # step_idx
+    )
+
+
+CTG_DEFAULTS = dict(budget_d=0.5, gamma=0.99)
+
+
+def test_monotone_latch():
+    """Once prior_active flips True, it stays True even with q_pess=0."""
+    active = np.array([True], dtype=bool)
+    cost = np.zeros(1, dtype=np.float32)
+    step = np.zeros(1, dtype=np.int32)
+    for _ in range(50):
+        active, cost, step, trig = cost_tracking_gate_step(
+            active, cost, step,
+            q_pess=np.zeros(1, dtype=np.float32),
+            cost_t=np.zeros(1, dtype=np.float32),
+            **CTG_DEFAULTS,
+        )
+        assert active[0]
+        assert not trig[0]  # already active, no fresh trigger
+
+
+def test_no_trigger_when_phi_lt_budget():
+    """q_pess=0.1 (well below d=0.5) never triggers across many steps."""
+    active, cost, step = _ctg_state(B=1)
+    for _ in range(100):
+        active, cost, step, trig = cost_tracking_gate_step(
+            active, cost, step,
+            q_pess=np.full(1, 0.1, dtype=np.float32),
+            cost_t=np.zeros(1, dtype=np.float32),
+            **CTG_DEFAULTS,
+        )
+    assert not active.any()
+    assert (cost == 0).all()
+
+
+def test_immediate_trigger_at_t0():
+    """q_pess=1.0 ≥ d=0.5 at t=0 (γ^0 = 1) → trigger fires immediately."""
+    active, cost, step = _ctg_state(B=1)
+    active, cost, step, trig = cost_tracking_gate_step(
+        active, cost, step,
+        q_pess=np.full(1, 1.0, dtype=np.float32),
+        cost_t=np.zeros(1, dtype=np.float32),
+        **CTG_DEFAULTS,
+    )
+    assert active[0]
+    assert trig[0]
+
+
+def test_cost_accumulation_eventually_triggers():
+    """Per-step c=0 with one big cost at t=5; later step crosses budget via c_<t."""
+    active, cost, step = _ctg_state(B=1)
+    budget = 0.5
+    gamma = 0.99
+    for t in range(20):
+        cost_t = np.array(
+            [1.0 if t == 5 else 0.0], dtype=np.float32)
+        # Set q_pess just below the bare budget so trigger only fires via c_<t.
+        q_pess = np.full(1, 0.0, dtype=np.float32)
+        active, cost, step, trig = cost_tracking_gate_step(
+            active, cost, step, q_pess, cost_t,
+            budget_d=budget, gamma=gamma,
+        )
+        if t == 5:
+            # cost_accum updated AFTER the test, so cost is still 0 at trigger
+            # test for t=5; but at t=6, cost_accum = γ^5.
+            assert not trig[0]
+        if t == 6:
+            expected = gamma ** 5
+            assert np.isclose(cost[0], expected, atol=1e-5), (
+                f"expected cost_accum ≈ {expected}, got {cost[0]}")
+            # At t=6, gamma_t·q_pess = 0, so Φ = c_<t = γ^5 ≈ 0.951 ≥ 0.5.
+            assert active[0]
+            assert trig[0]
+
+
+def test_episode_reset_zeros_state():
+    """Gate does NOT self-reset; caller resets externally on is_first."""
+    active, cost, step = _ctg_state(B=2)
+    # Drive env 0 into active + nonzero cost.
+    active, cost, step, _ = cost_tracking_gate_step(
+        active, cost, step,
+        q_pess=np.array([1.0, 0.0], dtype=np.float32),
+        cost_t=np.array([1.0, 0.0], dtype=np.float32),
+        **CTG_DEFAULTS,
+    )
+    assert active[0]
+    assert cost[0] > 0
+    assert step[0] == 1
+    # Simulate the caller-side reset for env 0 only (as PolicySwitcher does
+    # on is_first).
+    first = np.array([True, False])
+    active[first] = False
+    cost[first] = 0.0
+    step[first] = 0
+    # Env 0 fully reset; env 1 untouched.
+    assert not active[0]
+    assert cost[0] == 0
+    assert step[0] == 0
+    assert step[1] == 1
+
+
+def test_lambda_sigma_lifts_q_pess():
+    """Larger λ·σ lifts Q_pess past the budget; trigger fires earlier."""
+    sigma = np.full(1, 0.5, dtype=np.float32)
+    q_critic = np.full(1, 0.1, dtype=np.float32)
+    # With λ=0: q_pess = 0.1, well below d=0.5 → never trigger.
+    active, cost, step = _ctg_state(B=1)
+    for _ in range(20):
+        active, cost, step, _ = cost_tracking_gate_step(
+            active, cost, step,
+            q_pess=q_critic + 0.0 * sigma,
+            cost_t=np.zeros(1, dtype=np.float32),
+            **CTG_DEFAULTS,
+        )
+    assert not active.any()
+    # With λ=1: q_pess = 0.1 + 0.5 = 0.6 ≥ 0.5 → trigger at t=0.
+    active, cost, step = _ctg_state(B=1)
+    active, cost, step, trig = cost_tracking_gate_step(
+        active, cost, step,
+        q_pess=q_critic + 1.0 * sigma,
+        cost_t=np.zeros(1, dtype=np.float32),
+        **CTG_DEFAULTS,
+    )
+    assert active[0]
+    assert trig[0]
 
 
 if __name__ == '__main__':
