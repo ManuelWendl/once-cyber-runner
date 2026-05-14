@@ -36,7 +36,11 @@ class Agent(embodied.jax.Agent):
     self.act_space = act_space
     self.config = config
 
-    exclude = ('is_first', 'is_last', 'is_terminal', 'reward')
+    # `prior_risk` / `prior_active` are SOOPER Mode 2 replay slots — loss
+    # targets for the distilled risk head and the V^pi~_r head, never
+    # encoded or reconstructed (same treatment as `reward`).
+    exclude = ('is_first', 'is_last', 'is_terminal', 'reward',
+               'prior_risk', 'prior_active')
     enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
     dec_space = {k: v for k, v in obs_space.items() if k not in exclude}
     self.enc = {
@@ -84,11 +88,30 @@ class Agent(embodied.jax.Agent):
     if self.has_reward_head:
       self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
 
+    # SOOPER Mode 2 heads — built only when sooper.mode2_enabled, so plain
+    # OPAX / Mode-1-only runs are byte-identical to before.
+    #   risk     : distills the gate's risk_critic ([0,1] scalar) onto the
+    #              latent, so the in-imagination switching condition Φ≥d
+    #              can be evaluated on imagined states.
+    #   priorval : V^pi~_r — the explorer's intrinsic-reward value under the
+    #              PRIOR policy; the terminal value the imagined return
+    #              bootstraps from when the switch fires.
+    self.mode2_enabled = bool(config.sooper.mode2_enabled)
+    if self.mode2_enabled:
+      assert self.exploration_reward != 'none', (
+          'sooper.mode2_enabled requires an OPAX exploration reward — '
+          'V^pi~_r is the value of the explorer\'s intrinsic reward.')
+      self.risk = embodied.jax.MLPHead(scalar, **config.riskhead, name='risk')
+      self.priorval = embodied.jax.MLPHead(
+          scalar, **config.priorvalhead, name='priorval')
+
     self.modules = [
         self.dyn, self.enc, self.dec, self.con,
         self.ball_pos_head, self.ball_vel_head, self.pol, self.val]
     if self.has_reward_head:
       self.modules.insert(3, self.rew)
+    if self.mode2_enabled:
+      self.modules += [self.risk, self.priorval]
 
     if self.exploration_reward != 'none':
       rssm_cfg = config.dyn[config.dyn.typ]
@@ -112,6 +135,9 @@ class Agent(embodied.jax.Agent):
       scales.pop('rew', None)
     if not self.config.repval_loss:
       scales.pop('repval', None)
+    if not self.mode2_enabled:
+      scales.pop('risk', None)
+      scales.pop('priorval', None)
     self.scales = scales
 
   @property
@@ -235,6 +261,15 @@ class Agent(embodied.jax.Agent):
     if self.config.contdisc:
       con *= 1 - 1 / self.config.horizon
     losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
+    if self.mode2_enabled:
+      # SOOPER Mode 2: distill the gate's risk_critic onto the latent so the
+      # in-imagination switching condition can read it. Stop-grad the input
+      # — this auxiliary readout must not perturb the working world-model
+      # representation. obs['prior_risk'] is what the PolicySwitcher wrote
+      # into replay (0.0 on no-gate steps, e.g. warmup — harmless, the head
+      # just learns 0 there).
+      losses['risk'] = self.risk(
+          sg(self.feat2tensor(repfeat)), 2).loss(obs['prior_risk'])
     for key, recon in recons.items():
       space, value = self.obs_space[key], obs[key]
       assert value.dtype == space.dtype, (key, space, value.dtype)
@@ -262,6 +297,30 @@ class Agent(embodied.jax.Agent):
       metrics['exploration/ensemble_loss'] = ens_loss.mean()
       ens_var = jnp.var(preds, axis=-2)  # (B, T-1, output_dim)
       metrics['exploration/ensemble_variance'] = ens_var.mean()
+
+      if self.mode2_enabled:
+        # SOOPER Mode 2: V^pi~_r — value of the explorer's intrinsic reward
+        # under the PRIOR policy. Trained only on prior-driven transitions
+        # (obs['prior_active']==1): there the realized trajectory IS a prior
+        # rollout, so its intrinsic-reward lambda-return is an unbiased
+        # V^pi~_r target. Reuses `preds` (real-trajectory ensemble preds)
+        # from just above; intrinsic reward matches the imagination bonus
+        # (exploration_lambd * disagreement).
+        intr = self.exploration_lambd * expl.disagreement(preds)  # (B,T-1)
+        intr = jnp.pad(intr, ((0, 0), (0, 1)))                    # (B,T)
+        pv_head = self.priorval(sg(self.feat2tensor(repfeat)), 2)
+        pv = pv_head.pred()                                       # (B,T)
+        disc = 1 - 1 / self.config.horizon
+        pv_ret = lambda_return(
+            f32(obs['is_last']), f32(obs['is_terminal']), intr,
+            sg(pv), sg(pv), disc, 0.95)                           # (B,T-1)
+        pv_ret = jnp.concatenate([pv_ret, 0 * pv_ret[:, -1:]], 1)  # (B,T)
+        w = obs['prior_active']                                   # (B,T)
+        losses['priorval'] = jnp.pad(
+            (w * pv_head.loss(sg(pv_ret)))[:, :-1], ((0, 0), (0, 1)))
+        metrics['sooper/priorval_mean'] = pv.mean()
+        metrics['sooper/intr_reward_mean'] = intr.mean()
+        metrics['sooper/prior_active_frac'] = w.mean()
 
     B, T = reset.shape
     shapes = {k: v.shape for k, v in losses.items()}
@@ -302,6 +361,19 @@ class Agent(embodied.jax.Agent):
       else:
         imag_rew = bonus
 
+    # SOOPER Mode 2: evaluate the distilled risk head + V^pi~_r head on the
+    # imagined latents so imag_loss can apply the in-imagination switching
+    # condition. sg() — these heads are trained by their own losses above,
+    # not through the actor loss. Reuses the v10-locked Mode 1 calibration.
+    mode2_kw = {}
+    if self.mode2_enabled:
+      mode2_kw = dict(
+          mode2=True,
+          risk_imag=sg(self.risk(inp, 2).pred()),
+          priorval_imag=sg(self.priorval(inp, 2).pred()),
+          budget_d=float(self.config.sooper.budget_d),
+          gamma_cost=float(self.config.sooper.gamma_cost),
+      )
     los, imgloss_out, mets = imag_loss(
         imgact,
         imag_rew,
@@ -313,6 +385,7 @@ class Agent(embodied.jax.Agent):
         update=training,
         contdisc=self.config.contdisc,
         horizon=self.config.horizon,
+        **mode2_kw,
         **self.config.imag_loss)
     losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()})
     metrics.update(mets)
@@ -523,6 +596,11 @@ def imag_loss(
     lam=0.95,
     actent=3e-4,
     slowreg=1.0,
+    mode2=False,
+    risk_imag=None,
+    priorval_imag=None,
+    budget_d=0.1,
+    gamma_cost=0.999,
 ):
   losses = {}
   metrics = {}
@@ -535,6 +613,38 @@ def imag_loss(
   weight = jnp.cumprod(disc * con, 1) / disc
   last = jnp.zeros_like(con)
   term = 1 - con
+
+  if mode2:
+    # SOOPER Mode 2: planning-MDP termination. Evaluate the in-imagination
+    # switching condition Φ = c_<t + γ^t·q_pess at every imagined latent and
+    # truncate the explorer's credit there, bootstrapping with V^pi~_r.
+    #   cost_t   = 1 - con  (per-step termination prob — imagination analog
+    #              of the binary hole cost log/hole_terminated in Mode 1)
+    #   q_pess_t = risk_imag  (distilled risk_critic; λ·σ omitted, λ=0)
+    #   t        = imagination step index. Over H≈15 with gamma_cost≈0.999
+    #              the γ^t decay is <2%, so using imagination-relative t
+    #              (the real step_in_ep isn't available here) is fine.
+    t_idx = jnp.arange(con.shape[1], dtype=f32)
+    gamma_t = (gamma_cost ** t_idx)[None, :]
+    disc_cost = gamma_t * (1.0 - con)
+    c_lt = jnp.cumsum(disc_cost, 1) - disc_cost            # exclusive cumsum
+    phi = c_lt + gamma_t * risk_imag
+    switched = (jnp.cumsum((phi >= budget_d).astype(f32), 1) > 0).astype(f32)
+    # r̃(s_t): at/after the switch the explorer's reward becomes V^pi~_r.
+    # Only the first switched step's value actually feeds the return — later
+    # steps are masked out of the loss by `weight` below.
+    rew = jnp.where(switched > 0, priorval_imag, rew)
+    # Treat the switch as a terminal event so lambda_return stops
+    # accumulating future reward there and picks up V^pi~_r as the bootstrap.
+    term = jnp.maximum(term, switched)
+    # Truncate the actor's (and value's) credit at/after the switch — the
+    # explorer's actions past the switch are not executed (prior is driving).
+    weight = weight * (1.0 - switched)
+    metrics['sooper/switch_frac'] = switched.mean()
+    metrics['sooper/phi_mean'] = phi.mean()
+    metrics['sooper/risk_imag_mean'] = risk_imag.mean()
+    metrics['sooper/priorval_imag_mean'] = priorval_imag.mean()
+
   ret = lambda_return(last, term, rew, tarval, tarval, disc, lam)
 
   roffset, rscale = retnorm(ret, update)

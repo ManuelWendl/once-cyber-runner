@@ -1165,19 +1165,29 @@ class CyberRunnerEnv(gym.Env):
         # Reset MuJoCo
         mujoco.mj_resetData(self.model, self.data)
 
-        # Set initial marble position
-        if self.randomize_init_pos:
-            idx = self.np_random.integers(0, len(self.waypoints))
-            init_pos = self.waypoints[idx]
+        # Persistent-spawn chaining: if the caller passes a saved physical
+        # state (set by the DreamerV3 wrapper after a non-hole episode end),
+        # continue from it instead of a fresh waypoint spawn. mj_resetData
+        # above still clears sim cruft (time, contacts, warmstart); we then
+        # overwrite the full configuration (qpos + qvel).
+        restore = options.get('restore_state') if options else None
+        if restore is not None:
+            self.data.qpos[:] = restore['qpos']
+            self.data.qvel[:] = restore['qvel']
         else:
-            init_pos = self.waypoints[0]
+            # Set initial marble position
+            if self.randomize_init_pos:
+                idx = self.np_random.integers(0, len(self.waypoints))
+                init_pos = self.waypoints[idx]
+            else:
+                init_pos = self.waypoints[0]
 
-        # Set marble qpos (free joint: 3 pos + 4 quat)
-        # qpos layout: [alpha, beta, marble_x, marble_y, marble_z, qw, qx, qy, qz]
-        self.data.qpos[2] = init_pos[0]
-        self.data.qpos[3] = init_pos[1]
-        self.data.qpos[4] = 0.0793  # Height above board
-        self.data.qpos[5:9] = [1, 0, 0, 0]  # Identity quaternion
+            # Set marble qpos (free joint: 3 pos + 4 quat)
+            # qpos layout: [alpha, beta, marble_x, marble_y, marble_z, qw, qx, qy, qz]
+            self.data.qpos[2] = init_pos[0]
+            self.data.qpos[3] = init_pos[1]
+            self.data.qpos[4] = 0.0793  # Height above board
+            self.data.qpos[5:9] = [1, 0, 0, 0]  # Identity quaternion
 
         # Forward dynamics
         mujoco.mj_forward(self.model, self.data)

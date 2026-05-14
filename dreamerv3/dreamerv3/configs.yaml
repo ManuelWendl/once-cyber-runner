@@ -40,7 +40,7 @@ defaults:
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False, length: 36000}
     dmc: {size: [64, 64], repeat: 1, proprio: True, image: True, camera: -1}
     loconav: {size: [64, 64], repeat: 1, camera: -1}
-    cyberrunner: {size: [64, 64], episode_length: 2000, randomize_init_pos: False, include_vision: True, frame_stack: 1, layout: hard, grayscale: True}
+    cyberrunner: {size: [64, 64], episode_length: 2000, randomize_init_pos: False, include_vision: True, frame_stack: 1, layout: hard, grayscale: True, chain_on_survival: False}
 
   replay:
     size: 5e6
@@ -128,9 +128,18 @@ defaults:
     budget_d: 0.05              # cost budget d for cost_tracking gate
     gamma_cost: 0.99            # discount for c_<t accumulation
     lambda_pessimism: 0.0       # weight on σ_n pessimism (0 = no σ used)
+    # SOOPER Mode 2 — planning-MDP termination in the actor loss. When True,
+    # Agent.loss() builds the distilled risk head + V^pi~_r head and the
+    # imagination actor loss truncates at the in-imagination switching
+    # condition Φ = c_<t + γ^t·q_pess ≥ budget_d, bootstrapping the
+    # truncated return with V^pi~_r. Reuses budget_d / gamma_cost above
+    # (the v10-locked Mode 1 calibration). Independent of gate_mode: a
+    # Mode 2 run still runs the Mode 1 gate to collect prior_risk /
+    # prior_active for the head targets.
+    mode2_enabled: False
 
   agent:
-    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, ensemble: 1.0, ball_pos: 1.0, ball_vel: 1.0}
+    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, ensemble: 1.0, ball_pos: 1.0, ball_vel: 1.0, risk: 1.0, priorval: 1.0}
     opt: {lr: 4e-5, agc: 0.3, eps: 1e-20, beta1: 0.9, beta2: 0.999, momentum: True, wd: 0.0, schedule: const, warmup: 1000, anneal: 0}
     ac_grads: False
     dyn:
@@ -144,6 +153,12 @@ defaults:
       simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, outscale: 1.0, winit: trunc_normal_in, outer: False, kernel: 5, bspace: 8, strided: False}
     rewhead: {layers: 1, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
     conhead: {layers: 1, units: 1024, act: silu, norm: rms, output: binary, outscale: 1.0, winit: trunc_normal_in}
+    # SOOPER Mode 2 heads (only built when sooper.mode2_enabled). riskhead
+    # distills the gate's risk_critic (a [0,1] scalar) onto the latent;
+    # priorvalhead is V^pi~_r — the explorer's intrinsic-reward value under
+    # the prior policy (a value head, so symexp_twohot like `value`).
+    riskhead: {layers: 1, units: 1024, act: silu, norm: rms, output: mse, outscale: 1.0, winit: trunc_normal_in}
+    priorvalhead: {layers: 3, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
     ball_pos_head: {layers: 1, units: 256, act: silu, norm: rms, output: mse, outscale: 1.0, winit: trunc_normal_in}
     ball_vel_head: {layers: 1, units: 256, act: silu, norm: rms, output: mse, outscale: 1.0, winit: trunc_normal_in}
     policy: {layers: 3, units: 1024, act: silu, norm: rms, minstd: 0.1, maxstd: 1.0, outscale: 0.01, unimix: 0.01, winit: trunc_normal_in}

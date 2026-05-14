@@ -156,6 +156,10 @@ def make_agent(config):
       report_length=config.report_length,
       replica=config.replica,
       replicas=config.replicas,
+      # SOOPER Mode 2 reads the same sooper block the PolicySwitcher uses,
+      # so the in-imagination switching condition reuses the exact Mode 1
+      # calibration (budget_d / gamma_cost).
+      sooper=config.sooper,
   ))
 
 

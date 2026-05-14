@@ -25,6 +25,7 @@ class CyberRunner(embodied.Env):
         size=(64, 64),
         layout='hard',
         grayscale=True,
+        chain_on_survival=False,
     ):
         # Make the top-level cyberrunner_env_vision module importable.
         if repo_root is None:
@@ -56,6 +57,11 @@ class CyberRunner(embodied.Env):
         self._size = tuple(size)
         self._done = True
         self._info = None
+        # Persistent-spawn chaining: when True, an episode that ends by
+        # anything other than a hole-fall (timeout or goal) chains — the
+        # next episode starts from that episode's final physical state
+        # instead of a fresh waypoint spawn. Only a hole resets to origin.
+        self._chain_on_survival = bool(chain_on_survival)
 
     @property
     def info(self):
@@ -89,6 +95,15 @@ class CyberRunner(embodied.Env):
         spaces['log/hole_terminated']    = elements.Space(np.float32)
         spaces['log/goal_terminated']    = elements.Space(np.float32)
         spaces['log/timeout_terminated'] = elements.Space(np.float32)
+        # SOOPER Mode 2 plumbing: placeholder slots the env always emits as
+        # 0.0. The PolicySwitcher overrides them via the policy `outs` dict
+        # (the driver merges `outs` after `obs`), so when the gate is active
+        # these carry the per-step risk_critic and prior_active flag into
+        # replay. Excluded from the encoder/decoder in agent.py (like
+        # `reward`); consumed only as loss targets for the distilled risk
+        # head and the V^pi~_r intrinsic-value head.
+        spaces['prior_risk']   = elements.Space(np.float32)
+        spaces['prior_active'] = elements.Space(np.float32)
         return spaces
 
     @functools.cached_property
@@ -102,7 +117,21 @@ class CyberRunner(embodied.Env):
     def step(self, action):
         if action['reset'] or self._done:
             self._done = False
-            obs, self._info = self._env.reset()
+            # Persistent-spawn chaining: if the previous episode ended by
+            # anything other than a hole-fall, continue from its final
+            # physical state. self._env.data still holds the terminal state
+            # here (reset() hasn't run yet); self._info holds the terminal
+            # step's termination_reason. First reset / hole-fall → None →
+            # the underlying env does its normal waypoint spawn.
+            options = None
+            if self._chain_on_survival and self._info is not None:
+                reason = self._info.get('termination_reason', '')
+                if reason and reason != 'hole':
+                    options = {'restore_state': {
+                        'qpos': self._env.data.qpos.copy(),
+                        'qvel': self._env.data.qvel.copy(),
+                    }}
+            obs, self._info = self._env.reset(options=options)
             obs = self._stack_states(obs, reset=True)
             return self._obs(obs, 0.0, is_first=True)
         act = np.asarray(action['action'], dtype=np.float32)
@@ -147,6 +176,9 @@ class CyberRunner(embodied.Env):
         out['log/hole_terminated']    = np.float32(1.0 if reason == 'hole' else 0.0)
         out['log/goal_terminated']    = np.float32(1.0 if reason == 'goal' else 0.0)
         out['log/timeout_terminated'] = np.float32(1.0 if reason == 'timeout' else 0.0)
+        # Placeholder SOOPER Mode 2 slots — overridden by PolicySwitcher outs.
+        out['prior_risk']   = np.float32(0.0)
+        out['prior_active'] = np.float32(0.0)
         return out
 
     def render(self):
