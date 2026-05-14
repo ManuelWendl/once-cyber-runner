@@ -58,6 +58,8 @@ def parse_args():
         default=None,
         help="Override env.safe_prior_sigma (only used by exp_d_sigma).",
     )
+    p.add_argument("--episode-length", type=int, default=None,
+                   help="Override env.episode_length (control-step truncation cap).")
     p.add_argument("--init-ball-speed", type=float, default=None,
                    help="Override env.init_ball_speed (max spawn ball speed, m/s).")
     p.add_argument("--init-tilt-frac", type=float, default=None,
@@ -139,6 +141,8 @@ def main():
         config["env"]["safe_prior_strategy"] = args.prior_strategy
     if args.prior_sigma is not None:
         config["env"]["safe_prior_sigma"] = args.prior_sigma
+    if args.episode_length is not None:
+        config["env"]["episode_length"] = args.episode_length
     if args.init_ball_speed is not None:
         config["env"]["init_ball_speed"] = args.init_ball_speed
     if args.init_tilt_frac is not None:
