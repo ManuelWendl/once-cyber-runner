@@ -116,11 +116,14 @@ class CyberRunner(embodied.Env):
         return {
             'action': self._convert(space),
             'reset': elements.Space(bool),
-            # SOOPER max_prior_hold signal from PolicySwitcher. Declared here
-            # so replay accepts it; filtered out of the agent's act_space in
-            # main.py (mirrors `reset`). 0.0 by default (e.g. plain OPAX) →
+            # SOOPER max_prior_hold signal from PolicySwitcher. Declared as
+            # bool (discrete) so wrap_env's NormalizeAction/ClipAction skip
+            # it — those wrappers promote float32 → float64 via the (x+1)/2
+            # arithmetic against Python-float space bounds and trip
+            # CheckSpaces. Filtered out of the agent's act_space in main.py
+            # (mirrors `reset`). False by default (e.g. plain OPAX) →
             # no truncation.
-            '_force_terminate': elements.Space(np.float32),
+            '_force_terminate': elements.Space(bool),
         }
 
     def step(self, action):
@@ -150,7 +153,7 @@ class CyberRunner(embodied.Env):
         # prior has been driving for too many consecutive steps. Only override
         # when the env didn't naturally terminate this step — a real hole-fall
         # wins (so chain_on_survival still routes the hole to origin spawn).
-        force_term = bool(float(action.get('_force_terminate', 0.0)) > 0.5)
+        force_term = bool(action.get('_force_terminate', False))
         if force_term and not natural_done:
             self._info = dict(self._info) if self._info is not None else {}
             self._info['termination_reason'] = 'prior_hold'

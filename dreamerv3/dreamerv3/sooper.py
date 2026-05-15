@@ -822,7 +822,7 @@ class PolicySwitcher:
         # the agent's act_space in main.py (so the WM doesn't see it as an
         # action), mirroring the `reset` precedent.
         acts = {act_key: final_act,
-                '_force_terminate': force_terminate.astype(np.float32)}
+                '_force_terminate': force_terminate.astype(bool)}
 
         out = dict(out) if out else {}
         out.update(self._gate_log(
