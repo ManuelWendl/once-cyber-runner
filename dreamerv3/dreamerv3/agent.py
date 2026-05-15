@@ -164,6 +164,15 @@ class Agent(embodied.jax.Agent):
     spaces = {}
     spaces['consec'] = elements.Space(np.int32)
     spaces['stepid'] = elements.Space(np.uint8, 20)
+    # SOOPER `_force_terminate`: env-side max_prior_hold signal emitted by
+    # PolicySwitcher in `acts` so env.step receives it. The driver also
+    # merges acts into `trans` → it lands in replay. Without this entry the
+    # agent's self.spaces wouldn't include it and the data/spaces assertion
+    # in embodied/jax/agent.py would fail on sooper runs. Filtered from
+    # self.act_space in main.py so the loss/policy iteration never treats
+    # it as a real action — it just rides in replay as inert metadata.
+    if bool(getattr(self.config.sooper, 'enabled', False)):
+      spaces['_force_terminate'] = elements.Space(bool)
     if self.config.replay_context:
       spaces.update(elements.tree.flatdict(dict(
           enc=self.enc.entry_space,
