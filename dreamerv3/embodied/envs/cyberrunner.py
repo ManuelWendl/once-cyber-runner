@@ -95,6 +95,10 @@ class CyberRunner(embodied.Env):
         spaces['log/hole_terminated']    = elements.Space(np.float32)
         spaces['log/goal_terminated']    = elements.Space(np.float32)
         spaces['log/timeout_terminated'] = elements.Space(np.float32)
+        # SOOPER max_prior_hold: episode truncated because the PolicySwitcher
+        # held the prior active for too long. Treated as a non-hole
+        # termination (chains via chain_on_survival).
+        spaces['log/prior_hold_terminated'] = elements.Space(np.float32)
         # SOOPER Mode 2 plumbing: placeholder slots the env always emits as
         # 0.0. The PolicySwitcher overrides them via the policy `outs` dict
         # (the driver merges `outs` after `obs`), so when the gate is active
@@ -112,6 +116,11 @@ class CyberRunner(embodied.Env):
         return {
             'action': self._convert(space),
             'reset': elements.Space(bool),
+            # SOOPER max_prior_hold signal from PolicySwitcher. Declared here
+            # so replay accepts it; filtered out of the agent's act_space in
+            # main.py (mirrors `reset`). 0.0 by default (e.g. plain OPAX) →
+            # no truncation.
+            '_force_terminate': elements.Space(np.float32),
         }
 
     def step(self, action):
@@ -136,7 +145,18 @@ class CyberRunner(embodied.Env):
             return self._obs(obs, 0.0, is_first=True)
         act = np.asarray(action['action'], dtype=np.float32)
         obs, reward, terminated, truncated, self._info = self._env.step(act)
-        self._done = bool(terminated or truncated)
+        natural_done = bool(terminated or truncated)
+        # SOOPER max_prior_hold: PolicySwitcher requests truncation when the
+        # prior has been driving for too many consecutive steps. Only override
+        # when the env didn't naturally terminate this step — a real hole-fall
+        # wins (so chain_on_survival still routes the hole to origin spawn).
+        force_term = bool(float(action.get('_force_terminate', 0.0)) > 0.5)
+        if force_term and not natural_done:
+            self._info = dict(self._info) if self._info is not None else {}
+            self._info['termination_reason'] = 'prior_hold'
+            self._done = True
+        else:
+            self._done = natural_done
         obs = self._stack_states(obs, reset=False)
         return self._obs(
             obs,
@@ -176,6 +196,7 @@ class CyberRunner(embodied.Env):
         out['log/hole_terminated']    = np.float32(1.0 if reason == 'hole' else 0.0)
         out['log/goal_terminated']    = np.float32(1.0 if reason == 'goal' else 0.0)
         out['log/timeout_terminated'] = np.float32(1.0 if reason == 'timeout' else 0.0)
+        out['log/prior_hold_terminated'] = np.float32(1.0 if reason == 'prior_hold' else 0.0)
         # Placeholder SOOPER Mode 2 slots — overridden by PolicySwitcher outs.
         out['prior_risk']   = np.float32(0.0)
         out['prior_active'] = np.float32(0.0)

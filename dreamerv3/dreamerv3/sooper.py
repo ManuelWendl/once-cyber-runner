@@ -561,6 +561,9 @@ class PolicySwitcher:
             # but allocated unconditionally so the dispatch branch is cheap).
             self.cost_accum   = np.zeros(B, dtype=np.float32)
             self.step_idx     = np.zeros(B, dtype=np.int32)
+            # max_prior_hold: consecutive prior_active=True steps per env.
+            # Resets on is_first or on any step where prior_active is False.
+            self.prior_hold_count = np.zeros(B, dtype=np.int32)
 
     # Optional log/* keys we try to surface from obs. Missing keys are
     # silently skipped — the env may not expose all of them.
@@ -654,6 +657,7 @@ class PolicySwitcher:
             self.cooldown[first]     = 0
             self.cost_accum[first]   = 0.0
             self.step_idx[first]     = 0
+            self.prior_hold_count[first] = 0
             self.adapter.reset_envs(first)
 
         # 1. Run the agent's jitted policy in 'sooper' mode: returns OPAX
@@ -792,6 +796,18 @@ class PolicySwitcher:
             self.hold_count   = new_hold
             self.cooldown     = new_cool
 
+        # max_prior_hold: count consecutive prior-driven steps per env. Resets
+        # to 0 on any step the prior is NOT active (or on is_first, handled
+        # above). When count reaches the threshold, signal the env wrapper to
+        # truncate this episode (non-hole → chains via chain_on_survival).
+        self.prior_hold_count = np.where(
+            self.prior_active, self.prior_hold_count + 1, 0).astype(np.int32)
+        max_hold = int(getattr(self.cfg, 'max_prior_hold_steps', 0))
+        if max_hold > 0:
+            force_terminate = (self.prior_hold_count >= max_hold)
+        else:
+            force_terminate = np.zeros_like(self.prior_active, dtype=bool)
+
         # 5. Action mux. Overwrite carry's prevact so the world model
         # next step conditions on the action that actually executed.
         # NB: carry[3] is a DICT keyed by act_space (per agent.init_policy
@@ -800,7 +816,13 @@ class PolicySwitcher:
         final_act = np.where(self.prior_active[:, None],
                              prior_act_np, opax_act_arr).astype(np.float32)
         new_carry = (*carry[:3], {act_key: jnp.asarray(final_act)})
-        acts = {act_key: final_act}
+        # `_force_terminate` is consumed by the env wrapper to truncate when
+        # prior_hold_count crosses max_prior_hold_steps. It must be declared
+        # in the env's act_space (so replay accepts it) and filtered out of
+        # the agent's act_space in main.py (so the WM doesn't see it as an
+        # action), mirroring the `reset` precedent.
+        acts = {act_key: final_act,
+                '_force_terminate': force_terminate.astype(np.float32)}
 
         out = dict(out) if out else {}
         out.update(self._gate_log(

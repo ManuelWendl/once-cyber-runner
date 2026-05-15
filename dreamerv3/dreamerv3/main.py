@@ -139,7 +139,11 @@ def make_agent(config):
   env = make_env(config, 0)
   notlog = lambda k: not k.startswith('log/')
   obs_space = {k: v for k, v in env.obs_space.items() if notlog(k)}
-  act_space = {k: v for k, v in env.act_space.items() if k != 'reset'}
+  # `reset` and `_force_terminate` are driver/wrapper-level action keys,
+  # not real environment actions — keep them out of the agent's act_space
+  # so the world model never sees them as previous actions.
+  act_space = {k: v for k, v in env.act_space.items()
+               if k not in ('reset', '_force_terminate')}
   env.close()
   if config.random_agent:
     return embodied.RandomAgent(obs_space, act_space)
