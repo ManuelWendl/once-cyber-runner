@@ -160,10 +160,15 @@ defaults:
     rewhead: {layers: 1, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
     conhead: {layers: 1, units: 1024, act: silu, norm: rms, output: binary, outscale: 1.0, winit: trunc_normal_in}
     # SOOPER Mode 2 heads (only built when sooper.mode2_enabled). riskhead
-    # distills the gate's risk_critic (a [0,1] scalar) onto the latent;
-    # priorvalhead is V^pi~_r — the explorer's intrinsic-reward value under
-    # the prior policy (a value head, so symexp_twohot like `value`).
-    riskhead: {layers: 1, units: 1024, act: silu, norm: rms, output: mse, outscale: 1.0, winit: trunc_normal_in}
+    # distills V_prior (the survival prior's value-head output, range
+    # ~40-135). imag_loss then recovers risk_critic via the same clip the
+    # gate applies on real V_prior (clip(1-V/V_norm, 0, 1)). Distilling
+    # V_prior directly avoids the 97% zero-mass imbalance that collapsed
+    # an earlier risk_critic-target version of this head. Mirrors the value
+    # head config (3 layers, symexp_twohot, wide-range-robust). priorvalhead
+    # is V^pi~_r — the explorer's intrinsic-reward value under the prior
+    # policy.
+    riskhead: {layers: 3, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
     priorvalhead: {layers: 3, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
     ball_pos_head: {layers: 1, units: 256, act: silu, norm: rms, output: mse, outscale: 1.0, winit: trunc_normal_in}
     ball_vel_head: {layers: 1, units: 256, act: silu, norm: rms, output: mse, outscale: 1.0, winit: trunc_normal_in}

@@ -36,11 +36,13 @@ class Agent(embodied.jax.Agent):
     self.act_space = act_space
     self.config = config
 
-    # `prior_risk` / `prior_active` are SOOPER Mode 2 replay slots — loss
-    # targets for the distilled risk head and the V^pi~_r head, never
-    # encoded or reconstructed (same treatment as `reward`).
+    # `prior_*` keys are SOOPER Mode 2 replay slots — loss targets for the
+    # distilled risk head and the V^pi~_r head, never encoded or
+    # reconstructed (same treatment as `reward`). `prior_v` is the raw
+    # survival-prior V_prior that the risk head regresses; `prior_risk` is
+    # kept for analysis logging.
     exclude = ('is_first', 'is_last', 'is_terminal', 'reward',
-               'prior_risk', 'prior_active')
+               'prior_risk', 'prior_active', 'prior_v')
     enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
     dec_space = {k: v for k, v in obs_space.items() if k not in exclude}
     self.enc = {
@@ -104,6 +106,16 @@ class Agent(embodied.jax.Agent):
       self.risk = embodied.jax.MLPHead(scalar, **config.riskhead, name='risk')
       self.priorval = embodied.jax.MLPHead(
           scalar, **config.priorvalhead, name='priorval')
+      # Polyak-averaged slow copy of priorval — used as the bootstrap target
+      # in the priorval lambda-return so the head doesn't self-bootstrap.
+      # v1 ran with boot=sg(pv) which is a self-reinforcing positive-feedback
+      # loop: a too-high pv pulls the target even higher, head loss grew
+      # 0.41 → 0.49 over 100k steps and pv ran to ~3-47 vs ~0.4-2 real
+      # targets. Mirrors the slowval/val pattern (same slowvalue config).
+      self.slowpriorval = embodied.jax.SlowModel(
+          embodied.jax.MLPHead(
+              scalar, **config.priorvalhead, name='slowpriorval'),
+          source=self.priorval, **config.slowvalue)
 
     self.modules = [
         self.dyn, self.enc, self.dec, self.con,
@@ -111,7 +123,7 @@ class Agent(embodied.jax.Agent):
     if self.has_reward_head:
       self.modules.insert(3, self.rew)
     if self.mode2_enabled:
-      self.modules += [self.risk, self.priorval]
+      self.modules += [self.risk, self.priorval, self.slowpriorval]
 
     if self.exploration_reward != 'none':
       rssm_cfg = config.dyn[config.dyn.typ]
@@ -225,6 +237,8 @@ class Agent(embodied.jax.Agent):
         self.loss, carry, obs, prevact, training=True, has_aux=True)
     metrics.update(mets)
     self.slowval.update()
+    if self.mode2_enabled:
+      self.slowpriorval.update()
     outs = {}
     if self.config.replay_context:
       updates = elements.tree.flatdict(dict(
@@ -262,14 +276,20 @@ class Agent(embodied.jax.Agent):
       con *= 1 - 1 / self.config.horizon
     losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
     if self.mode2_enabled:
-      # SOOPER Mode 2: distill the gate's risk_critic onto the latent so the
-      # in-imagination switching condition can read it. Stop-grad the input
-      # — this auxiliary readout must not perturb the working world-model
-      # representation. obs['prior_risk'] is what the PolicySwitcher wrote
-      # into replay (0.0 on no-gate steps, e.g. warmup — harmless, the head
-      # just learns 0 there).
+      # SOOPER Mode 2: distill V_prior (the survival prior's value head)
+      # onto the latent so the in-imagination switching condition can
+      # recover risk_critic via clip(1 - V/V_norm). Distilling V_prior
+      # directly (continuous, range ~40-135) avoids the 97% zero-mass
+      # imbalance that collapsed a risk_critic-target version of this head
+      # to predicting ~0 everywhere. Stop-grad input — auxiliary readout,
+      # must not perturb the working world-model representation.
+      # obs['prior_v'] is what the PolicySwitcher wrote into replay (0.0
+      # on no-gate steps, e.g. warmup — harmless).
       losses['risk'] = self.risk(
-          sg(self.feat2tensor(repfeat)), 2).loss(obs['prior_risk'])
+          sg(self.feat2tensor(repfeat)), 2).loss(obs['prior_v'])
+      metrics['sooper/v_pred_mean']   = self.risk(
+          sg(self.feat2tensor(repfeat)), 2).pred().mean()
+      metrics['sooper/v_target_mean'] = obs['prior_v'].mean()
     for key, recon in recons.items():
       space, value = self.obs_space[key], obs[key]
       assert value.dtype == space.dtype, (key, space, value.dtype)
@@ -305,20 +325,26 @@ class Agent(embodied.jax.Agent):
         # rollout, so its intrinsic-reward lambda-return is an unbiased
         # V^pi~_r target. Reuses `preds` (real-trajectory ensemble preds)
         # from just above; intrinsic reward matches the imagination bonus
-        # (exploration_lambd * disagreement).
+        # (exploration_lambd * disagreement). Bootstrap from slowpriorval
+        # (Polyak-averaged copy of priorval) NOT from pv itself — v1
+        # self-bootstrapped via boot=sg(pv) which created a positive feedback
+        # loop, runaway pv (3-47) and growing loss (0.41 → 0.49).
         intr = self.exploration_lambd * expl.disagreement(preds)  # (B,T-1)
         intr = jnp.pad(intr, ((0, 0), (0, 1)))                    # (B,T)
         pv_head = self.priorval(sg(self.feat2tensor(repfeat)), 2)
         pv = pv_head.pred()                                       # (B,T)
+        pv_slow = sg(self.slowpriorval(
+            sg(self.feat2tensor(repfeat)), 2).pred())             # (B,T)
         disc = 1 - 1 / self.config.horizon
         pv_ret = lambda_return(
             f32(obs['is_last']), f32(obs['is_terminal']), intr,
-            sg(pv), sg(pv), disc, 0.95)                           # (B,T-1)
+            pv_slow, pv_slow, disc, 0.95)                          # (B,T-1)
         pv_ret = jnp.concatenate([pv_ret, 0 * pv_ret[:, -1:]], 1)  # (B,T)
         w = obs['prior_active']                                   # (B,T)
         losses['priorval'] = jnp.pad(
             (w * pv_head.loss(sg(pv_ret)))[:, :-1], ((0, 0), (0, 1)))
         metrics['sooper/priorval_mean'] = pv.mean()
+        metrics['sooper/priorval_slow_mean'] = pv_slow.mean()
         metrics['sooper/intr_reward_mean'] = intr.mean()
         metrics['sooper/prior_active_frac'] = w.mean()
 
@@ -361,18 +387,21 @@ class Agent(embodied.jax.Agent):
       else:
         imag_rew = bonus
 
-    # SOOPER Mode 2: evaluate the distilled risk head + V^pi~_r head on the
+    # SOOPER Mode 2: evaluate the distilled V_prior head + V^pi~_r head on
     # imagined latents so imag_loss can apply the in-imagination switching
-    # condition. sg() — these heads are trained by their own losses above,
-    # not through the actor loss. Reuses the v10-locked Mode 1 calibration.
+    # condition. The risk head outputs V_prior (not risk_critic); imag_loss
+    # recovers risk via the same clip(1-V/V_norm) the gate uses. sg() —
+    # these heads are trained by their own losses above, not through the
+    # actor loss. Reuses the v10-locked Mode 1 calibration.
     mode2_kw = {}
     if self.mode2_enabled:
       mode2_kw = dict(
           mode2=True,
-          risk_imag=sg(self.risk(inp, 2).pred()),
+          v_imag=sg(self.risk(inp, 2).pred()),
           priorval_imag=sg(self.priorval(inp, 2).pred()),
           budget_d=float(self.config.sooper.budget_d),
           gamma_cost=float(self.config.sooper.gamma_cost),
+          V_norm=float(self.config.sooper.V_norm),
       )
     los, imgloss_out, mets = imag_loss(
         imgact,
@@ -597,10 +626,11 @@ def imag_loss(
     actent=3e-4,
     slowreg=1.0,
     mode2=False,
-    risk_imag=None,
+    v_imag=None,
     priorval_imag=None,
     budget_d=0.1,
     gamma_cost=0.999,
+    V_norm=88.0,
 ):
   losses = {}
   metrics = {}
@@ -620,10 +650,15 @@ def imag_loss(
     # truncate the explorer's credit there, bootstrapping with V^pi~_r.
     #   cost_t   = 1 - con  (per-step termination prob — imagination analog
     #              of the binary hole cost log/hole_terminated in Mode 1)
-    #   q_pess_t = risk_imag  (distilled risk_critic; λ·σ omitted, λ=0)
+    #   q_pess_t = clip(1 - v_imag/V_norm)  — distilled risk_critic, recovered
+    #              from the V_prior head via the same clip the real gate
+    #              applies on real V_prior. (Distilling V_prior directly
+    #              avoids the zero-mass imbalance of risk_critic targets.)
+    #              λ·σ omitted (λ=0).
     #   t        = imagination step index. Over H≈15 with gamma_cost≈0.999
     #              the γ^t decay is <2%, so using imagination-relative t
     #              (the real step_in_ep isn't available here) is fine.
+    risk_imag = jnp.clip(1.0 - v_imag / V_norm, 0.0, 1.0)
     t_idx = jnp.arange(con.shape[1], dtype=f32)
     gamma_t = (gamma_cost ** t_idx)[None, :]
     disc_cost = gamma_t * (1.0 - con)
@@ -642,6 +677,7 @@ def imag_loss(
     weight = weight * (1.0 - switched)
     metrics['sooper/switch_frac'] = switched.mean()
     metrics['sooper/phi_mean'] = phi.mean()
+    metrics['sooper/v_imag_mean'] = v_imag.mean()
     metrics['sooper/risk_imag_mean'] = risk_imag.mean()
     metrics['sooper/priorval_imag_mean'] = priorval_imag.mean()
 

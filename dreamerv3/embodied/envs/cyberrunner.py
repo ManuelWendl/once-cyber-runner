@@ -108,6 +108,12 @@ class CyberRunner(embodied.Env):
         # head and the V^pi~_r intrinsic-value head.
         spaces['prior_risk']   = elements.Space(np.float32)
         spaces['prior_active'] = elements.Space(np.float32)
+        # Raw V_prior (the survival prior's value-head output) — the
+        # distilled risk head regresses this instead of risk_critic because
+        # ~97% of risk_critic targets are 0.0 with v10-calibrated V_norm,
+        # which collapsed the head to predicting ~0 everywhere. V_prior has
+        # a natural continuous distribution (~40-135).
+        spaces['prior_v']      = elements.Space(np.float32)
         return spaces
 
     @functools.cached_property
@@ -203,6 +209,7 @@ class CyberRunner(embodied.Env):
         # Placeholder SOOPER Mode 2 slots — overridden by PolicySwitcher outs.
         out['prior_risk']   = np.float32(0.0)
         out['prior_active'] = np.float32(0.0)
+        out['prior_v']      = np.float32(0.0)
         return out
 
     def render(self):

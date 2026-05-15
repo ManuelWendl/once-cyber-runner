@@ -831,15 +831,20 @@ class PolicySwitcher:
             log_signals,
         ))
 
-        # SOOPER Mode 2 plumbing: surface the per-step risk_critic and the
-        # post-gate prior_active flag so they land in replay. The env emits
-        # `prior_risk` / `prior_active` as placeholder zeros; the driver
-        # merges this `out` dict AFTER `obs`, so these values win. agent.py
-        # consumes them as loss targets for the distilled risk head and the
-        # V^pi~_r intrinsic-value head. risk_critic is only computed when a
-        # value_fn was loaded (always true for cost_tracking / Mode 2 runs).
+        # SOOPER Mode 2 plumbing: surface the per-step risk_critic, the raw
+        # V_prior, and the post-gate prior_active flag so they land in
+        # replay. The env emits `prior_risk` / `prior_v` / `prior_active` as
+        # placeholder zeros; the driver merges this `out` dict AFTER `obs`,
+        # so these values win. agent.py consumes them as loss targets:
+        # `prior_v` for the distilled risk head (regression target with full
+        # dynamic range, no zero-mass imbalance) and `prior_active` as the
+        # V^pi~_r training mask. `prior_risk` is kept for logging /
+        # backwards-compatible dumps. All three require a loaded value_fn.
         out['prior_risk'] = (
             risk_critic if self._value_fn is not None
+            else np.zeros(B, dtype=np.float32))
+        out['prior_v'] = (
+            V if self._value_fn is not None
             else np.zeros(B, dtype=np.float32))
         out['prior_active'] = self.prior_active.astype(np.float32)
 
