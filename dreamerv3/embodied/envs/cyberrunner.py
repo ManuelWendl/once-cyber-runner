@@ -26,6 +26,7 @@ class CyberRunner(embodied.Env):
         layout='hard',
         grayscale=True,
         chain_on_survival=False,
+        chain_only_on_prior_hold=False,
     ):
         # Make the top-level cyberrunner_env_vision module importable.
         if repo_root is None:
@@ -61,7 +62,15 @@ class CyberRunner(embodied.Env):
         # anything other than a hole-fall (timeout or goal) chains — the
         # next episode starts from that episode's final physical state
         # instead of a fresh waypoint spawn. Only a hole resets to origin.
+        # `chain_only_on_prior_hold` further restricts the chain to ONLY
+        # fire when the previous episode ended via PolicySwitcher's
+        # max_prior_hold truncation (termination_reason='prior_hold').
+        # Useful when natural timeouts loop the actor back into a safe
+        # pocket — restricting to prior_hold-only keeps the chained
+        # spawns at danger-boundary states the prior stabilized,
+        # which is where the exploration breadcrumbs live.
         self._chain_on_survival = bool(chain_on_survival)
+        self._chain_only_on_prior_hold = bool(chain_only_on_prior_hold)
 
     @property
     def info(self):
@@ -144,7 +153,11 @@ class CyberRunner(embodied.Env):
             options = None
             if self._chain_on_survival and self._info is not None:
                 reason = self._info.get('termination_reason', '')
-                if reason and reason != 'hole':
+                if self._chain_only_on_prior_hold:
+                    should_chain = (reason == 'prior_hold')
+                else:
+                    should_chain = bool(reason) and reason != 'hole'
+                if should_chain:
                     options = {'restore_state': {
                         'qpos': self._env.data.qpos.copy(),
                         'qvel': self._env.data.qvel.copy(),
