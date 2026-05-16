@@ -674,12 +674,17 @@ def imag_loss(
     c_lt = jnp.cumsum(disc_cost, 1) - disc_cost            # exclusive cumsum
     phi = c_lt + gamma_t * risk_imag
     switched = (jnp.cumsum((phi >= budget_d).astype(f32), 1) > 0).astype(f32)
-    # r̃(s_t): at/after the switch the explorer's reward becomes V^pi~_r.
-    # Only the first switched step's value actually feeds the return — later
-    # steps are masked out of the loss by `weight` below.
-    rew = jnp.where(switched > 0, priorval_imag, rew)
+    # r̃(s_t): at/after the switch the explorer's reward is 0 (the survival
+    # prior earns ~0 intrinsic reward — it doesn't explore by definition,
+    # so V^π̃_r ≈ 0 theoretically). The learned priorval head was empirically
+    # inflated ~3× over the theoretical λ-return of intr_reward, which gave
+    # the actor a wrong-sign gradient (favoring gate triggers). 0 is the
+    # principled lower bound; priorval_imag is retained as a diagnostic
+    # metric so the inflation can still be observed.
+    rew = jnp.where(switched > 0, 0.0, rew)
     # Treat the switch as a terminal event so lambda_return stops
-    # accumulating future reward there and picks up V^pi~_r as the bootstrap.
+    # accumulating future reward there. With 0 bootstrap, the actor learns
+    # to *avoid* triggering (triggering = 0 future return).
     term = jnp.maximum(term, switched)
     # Truncate the actor's (and value's) credit at/after the switch — the
     # explorer's actions past the switch are not executed (prior is driving).
