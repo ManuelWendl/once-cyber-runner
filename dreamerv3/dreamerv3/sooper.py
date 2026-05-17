@@ -798,15 +798,39 @@ class PolicySwitcher:
 
         # max_prior_hold: count consecutive prior-driven steps per env. Resets
         # to 0 on any step the prior is NOT active (or on is_first, handled
-        # above). When count reaches the threshold, signal the env wrapper to
-        # truncate this episode (non-hole → chains via chain_on_survival).
+        # above). When the count crosses the threshold, RELEASE control back
+        # to the explorer (post-v4 redesign — previously this force-terminated
+        # the episode, which meant the world model never observed "prior
+        # rescued me → I kept exploring"). We zero cost_accum + prior_hold
+        # at release so the gate has to re-trigger from a fresh budget rather
+        # than re-firing on stale accumulated cost. step_idx is NOT reset —
+        # γ^t decay continues in episode-time so the budget stays
+        # conservative late in the episode.
+        #
+        # SAFETY NOTE: this breaks SOOPER's monotone-latch theorem (Theorem 1
+        # of the paper assumes Φ is non-decreasing and the gate is one-way).
+        # In this env it's a deliberate trade — the binary hole cost only
+        # fires at terminal events, so c_<t stays 0 across the release
+        # boundary anyway, and we recover an exploration signal the formal
+        # guarantee was suppressing.
         self.prior_hold_count = np.where(
             self.prior_active, self.prior_hold_count + 1, 0).astype(np.int32)
         max_hold = int(getattr(self.cfg, 'max_prior_hold_steps', 0))
         if max_hold > 0:
-            force_terminate = (self.prior_hold_count >= max_hold)
-        else:
-            force_terminate = np.zeros_like(self.prior_active, dtype=bool)
+            release_now = (
+                (self.prior_hold_count >= max_hold) & self.prior_active)
+            self.prior_active = self.prior_active & ~release_now
+            self.cost_accum = np.where(
+                release_now, np.float32(0.0), self.cost_accum)
+            self.prior_hold_count = np.where(
+                release_now, np.int32(0), self.prior_hold_count)
+            # Surface the max-hold release in the gate log + per-step dump so
+            # the new path is visible in metrics. Only meaningful in
+            # cost_tracking mode (threshold mode has its own release logic).
+            if gate_mode == 'cost_tracking':
+                released_flag = release_now.astype(bool)
+                hard_released_flag = release_now.astype(bool)
+        force_terminate = np.zeros_like(self.prior_active, dtype=bool)
 
         # 5. Action mux. Overwrite carry's prevact so the world model
         # next step conditions on the action that actually executed.

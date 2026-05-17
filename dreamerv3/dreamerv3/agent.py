@@ -411,6 +411,8 @@ class Agent(embodied.jax.Agent):
           budget_d=float(self.config.sooper.budget_d),
           gamma_cost=float(self.config.sooper.gamma_cost),
           V_norm=float(self.config.sooper.V_norm),
+          lambda_cost=float(
+              getattr(self.config.sooper, 'lambda_cost', 0.5)),
       )
     los, imgloss_out, mets = imag_loss(
         imgact,
@@ -640,6 +642,7 @@ def imag_loss(
     budget_d=0.1,
     gamma_cost=0.999,
     V_norm=88.0,
+    lambda_cost=0.5,
 ):
   losses = {}
   metrics = {}
@@ -654,45 +657,32 @@ def imag_loss(
   term = 1 - con
 
   if mode2:
-    # SOOPER Mode 2: planning-MDP termination. Evaluate the in-imagination
-    # switching condition Φ = c_<t + γ^t·q_pess at every imagined latent and
-    # truncate the explorer's credit there, bootstrapping with V^pi~_r.
-    #   cost_t   = 1 - con  (per-step termination prob — imagination analog
-    #              of the binary hole cost log/hole_terminated in Mode 1)
-    #   q_pess_t = clip(1 - v_imag/V_norm)  — distilled risk_critic, recovered
-    #              from the V_prior head via the same clip the real gate
-    #              applies on real V_prior. (Distilling V_prior directly
-    #              avoids the zero-mass imbalance of risk_critic targets.)
-    #              λ·σ omitted (λ=0).
-    #   t        = imagination step index. Over H≈15 with gamma_cost≈0.999
-    #              the γ^t decay is <2%, so using imagination-relative t
-    #              (the real step_in_ep isn't available here) is fine.
+    # SOOPER Mode 2 (post-v4 redesign): SOFT per-step cost penalty in
+    # imagination — no termination, no credit truncation. This replaces the
+    # v1-v4 hard-terminate-at-switch design.
+    #
+    # Why the redesign: in the pure-OPAX + survival-prior setting, V^π̃_r ≈ 0
+    # (the survival prior doesn't explore, so its intrinsic-reward value is
+    # ~0). With reward=0 + term=1 at switched states, the actor saw "gate
+    # trigger ≡ falling in a hole" — both yield 0 future return. Combined
+    # with the cost signal `1 - V_prior/V_norm` being structurally high in
+    # novel regions (V_prior under-confident outside training distribution),
+    # the actor learned to avoid the gate ↔ avoid novelty. The v4 100k run
+    # showed coverage frozen at 0.033 and intrinsic reward collapsed 150×.
+    #
+    # The fix: augmented-Lagrangian-style soft CMDP relaxation. The actor
+    # pays `lambda_cost · risk_imag` per imagined step but the trajectory
+    # continues uninterrupted. Mode 1 (real-rollout cost_tracking gate) still
+    # provides hard safety on actually-executed trajectories. The priorval
+    # head keeps training for diagnostic comparison (logged as priorval_mean
+    # in the real-trajectory loss above) but is no longer used as a bootstrap
+    # value.
     risk_imag = jnp.clip(1.0 - v_imag / V_norm, 0.0, 1.0)
-    t_idx = jnp.arange(con.shape[1], dtype=f32)
-    gamma_t = (gamma_cost ** t_idx)[None, :]
-    disc_cost = gamma_t * (1.0 - con)
-    c_lt = jnp.cumsum(disc_cost, 1) - disc_cost            # exclusive cumsum
-    phi = c_lt + gamma_t * risk_imag
-    switched = (jnp.cumsum((phi >= budget_d).astype(f32), 1) > 0).astype(f32)
-    # r̃(s_t): at/after the switch the explorer's reward is 0 (the survival
-    # prior earns ~0 intrinsic reward — it doesn't explore by definition,
-    # so V^π̃_r ≈ 0 theoretically). The learned priorval head was empirically
-    # inflated ~3× over the theoretical λ-return of intr_reward, which gave
-    # the actor a wrong-sign gradient (favoring gate triggers). 0 is the
-    # principled lower bound; priorval_imag is retained as a diagnostic
-    # metric so the inflation can still be observed.
-    rew = jnp.where(switched > 0, 0.0, rew)
-    # Treat the switch as a terminal event so lambda_return stops
-    # accumulating future reward there. With 0 bootstrap, the actor learns
-    # to *avoid* triggering (triggering = 0 future return).
-    term = jnp.maximum(term, switched)
-    # Truncate the actor's (and value's) credit at/after the switch — the
-    # explorer's actions past the switch are not executed (prior is driving).
-    weight = weight * (1.0 - switched)
-    metrics['sooper/switch_frac'] = switched.mean()
-    metrics['sooper/phi_mean'] = phi.mean()
-    metrics['sooper/v_imag_mean'] = v_imag.mean()
+    penalty = lambda_cost * risk_imag
+    rew = rew - penalty
     metrics['sooper/risk_imag_mean'] = risk_imag.mean()
+    metrics['sooper/penalty_mean'] = penalty.mean()
+    metrics['sooper/v_imag_mean'] = v_imag.mean()
     metrics['sooper/priorval_imag_mean'] = priorval_imag.mean()
 
   ret = lambda_return(last, term, rew, tarval, tarval, disc, lam)

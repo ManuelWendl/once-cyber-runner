@@ -137,11 +137,21 @@ defaults:
     # Mode 2 run still runs the Mode 1 gate to collect prior_risk /
     # prior_active for the head targets.
     mode2_enabled: False
-    # Max consecutive prior-driven steps before the episode is force-truncated
-    # (non-hole termination → chains via env.cyberrunner.chain_on_survival).
-    # 0 disables. Mitigates the monotone-latch pathology where a transient
-    # risk spike triggers the gate and the prior then drives for the rest of
-    # the episode (~1800 wasted steps in v1 Mode 2 runs).
+    # Mode 2 soft penalty scale. Replaces the v3 hard-terminate-at-switch
+    # design (which gave the actor a "0 future return" cliff at any imagined
+    # state where Φ ≥ d → actor learned to avoid the gate → avoided novelty
+    # → intrinsic reward collapsed → coverage frozen at 0.033 in v4). Now
+    # imagination subtracts `lambda_cost · risk_imag` per imagined step, no
+    # termination, no credit truncation. Real-rollout safety still comes from
+    # the cost_tracking gate (Mode 1). Tune knob: 0.3-1.0 is the sweet spot;
+    # higher → more cautious → less exploration; lower → less safe.
+    lambda_cost: 0.5
+    # Max consecutive prior-driven steps. When hit, the gate RELEASES control
+    # back to the explorer (NOT a force-terminate any more) and zeros
+    # cost_accum + prior_hold_count for that env. This breaks SOOPER's
+    # monotone-latch safety theorem but lets the world model see "prior
+    # rescued me → I kept exploring" instead of "prior triggered → episode
+    # died at step 200". 0 disables (no max hold).
     max_prior_hold_steps: 0
 
   agent:
