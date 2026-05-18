@@ -15,17 +15,36 @@ class _CoverageTracker:
     self.board_w = board_w
     self.board_h = board_h
     self.visit_counts = np.zeros((grid_res, grid_res), dtype=np.int64)
+    # First env-step at which each grid cell was visited (-1 = never).
+    # Powers coverage_delta(window) — detects mode collapse that cumulative
+    # coverage hides (cumulative is monotone; delta can drop to zero even
+    # while coverage stays high if the agent stops finding new cells).
+    self._first_visit_step = np.full(
+        (grid_res, grid_res), -1, dtype=np.int64)
+    self._latest_step = 0
     self.max_progress_per_episode = []
     self._current_max = {}
 
-  def update(self, worker, states, path_progress, is_first, is_last):
+  def update(self, worker, states, path_progress, is_first, is_last,
+             env_step=0):
     if states.ndim < 1 or states.shape[-1] < 4:
       return
-    bx, by = float(states[2]), float(states[3])
+    self._latest_step = max(self._latest_step, int(env_step))
+    # states[2], states[3] are normalized by _STATE_SCALES in
+    # cyberrunner_env_vision.py (divided by BOARD_WIDTH/2 and BOARD_HEIGHT/2
+    # respectively), so they live in roughly [0, 2]. The old code divided by
+    # board_w/board_h again, capping every ball position to the leftmost
+    # ~14 % of the grid and silently bounding coverage at ~8 %. Convert back
+    # to physical coords first. NOTE: assumes frame_stack=1; with stacking,
+    # states[2:4] is the OLDEST frame — fine as a long-run coverage proxy.
+    bx = float(states[2]) * (self.board_w / 2.0)
+    by = float(states[3]) * (self.board_h / 2.0)
     cx = min(int(bx / self.board_w * self.grid_res), self.grid_res - 1)
     cy = min(int(by / self.board_h * self.grid_res), self.grid_res - 1)
     cx, cy = max(cx, 0), max(cy, 0)
     self.visit_counts[cy, cx] += 1
+    if self._first_visit_step[cy, cx] < 0:
+      self._first_visit_step[cy, cx] = self._latest_step
 
     pp = float(path_progress)
     if is_first:
@@ -36,6 +55,25 @@ class _CoverageTracker:
 
   def coverage(self):
     return float((self.visit_counts > 0).sum()) / self.visit_counts.size
+
+  def coverage_delta(self, window):
+    """Fraction of cells first-visited within the last `window` env-steps.
+
+    Unlike `coverage()` (cumulative, monotone non-decreasing), this drops to
+    zero when the agent stops finding new cells — even if cumulative
+    coverage remains high. Catches mode collapse: a healthy explorer keeps
+    expanding its frontier; a stalled one shows delta → 0 while coverage
+    plateaus. `window` is in env-step units (same unit as the wandb x-axis).
+    """
+    if self._latest_step <= 0:
+      return 0.0
+    # Mask out unvisited cells (sentinel -1) before the cutoff comparison.
+    # Otherwise early-training (small _latest_step) makes cutoff negative,
+    # and -1 > cutoff would count every unvisited cell as "newly visited".
+    cutoff = self._latest_step - int(window)
+    visited = self._first_visit_step >= 0
+    new_cells = int((visited & (self._first_visit_step > cutoff)).sum())
+    return float(new_cells) / self._first_visit_step.size
 
   def entropy(self):
     total = self.visit_counts.sum()
@@ -107,7 +145,8 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
     pp = tran.get('log/path_progress', np.float32(0.0))
     if states is not None:
       coverage_tracker.update(
-          worker, states, pp, bool(tran['is_first']), bool(tran['is_last']))
+          worker, states, pp, bool(tran['is_first']), bool(tran['is_last']),
+          env_step=int(step))
 
     # Collect video frames from worker 0 (full episode)
     if worker == 0:
@@ -238,8 +277,14 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
           from dreamerv3 import viz
           disagree = np.asarray(result.pop('_heatmap_disagree')).reshape(-1)
           states = np.asarray(result.pop('_heatmap_states'))
-          ball_xy = states[:, 1:, 2:4].reshape(-1, 2)
-          ball_xy_all = states[:, :, 2:4].reshape(-1, 2)
+          # states[2:4] is normalized to [0, 2] by _STATE_SCALES; viz expects
+          # physical board-frame coords in [0, BOARD_WIDTH/HEIGHT]. Unscale
+          # at the boundary so viz.py stays in physical units.
+          scale = np.array(
+              [viz.BOARD_WIDTH / 2.0, viz.BOARD_HEIGHT / 2.0],
+              dtype=np.float32)
+          ball_xy = states[:, 1:, 2:4].reshape(-1, 2) * scale
+          ball_xy_all = states[:, :, 2:4].reshape(-1, 2) * scale
           result['exploration/sigma_heatmap'] = viz.sigma_heatmap(
               disagree, ball_xy)
           result['exploration/coverage_heatmap'] = viz.coverage_heatmap(
@@ -280,6 +325,7 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
       # Coverage and path progress
       logger.add({
           'exploration/coverage': coverage_tracker.coverage(),
+          'exploration/coverage_delta_10k': coverage_tracker.coverage_delta(10_000),
           'exploration/visitation_entropy': coverage_tracker.entropy(),
           'exploration/mean_max_path_progress': coverage_tracker.mean_max_path_progress(),
       })
