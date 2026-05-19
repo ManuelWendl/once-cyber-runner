@@ -40,7 +40,7 @@ defaults:
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False, length: 36000}
     dmc: {size: [64, 64], repeat: 1, proprio: True, image: True, camera: -1}
     loconav: {size: [64, 64], repeat: 1, camera: -1}
-    cyberrunner: {size: [64, 64], episode_length: 2000, randomize_init_pos: False, include_vision: True, frame_stack: 1, layout: hard, grayscale: True, chain_on_survival: False, chain_only_on_prior_hold: False}
+    cyberrunner: {size: [64, 64], episode_length: 2000, randomize_init_pos: False, include_vision: True, frame_stack: 1, layout: hard, grayscale: True, chain_on_survival: False, chain_only_on_prior_hold: False, chain_only_on_timeout: False}
 
   replay:
     size: 5e6

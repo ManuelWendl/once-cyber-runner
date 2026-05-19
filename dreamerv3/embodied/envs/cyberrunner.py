@@ -27,6 +27,7 @@ class CyberRunner(embodied.Env):
         grayscale=True,
         chain_on_survival=False,
         chain_only_on_prior_hold=False,
+        chain_only_on_timeout=False,
     ):
         # Make the top-level cyberrunner_env_vision module importable.
         if repo_root is None:
@@ -62,15 +63,20 @@ class CyberRunner(embodied.Env):
         # anything other than a hole-fall (timeout or goal) chains — the
         # next episode starts from that episode's final physical state
         # instead of a fresh waypoint spawn. Only a hole resets to origin.
-        # `chain_only_on_prior_hold` further restricts the chain to ONLY
-        # fire when the previous episode ended via PolicySwitcher's
-        # max_prior_hold truncation (termination_reason='prior_hold').
-        # Useful when natural timeouts loop the actor back into a safe
-        # pocket — restricting to prior_hold-only keeps the chained
-        # spawns at danger-boundary states the prior stabilized,
-        # which is where the exploration breadcrumbs live.
+        #
+        # `chain_only_on_prior_hold` restricts the chain to ONLY fire when
+        # the previous episode ended via PolicySwitcher's max_prior_hold
+        # truncation (termination_reason='prior_hold').
+        # `chain_only_on_timeout` restricts the chain to ONLY fire when
+        # the previous episode ended via the env's episode_length cap
+        # (termination_reason='timeout'). Useful when the agent reliably
+        # survives long stretches and you want to re-spawn it at the
+        # far-frontier state it timed out in, rather than back at origin.
+        # The two "only" flags are mutually exclusive in effect:
+        # prior_hold takes precedence if both are set.
         self._chain_on_survival = bool(chain_on_survival)
         self._chain_only_on_prior_hold = bool(chain_only_on_prior_hold)
+        self._chain_only_on_timeout = bool(chain_only_on_timeout)
 
     @property
     def info(self):
@@ -155,6 +161,8 @@ class CyberRunner(embodied.Env):
                 reason = self._info.get('termination_reason', '')
                 if self._chain_only_on_prior_hold:
                     should_chain = (reason == 'prior_hold')
+                elif self._chain_only_on_timeout:
+                    should_chain = (reason == 'timeout')
                 else:
                     should_chain = bool(reason) and reason != 'hole'
                 if should_chain:

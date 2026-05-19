@@ -30,17 +30,20 @@ class _CoverageTracker:
     if states.ndim < 1 or states.shape[-1] < 4:
       return
     self._latest_step = max(self._latest_step, int(env_step))
-    # states[2], states[3] are normalized by _STATE_SCALES in
-    # cyberrunner_env_vision.py (divided by BOARD_WIDTH/2 and BOARD_HEIGHT/2
-    # respectively), so they live in roughly [0, 2]. The old code divided by
-    # board_w/board_h again, capping every ball position to the leftmost
-    # ~14 % of the grid and silently bounding coverage at ~8 %. Convert back
-    # to physical coords first. NOTE: assumes frame_stack=1; with stacking,
-    # states[2:4] is the OLDEST frame — fine as a long-run coverage proxy.
-    bx = float(states[2]) * (self.board_w / 2.0)
-    by = float(states[3]) * (self.board_h / 2.0)
-    cx = min(int(bx / self.board_w * self.grid_res), self.grid_res - 1)
-    cy = min(int(by / self.board_h * self.grid_res), self.grid_res - 1)
+    # states[2], states[3] are the marble's BOARD-FRAME coordinates,
+    # divided by _STATE_SCALES = (BOARD_WIDTH/2, BOARD_HEIGHT/2). The board
+    # frame is centered at the board's geometric center (per
+    # cyberrunner_env_vision.py:_get_ball_pos_board_frame, which subtracts
+    # board_pos from marble_pos), so states[2:4] lives in [-1, 1], NOT
+    # [0, 2]. A previous fix only unscaled (×board_w/2) without shifting,
+    # which clamped every negative bx to cell 0 — half the grid stayed
+    # unreachable. Shift by +1 then scale to [0, grid_res] in one step.
+    # NOTE: assumes frame_stack=1; with stacking, states[2:4] is the
+    # OLDEST frame — fine as a long-run coverage proxy.
+    cx = min(int((float(states[2]) + 1.0) * 0.5 * self.grid_res),
+             self.grid_res - 1)
+    cy = min(int((float(states[3]) + 1.0) * 0.5 * self.grid_res),
+             self.grid_res - 1)
     cx, cy = max(cx, 0), max(cy, 0)
     self.visit_counts[cy, cx] += 1
     if self._first_visit_step[cy, cx] < 0:
@@ -277,14 +280,15 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
           from dreamerv3 import viz
           disagree = np.asarray(result.pop('_heatmap_disagree')).reshape(-1)
           states = np.asarray(result.pop('_heatmap_states'))
-          # states[2:4] is normalized to [0, 2] by _STATE_SCALES; viz expects
-          # physical board-frame coords in [0, BOARD_WIDTH/HEIGHT]. Unscale
-          # at the boundary so viz.py stays in physical units.
-          scale = np.array(
+          # states[2:4] is BOARD-FRAME normalized: [-1, 1] (centered at
+          # board center, divided by board/2). viz.{sigma,coverage}_heatmap
+          # expect corner-origin physical coords in [0, BOARD_W/H]. Shift
+          # then scale at the boundary so viz.py stays in physical units.
+          half = np.array(
               [viz.BOARD_WIDTH / 2.0, viz.BOARD_HEIGHT / 2.0],
               dtype=np.float32)
-          ball_xy = states[:, 1:, 2:4].reshape(-1, 2) * scale
-          ball_xy_all = states[:, :, 2:4].reshape(-1, 2) * scale
+          ball_xy = (states[:, 1:, 2:4].reshape(-1, 2) + 1.0) * half
+          ball_xy_all = (states[:, :, 2:4].reshape(-1, 2) + 1.0) * half
           result['exploration/sigma_heatmap'] = viz.sigma_heatmap(
               disagree, ball_xy)
           result['exploration/coverage_heatmap'] = viz.coverage_heatmap(
