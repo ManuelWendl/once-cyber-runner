@@ -73,6 +73,9 @@ def main(argv=None):
       # this is a no-op for plain OPAX runs).
       sooper=config.sooper,
       log_video=config.log_video,
+      # Maze layout name, surfaced for the coverage metric (segment-based
+      # coverage needs the waypoint polyline of the active layout).
+      cyberrunner_layout=config.env.cyberrunner.layout,
   )
 
   if config.script == 'train':

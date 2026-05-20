@@ -6,90 +6,10 @@ import elements
 import embodied
 import numpy as np
 
-
-class _CoverageTracker:
-  """Tracks ball positions and computes coverage / path progress stats."""
-
-  def __init__(self, grid_res=30, board_w=0.276, board_h=0.231):
-    self.grid_res = grid_res
-    self.board_w = board_w
-    self.board_h = board_h
-    self.visit_counts = np.zeros((grid_res, grid_res), dtype=np.int64)
-    # First env-step at which each grid cell was visited (-1 = never).
-    # Powers coverage_delta(window) — detects mode collapse that cumulative
-    # coverage hides (cumulative is monotone; delta can drop to zero even
-    # while coverage stays high if the agent stops finding new cells).
-    self._first_visit_step = np.full(
-        (grid_res, grid_res), -1, dtype=np.int64)
-    self._latest_step = 0
-    self.max_progress_per_episode = []
-    self._current_max = {}
-
-  def update(self, worker, states, path_progress, is_first, is_last,
-             env_step=0):
-    if states.ndim < 1 or states.shape[-1] < 4:
-      return
-    self._latest_step = max(self._latest_step, int(env_step))
-    # states[2], states[3] are the marble's BOARD-FRAME coordinates,
-    # divided by _STATE_SCALES = (BOARD_WIDTH/2, BOARD_HEIGHT/2). The board
-    # frame is centered at the board's geometric center (per
-    # cyberrunner_env_vision.py:_get_ball_pos_board_frame, which subtracts
-    # board_pos from marble_pos), so states[2:4] lives in [-1, 1], NOT
-    # [0, 2]. A previous fix only unscaled (×board_w/2) without shifting,
-    # which clamped every negative bx to cell 0 — half the grid stayed
-    # unreachable. Shift by +1 then scale to [0, grid_res] in one step.
-    # NOTE: assumes frame_stack=1; with stacking, states[2:4] is the
-    # OLDEST frame — fine as a long-run coverage proxy.
-    cx = min(int((float(states[2]) + 1.0) * 0.5 * self.grid_res),
-             self.grid_res - 1)
-    cy = min(int((float(states[3]) + 1.0) * 0.5 * self.grid_res),
-             self.grid_res - 1)
-    cx, cy = max(cx, 0), max(cy, 0)
-    self.visit_counts[cy, cx] += 1
-    if self._first_visit_step[cy, cx] < 0:
-      self._first_visit_step[cy, cx] = self._latest_step
-
-    pp = float(path_progress)
-    if is_first:
-      self._current_max[worker] = 0.0
-    self._current_max[worker] = max(self._current_max.get(worker, 0.0), pp)
-    if is_last:
-      self.max_progress_per_episode.append(self._current_max.pop(worker, 0.0))
-
-  def coverage(self):
-    return float((self.visit_counts > 0).sum()) / self.visit_counts.size
-
-  def coverage_delta(self, window):
-    """Fraction of cells first-visited within the last `window` env-steps.
-
-    Unlike `coverage()` (cumulative, monotone non-decreasing), this drops to
-    zero when the agent stops finding new cells — even if cumulative
-    coverage remains high. Catches mode collapse: a healthy explorer keeps
-    expanding its frontier; a stalled one shows delta → 0 while coverage
-    plateaus. `window` is in env-step units (same unit as the wandb x-axis).
-    """
-    if self._latest_step <= 0:
-      return 0.0
-    # Mask out unvisited cells (sentinel -1) before the cutoff comparison.
-    # Otherwise early-training (small _latest_step) makes cutoff negative,
-    # and -1 > cutoff would count every unvisited cell as "newly visited".
-    cutoff = self._latest_step - int(window)
-    visited = self._first_visit_step >= 0
-    new_cells = int((visited & (self._first_visit_step > cutoff)).sum())
-    return float(new_cells) / self._first_visit_step.size
-
-  def entropy(self):
-    total = self.visit_counts.sum()
-    if total == 0:
-      return 0.0
-    p = self.visit_counts.ravel() / total
-    p = p[p > 0]
-    return float(-np.sum(p * np.log(p)))
-
-  def mean_max_path_progress(self, last_n=100):
-    if not self.max_progress_per_episode:
-      return 0.0
-    return float(np.mean(self.max_progress_per_episode[-last_n:]))
+try:
+  from embodied.run import run_metrics
+except ImportError:  # laptop driver / alternate sys.path layout
+  from . import run_metrics
 
 
 def _gpu_memory_stats():
@@ -119,15 +39,20 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
   step = logger.step
   usage = elements.Usage(**args.usage)
   train_agg = elements.Agg()
-  epstats = elements.Agg()
   episodes = collections.defaultdict(elements.Agg)
   policy_fps = elements.FPS()
   train_fps = elements.FPS()
 
-  coverage_tracker = _CoverageTracker()
+  # Faithful, budget-normalized metrics (replaces the window-averaged epstats
+  # + the old spatial _CoverageTracker). See embodied/run/run_metrics.py.
+  layout_name = getattr(args, 'cyberrunner_layout', 'hard')
+  exploration_stats = run_metrics.ExplorationStats(layout=layout_name)
+  safety_stats = run_metrics.SafetyStats()
+  gate_stats = run_metrics.GateStats()
+  trigger_clips = run_metrics.TriggerClips(num_envs=args.envs)
   video_ep = []
   completed_video = [None]
-  MAX_VIDEO_STEPS = 2000
+  MAX_VIDEO_STEPS = 3000
 
   batch_steps = args.batch_size * args.batch_length
   should_train = elements.when.Ratio(args.train_ratio / batch_steps)
@@ -138,51 +63,48 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
   @elements.timer.section('logfn')
   def logfn(tran, worker):
     episode = episodes[worker]
-    tran['is_first'] and episode.reset()
+    is_first = bool(tran['is_first'])
+    is_last = bool(tran['is_last'])
+    is_first and episode.reset()
     episode.add('score', tran['reward'], agg='sum')
     episode.add('length', 1, agg='sum')
-    episode.add('rewards', tran['reward'], agg='stack')
 
-    # Coverage tracking
+    # Find this env's rendered frame (uint8 HxWxC) once; reused for video.
+    frame = None
+    for key, value in tran.items():
+      if getattr(value, 'dtype', None) == np.uint8 and getattr(value, 'ndim', 0) == 3:
+        frame = value
+        break
+
+    # Faithful metrics.
     states = tran.get('states', None)
     pp = tran.get('log/path_progress', np.float32(0.0))
-    if states is not None:
-      coverage_tracker.update(
-          worker, states, pp, bool(tran['is_first']), bool(tran['is_last']),
-          env_step=int(step))
+    exploration_stats.update(
+        worker, states, pp, is_first, is_last, env_step=int(step))
+    safety_stats.update(tran, is_last)
+    gate_present = run_metrics.GateStats.present(tran)
+    if gate_present:
+      gate_stats.update(tran, worker, is_first, is_last)
+      triggered = float(tran.get('log/gate/triggered', 0.0)) > 0.5
+      trigger_clips.update(worker, frame, triggered, is_last)
 
-    # Collect video frames from worker 0 (full episode)
-    if worker == 0:
-      if tran['is_first']:
+    # Rollout video: gate-trigger clips when the gate is on; otherwise a
+    # worker-0 full-episode video so plain OPAX still gets a rollout.
+    if not gate_present and worker == 0:
+      if is_first:
         video_ep.clear()
-      if len(video_ep) < MAX_VIDEO_STEPS:
-        for key, value in tran.items():
-          if value.dtype == np.uint8 and value.ndim == 3:
-            video_ep.append(value)
-            break
-      if tran['is_last'] and len(video_ep) > 10:
+      if frame is not None and len(video_ep) < MAX_VIDEO_STEPS:
+        video_ep.append(frame)
+      if is_last and len(video_ep) > 10:
         completed_video[0] = np.stack(video_ep[:MAX_VIDEO_STEPS])
         video_ep.clear()
 
-    for key, value in tran.items():
-      if value.dtype == np.uint8 and value.ndim == 3:
-        if worker == 0:
-          episode.add(f'policy_{key}', value, agg='stack')
-      elif key.startswith('log/'):
-        assert value.ndim == 0, (key, value.shape, value.dtype)
-        episode.add(key + '/avg', value, agg='avg')
-        episode.add(key + '/max', value, agg='max')
-        episode.add(key + '/sum', value, agg='sum')
-    if tran['is_last']:
+    if is_last:
       result = episode.result()
       logger.add({
           'score': result.pop('score'),
           'length': result.pop('length'),
       }, prefix='episode')
-      rew = result.pop('rewards')
-      if len(rew) > 1:
-        result['reward_rate'] = (np.abs(rew[1:] - rew[:-1]) >= 0.01).mean()
-      epstats.add(result)
 
   fns = [bind(make_env, i) for i in range(args.envs)]
   driver = embodied.Driver(fns, parallel=not args.debug)
@@ -319,33 +241,40 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
 
     if should_log(step):
       logger.add(train_agg.result())
-      logger.add(epstats.result(), prefix='epstats')
       logger.add(replay.stats(), prefix='replay')
       logger.add(usage.stats(), prefix='usage')
       logger.add({'fps/policy': policy_fps.result()})
       logger.add({'fps/train': train_fps.result()})
       logger.add({'timer': elements.timer.stats()['summary']})
 
-      # Coverage and path progress
-      logger.add({
-          'exploration/coverage': coverage_tracker.coverage(),
-          'exploration/coverage_delta_10k': coverage_tracker.coverage_delta(10_000),
-          'exploration/visitation_entropy': coverage_tracker.entropy(),
-          'exploration/mean_max_path_progress': coverage_tracker.mean_max_path_progress(),
-      })
+      # Faithful safety + exploration metrics (cumulative counters, not
+      # window-averaged). Gate metrics only emit on SOOPER runs.
+      logger.add(safety_stats.emit())
+      logger.add(exploration_stats.emit())
+      if gate_stats.triggers > 0 or gate_stats.prior_steps > 0:
+        logger.add(gate_stats.emit())
+        cov = exploration_stats.emit()['exploration/coverage']
+        holes = safety_stats.holes
+        logger.add({'pareto/coverage_per_fall':
+                    cov / holes if holes > 0 else float(cov)})
 
       # GPU memory
       logger.add(_gpu_memory_stats())
 
-      # Policy rollout video (full episode from worker 0). Off-switch
-      # via --run.log_video false for runs where wandb video deps aren't
-      # installed or you just don't want the upload cost.
-      if getattr(args, 'log_video', True) and completed_video[0] is not None:
-        vid = completed_video[0]
-        if vid.shape[-1] == 1:
-          vid = np.repeat(vid, 3, axis=-1)
-        logger.add({'policy_video': vid})
-        completed_video[0] = None
+      # Rollout video. Off-switch via --run.log_video false. For SOOPER runs
+      # we log reservoir-sampled gate-trigger clips (~1 s before / ~2 s after
+      # each trigger); for plain OPAX we log a worker-0 full-episode video.
+      if getattr(args, 'log_video', True):
+        for name, clip in trigger_clips.drain().items():
+          if clip.shape[-1] == 1:
+            clip = np.repeat(clip, 3, axis=-1)
+          logger.add({name: clip})
+        if completed_video[0] is not None:
+          vid = completed_video[0]
+          if vid.shape[-1] == 1:
+            vid = np.repeat(vid, 3, axis=-1)
+          logger.add({'policy_video': vid})
+          completed_video[0] = None
 
       # Ensure all video/image metrics have 3 channels (WandB can't encode 1-channel)
       for i, (s, name, value) in enumerate(logger._metrics):
