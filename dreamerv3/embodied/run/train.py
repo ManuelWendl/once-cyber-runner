@@ -185,7 +185,17 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
         dump_path=dump_path,
     )
   else:
-    policy = lambda *args: agent.policy(*args, mode='train')
+    # Plain OPAX. The cyberrunner env declares `_force_terminate` in its
+    # act_space unconditionally (consumed only by the SOOPER max_prior_hold
+    # path via action.get(..., False)). The agent filters it out (main.py),
+    # and the driver only injects `reset` — so on plain OPAX nothing supplies
+    # `_force_terminate` and the act-space coercion wrapper KeyErrors. Inject
+    # an all-False flag here, mirroring what PolicySwitcher does for SOOPER.
+    def policy(carry, obs, **kw):
+      carry, acts, outs = agent.policy(carry, obs, mode='train', **kw)
+      n = len(obs['is_first'])
+      acts = {**acts, '_force_terminate': np.zeros(n, dtype=bool)}
+      return carry, acts, outs
   driver.reset(agent.init_policy)
   while step < args.steps:
 
