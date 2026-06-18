@@ -15,6 +15,11 @@ def make_env(cfg):
             reward_every_n_waypoints=cfg.env.reward_every_n_waypoints,
             hole_penalty=cfg.env.hole_penalty,
             episode_length=cfg.env.episode_length,
+            randomize_init_pos=cfg.env.randomize_init_pos,
+            backup_mode=cfg.env.backup_mode,
+            recovery_speed_threshold=cfg.env.recovery_speed_threshold,
+            recovery_tilt_threshold=cfg.env.recovery_tilt_threshold,
+            recovery_hole_margin_factor=cfg.env.recovery_hole_margin_factor,
         ))
     return _init
 
@@ -55,6 +60,7 @@ def main(cfg: DictConfig):
 
     model.learn(total_timesteps=cfg.total_timesteps, progress_bar=True)
     model.save(f"{algo}_cyberrunner")
+    env.save(f"{algo}_cyberrunner_vecnormalize.pkl")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,21 @@
+# @package _global_
+# Backup policy: binary recovery reward within a 20-step episode.
+# Reward = 1 if ball reaches recovery state (slow, level, hole-safe), 0 otherwise.
+# gamma=1.0 (undiscounted) so Q(s,a) = P(recover within 20 steps | s,a).
+# Run: python train.py +experiment=backup-sac
+
+defaults:
+  - override /algo: sac_backup
+
+total_timesteps: 1_000_000
+
+env:
+  episode_length: 200
+  randomize_init_pos: true
+  backup_mode: true
+  recovery_speed_threshold: 0.2
+  recovery_tilt_threshold: 0.1
+  recovery_hole_margin_factor: 3.0
+  # unused in backup_mode but required by schema:
+  reward_every_n_waypoints: 3
+  hole_penalty: 5.0

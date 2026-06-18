@@ -1,0 +1,9 @@
+name: sac
+n_envs: 16
+learning_rate: 3e-4
+buffer_size: 100_000
+batch_size: 256
+tau: 0.005
+gamma: 1.0          # undiscounted — Q(s,a) converges to P(recover within 20 steps | s,a)
+learning_starts: 1_000
+ent_coef: auto

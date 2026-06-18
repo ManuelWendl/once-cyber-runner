@@ -1,14 +1,19 @@
 defaults:
-  - algo: ppo
+  - algo: sac
   - _self_
 
 total_timesteps: 1_000_000
-device: cpu
+device: cuda
 
 env:
   reward_every_n_waypoints: 3
   hole_penalty: 5.0
   episode_length: 2000
+  randomize_init_pos: false
+  backup_mode: false
+  recovery_speed_threshold: 0.03    # m/s — ball must be slower than this
+  recovery_tilt_threshold: 0.02     # rad (~1.1°) — both joints must be within this
+  recovery_hole_margin_factor: 3.0  # ball must be > HOLE_RADIUS + N*MARBLE_RADIUS from any hole
 
 hydra:
   run:

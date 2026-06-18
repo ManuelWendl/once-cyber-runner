@@ -1225,6 +1225,11 @@ class CyberRunnerEnv(gym.Env):
         safe_hole_margin: float = 0.004,
         checkpoint_speed_ema_alpha: float = 0.8,
         checkpoint_include_corridors: bool = True,
+        recovery_reward: float = 0.0,
+        recovery_speed_threshold: float = 0.03,
+        recovery_tilt_threshold: float = 0.02,
+        recovery_hole_margin_factor: float = 3.0,
+        backup_mode: bool = False,
         prior_mode: bool = False,
         prior_task: str = "checkpoint",
         prior_spawn_source: str = "dense_path",
@@ -1278,6 +1283,11 @@ class CyberRunnerEnv(gym.Env):
         self.safe_hole_margin = safe_hole_margin
         self.checkpoint_speed_ema_alpha = checkpoint_speed_ema_alpha
         self.checkpoint_include_corridors = checkpoint_include_corridors
+        self.recovery_reward = float(recovery_reward)
+        self.recovery_speed_threshold = float(recovery_speed_threshold)
+        self.recovery_tilt_threshold = float(recovery_tilt_threshold)
+        self.recovery_hole_margin_factor = float(recovery_hole_margin_factor)
+        self.backup_mode = backup_mode
         self.prior_mode = prior_mode
         self.prior_task = prior_task
         self.prior_spawn_source = prior_spawn_source
@@ -1576,8 +1586,16 @@ class CyberRunnerEnv(gym.Env):
 
             self._active_checkpoint_idx = int(chosen_checkpoint_idx)
         elif self.randomize_init_pos:
-            idx = self.np_random.integers(0, len(self.waypoints))
-            init_pos = self.waypoints[idx]
+            margin = MARBLE_RADIUS + HOLE_RADIUS
+            for _ in range(1000):
+                x = self.np_random.uniform(MARBLE_RADIUS, BOARD_WIDTH - MARBLE_RADIUS)
+                y = self.np_random.uniform(MARBLE_RADIUS, BOARD_HEIGHT - MARBLE_RADIUS)
+                candidate = np.array([x, y], dtype=np.float32)
+                if np.linalg.norm(self.holes - candidate, axis=1).min() > margin:
+                    init_pos = candidate
+                    break
+            else:
+                init_pos = self.waypoints[0]
         else:
             init_pos = self.waypoints[0]
 
@@ -1587,6 +1605,14 @@ class CyberRunnerEnv(gym.Env):
         self.data.qpos[3] = init_pos[1]
         self.data.qpos[4] = 0.0793  # Height above board
         self.data.qpos[5:9] = [1, 0, 0, 0]  # Identity quaternion
+
+        if self.randomize_init_pos:
+            self.data.qpos[0] = self.np_random.uniform(*RANGE_ALPHA)
+            self.data.qpos[1] = self.np_random.uniform(*RANGE_BETA)
+            theta = self.np_random.uniform(0.0, 2 * np.pi)
+            speed = self.np_random.uniform(0.0, 0.2)
+            self.data.qvel[2] = speed * np.cos(theta)
+            self.data.qvel[3] = speed * np.sin(theta)
 
         # Prior-mode handoff randomization: initial tilt + marble velocity so the
         # prior is trained on states it will actually see when the main policy
@@ -1641,6 +1667,7 @@ class CyberRunnerEnv(gym.Env):
         self._prior_target_seg_idx = -1
         self._stable_steps_max = 0
         self._ep_inside_checkpoint_steps = 0
+        self._recovery_achieved = False
         self._reward_terms = {
             "reward_progress": 0.0,
             "reward_basin": 0.0,
@@ -1650,6 +1677,7 @@ class CyberRunnerEnv(gym.Env):
             "reward_action_delta": 0.0,
             "reward_tilt": 0.0,
             "reward_hole": 0.0,
+            "reward_recovery": 0.0,
         }
         ball_pos = self._get_ball_pos_board_frame()
         self._prev_ball_pos = ball_pos.copy()
@@ -2015,6 +2043,14 @@ class CyberRunnerEnv(gym.Env):
 
         return obs
 
+    def _check_recovery_conditions(self) -> bool:
+        """Return True if the ball is in a safe, slow, level state."""
+        hole_safe = self._min_hole_distance > HOLE_RADIUS + self.recovery_hole_margin_factor * MARBLE_RADIUS
+        speed_ok = self._ball_speed_true < self.recovery_speed_threshold
+        tilt = self.data.qpos[:2]
+        tilt_ok = float(np.abs(tilt[0])) < self.recovery_tilt_threshold and float(np.abs(tilt[1])) < self.recovery_tilt_threshold
+        return hole_safe and speed_ok and tilt_ok
+
     def _compute_reward(
         self,
         ball_pos: np.ndarray,
@@ -2025,6 +2061,13 @@ class CyberRunnerEnv(gym.Env):
         ball_pos_observed: np.ndarray | None = None,
     ) -> float:
         """Stabilized frontier checkpoints + goal bonus + hole penalty."""
+        if self.backup_mode:
+            if self._check_recovery_conditions():
+                self._recovery_achieved = True
+                self._success = True
+                return 1.0
+            return 0.0
+
         if self.prior_mode and self.prior_task == "stabilize":
             if self.prior_reward_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
                 return self._compute_checkpoint_recovery_reward(ball_pos, action, prev_action, ball_pos_observed)
@@ -2342,6 +2385,11 @@ class CyberRunnerEnv(gym.Env):
         info = {}
         terminated = False
         truncated = False
+
+        if self.backup_mode and self._recovery_achieved:
+            terminated = True
+            info["termination_reason"] = "recovery"
+            return terminated, truncated, info
 
         # Check if in hole
         hole_distances = np.linalg.norm(self.holes - ball_pos, axis=1)
