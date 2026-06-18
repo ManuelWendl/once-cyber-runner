@@ -1,71 +1,60 @@
-import atexit
-import pathlib
-import sys
-import warnings
-
 import hydra
-import torch
+from omegaconf import DictConfig
+from gymnasium.wrappers import FlattenObservation
+from stable_baselines3 import PPO, SAC
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import VecNormalize
 
-import tools
-from buffer import Buffer
-from dreamer import Dreamer
-from envs import make_envs
-from trainer import OnlineTrainer
-
-warnings.filterwarnings("ignore")
-sys.path.append(str(pathlib.Path(__file__).parent))
-# torch.backends.cudnn.benchmark = True
-torch.set_float32_matmul_precision("high")
+from envs.cyberrunner import CyberRunnerEnv
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="configs")
-def main(config):
-    tools.set_seed_everywhere(config.seed)
-    if config.deterministic_run:
-        tools.enable_deterministic_run()
-    logdir = pathlib.Path(config.logdir).expanduser()
-    logdir.mkdir(parents=True, exist_ok=True)
+def make_env(cfg):
+    def _init():
+        return FlattenObservation(CyberRunnerEnv(
+            include_vision=False,
+            reward_every_n_waypoints=cfg.env.reward_every_n_waypoints,
+            hole_penalty=cfg.env.hole_penalty,
+            episode_length=cfg.env.episode_length,
+        ))
+    return _init
 
-    # Mirror stdout/stderr to a file under logdir while keeping console output.
-    console_f = tools.setup_console_log(logdir, filename="console.log")
-    atexit.register(lambda: console_f.close())
 
-    print("Logdir", logdir)
+@hydra.main(config_path="configs", config_name="config", version_base=None)
+def main(cfg: DictConfig):
+    env = VecNormalize(
+        make_vec_env(make_env(cfg), n_envs=cfg.algo.n_envs),
+        norm_obs=True, norm_reward=True,
+    )
 
-    logger = tools.Logger(logdir)
-    if config.wandb.enabled:
-        from omegaconf import OmegaConf
-        logger.init_wandb(
-            project=config.wandb.project,
-            entity=config.wandb.entity or None,
-            name=config.wandb.name or None,
-            group=config.wandb.group or None,
-            config=OmegaConf.to_container(config, resolve=True),
+    algo = cfg.algo.name.lower()
+    if algo == "ppo":
+        model = PPO(
+            "MlpPolicy", env, verbose=1, device=cfg.device,
+            learning_rate=cfg.algo.learning_rate,
+            n_steps=cfg.algo.n_steps,
+            batch_size=cfg.algo.batch_size,
+            n_epochs=cfg.algo.n_epochs,
+            gamma=cfg.algo.gamma,
+            gae_lambda=cfg.algo.gae_lambda,
+            clip_range=cfg.algo.clip_range,
+            ent_coef=cfg.algo.ent_coef,
         )
-    # save config
-    logger.log_hydra_config(config)
+    elif algo == "sac":
+        model = SAC(
+            "MlpPolicy", env, verbose=1, device=cfg.device,
+            learning_rate=cfg.algo.learning_rate,
+            buffer_size=cfg.algo.buffer_size,
+            batch_size=cfg.algo.batch_size,
+            tau=cfg.algo.tau,
+            gamma=cfg.algo.gamma,
+            learning_starts=cfg.algo.learning_starts,
+            ent_coef=cfg.algo.ent_coef,
+        )
+    else:
+        raise ValueError(f"Unknown algo: {algo}")
 
-    mirror_augment = getattr(config.env, "mirror_augment", False)
-    replay_buffer = Buffer(config.buffer, mirror_augment=mirror_augment)
-
-    print("Create envs.")
-    train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
-
-    print("Simulate agent.")
-    agent = Dreamer(
-        config.model,
-        obs_space,
-        act_space,
-    ).to(config.device)
-
-    policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger, logdir, train_envs, eval_envs)
-    policy_trainer.begin(agent)
-
-    items_to_save = {
-        "agent_state_dict": agent.state_dict(),
-        "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
-    }
-    torch.save(items_to_save, logdir / "latest.pt")
+    model.learn(total_timesteps=cfg.total_timesteps, progress_bar=True)
+    model.save(f"{algo}_cyberrunner")
 
 
 if __name__ == "__main__":

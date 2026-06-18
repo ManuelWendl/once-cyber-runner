@@ -1,0 +1,16 @@
+defaults:
+  - algo: ppo
+  - _self_
+
+total_timesteps: 1_000_000
+device: cpu
+
+env:
+  reward_every_n_waypoints: 3
+  hole_penalty: 5.0
+  episode_length: 2000
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
