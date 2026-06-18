@@ -9,12 +9,13 @@ gamma: 0.99
 ent_coef: auto
 
 # ── World model ───────────────────────────────────────────────────────────────
-ensemble_size: 7
-num_elites: 5
-hidden_sizes: [512, 512, 512, 512]
+ensemble_size: 5
+num_elites: 3
+hidden_sizes: [256, 256, 256]
 model_lr: 1e-3
 model_weight_decay: 1e-4
-model_train_freq: 250          # retrain every N env steps
+model_train_freq: 250          # retrain world model every N env steps
+rollout_freq: 250              # regenerate synthetic rollouts every N env steps
 model_train_epochs: 5
 model_batch_size: 4096
 
@@ -23,11 +24,18 @@ real_buffer_size: 100_000
 model_buffer_size: 400_000     # SAC's replay buffer (model rollouts)
 
 # ── Rollout schedule ──────────────────────────────────────────────────────────
-warmup_steps: 5_000            # pure random collection before model training
+warmup_steps: 20_000           # pure random collection before model training
 rollout_batch_size: 400        # initial states per rollout call
 min_rollout_length: 1
-max_rollout_length: 15
+max_rollout_length: 3
 rollout_schedule_steps: 100_000  # steps over which length grows min→max
 
 # ── Policy update ─────────────────────────────────────────────────────────────
-utd_ratio: 20                  # SAC gradient steps per env step (after warmup)
+utd_ratio: 5                   # SAC gradient steps per env step (after warmup)
+
+# ── Backup safety filter ──────────────────────────────────────────────────────
+# If backup_policy_path exists, the world model predicts the next state for every
+# real env action. If V_backup(s') < safety_threshold the backup policy acts instead.
+backup_policy_path: "ppo_backup.zip"
+backup_vecnorm_path: "ppo_backup_vecnormalize.pkl"
+safety_threshold: 0.9

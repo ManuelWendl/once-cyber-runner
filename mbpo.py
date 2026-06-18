@@ -21,8 +21,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
-from stable_baselines3 import SAC
+import os
+from stable_baselines3 import SAC, PPO
 from stable_baselines3.common.buffers import ReplayBuffer
+from stable_baselines3.common.logger import configure as configure_logger
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from omegaconf import DictConfig
 
 
@@ -160,7 +163,7 @@ class MBPOTrainer:
 
         # SAC operates on synthetic rollouts stored in its replay buffer
         self.sac = SAC(
-            "MlpPolicy", env, verbose=1, device=device,
+            "MlpPolicy", env, verbose=0, device=device,
             learning_rate=ac.learning_rate,
             buffer_size=ac.model_buffer_size,
             batch_size=ac.batch_size,
@@ -169,6 +172,8 @@ class MBPOTrainer:
             learning_starts=0,
             ent_coef=ac.ent_coef,
         )
+        # SAC.train() requires _logger; silence it — MBPO has its own logging
+        self.sac.set_logger(configure_logger(folder=None, format_strings=[]))
 
         # Real experience buffer (separate from SAC's model buffer)
         self.real_buffer = ReplayBuffer(
@@ -180,6 +185,76 @@ class MBPOTrainer:
             handle_timeout_termination=True,
         )
         self._ac = ac
+
+        # ── optional backup safety filter ─────────────────────────────────
+        # Backup policy (PPO) guards real env collection: if the world model
+        # predicts that the SAC action leads to an unrecoverable next state
+        # (V_backup(s') < safety_threshold), the backup policy acts instead.
+        self.backup_policy = None
+        self.backup_vecnorm = None
+        self.safety_threshold = float(ac.get("safety_threshold", 0.3))
+
+        bp_path = ac.get("backup_policy_path", "ppo_backup.zip")
+        bv_path = ac.get("backup_vecnorm_path", "ppo_backup_vecnormalize.pkl")
+        if os.path.exists(bp_path) and os.path.exists(bv_path):
+            from gymnasium.wrappers import FlattenObservation
+            from envs.cyberrunner import CyberRunnerEnv
+            self.backup_policy = PPO.load(bp_path, device=device)
+            dummy = DummyVecEnv([lambda: FlattenObservation(
+                CyberRunnerEnv(include_vision=False, backup_mode=True)
+            )])
+            self.backup_vecnorm = VecNormalize.load(bv_path, dummy)
+            self.backup_vecnorm.training = False
+            self.backup_vecnorm.norm_reward = False
+            print(f"[MBPO] Backup safety filter loaded: {bp_path}  threshold={self.safety_threshold}")
+        else:
+            print(f"[MBPO] No backup policy found at '{bp_path}' — safety filter disabled.")
+
+    # ── backup obs conversion & safety check ─────────────────────────────
+
+    def _to_backup_obs(self, obs: np.ndarray, prev_obs: np.ndarray) -> np.ndarray:
+        """
+        Convert MBPO-normalised maze obs → backup-policy-normalised obs.
+
+        MBPO obs layout  (13-d): [joint(2), ball_pos(2), vec_closest(2),
+                                   vec_next_wp(2), vec_next_next_wp(2), checkpoint(3)]
+        Backup obs layout(13-d): [joint(2), ball_pos(2), vec_closest(2),
+                                   ball_vel(2), ball_speed(1), 0(1),  checkpoint(3)]
+        """
+        rms = self.env.obs_rms
+        std = np.sqrt(rms.var + 1e-8)
+
+        raw      = obs      * std + rms.mean   # (B, 13)
+        prev_raw = prev_obs * std + rms.mean
+
+        dt = 0.00166666 * 10  # TIMESTEP * FRAME_SKIP = 1/60 s
+
+        joint_pos     = raw[:, 0:2]
+        ball_pos      = raw[:, 2:4]
+        vec_closest   = raw[:, 4:6]
+        checkpoint    = raw[:, 10:13]
+
+        prev_ball_pos = prev_raw[:, 2:4]
+        ball_vel      = (ball_pos - prev_ball_pos) / dt          # (B, 2)
+        ball_speed    = np.linalg.norm(ball_vel, axis=1, keepdims=True)  # (B, 1)
+        zeros         = np.zeros((len(obs), 1), dtype=np.float32)
+
+        backup_raw = np.concatenate(
+            [joint_pos, ball_pos, vec_closest, ball_vel, ball_speed, zeros, checkpoint], axis=1
+        ).astype(np.float32)   # (B, 13)
+
+        b_rms = self.backup_vecnorm.obs_rms
+        backup_norm = np.clip(
+            (backup_raw - b_rms.mean) / np.sqrt(b_rms.var + 1e-8), -10.0, 10.0
+        )
+        return backup_norm
+
+    def _recovery_values(self, backup_obs: np.ndarray) -> np.ndarray:
+        """Query backup policy value function V(s) = P(recover | s). Returns (B,)."""
+        obs_t = torch.FloatTensor(backup_obs).to(self.device)
+        with torch.no_grad():
+            values = self.backup_policy.policy.predict_values(obs_t)
+        return values.cpu().numpy().flatten()
 
     # ── world model training ──────────────────────────────────────────────
 
@@ -219,7 +294,8 @@ class MBPOTrainer:
         for _ in range(length):
             act, _ = self.sac.predict(obs, deterministic=False)
             nobs, rew = self.dynamics.sample(obs, act)
-            nobs = np.clip(nobs, -10.0, 10.0)   # guard against model exploitation
+            nobs = np.clip(nobs, -10.0, 10.0)
+            rew = np.clip(rew, -10.0, 10.0)   # guard against model exploitation
             all_obs.append(obs); all_nobs.append(nobs)
             all_act.append(act); all_rew.append(rew)
             obs = nobs
@@ -269,6 +345,13 @@ class MBPOTrainer:
         n_envs = self.env.num_envs
         step = 0
 
+        ep_rewards: list[float] = []
+        ep_lengths: list[int] = []
+        actor_losses: list[float] = []
+        critic_losses: list[float] = []
+
+        prev_obs = obs.copy()
+
         while step < total_timesteps:
             # Random exploration during warmup, SAC policy afterwards
             if step < ac.warmup_steps:
@@ -276,34 +359,83 @@ class MBPOTrainer:
             else:
                 act, _ = self.sac.predict(obs, deterministic=False)
 
+            # ── backup safety filter on real env actions ───────────────────
+            # After warmup, use the world model to predict the next state for
+            # each env. If the backup policy's value V(s') < safety_threshold,
+            # the next state is predicted to be unrecoverable — replace SAC's
+            # action with the backup policy's action for that env.
+            if (self.backup_policy is not None
+                    and step >= ac.warmup_steps
+                    and self.real_buffer.size() >= ac.batch_size):
+                nobs_pred, _ = self.dynamics.sample(obs, act)
+                nobs_pred = np.clip(nobs_pred, -10.0, 10.0)
+                backup_obs = self._to_backup_obs(nobs_pred, obs)
+                values = self._recovery_values(backup_obs)
+                unsafe = values < self.safety_threshold
+                if unsafe.any():
+                    cur_backup_obs = self._to_backup_obs(obs, prev_obs)
+                    backup_act, _ = self.backup_policy.predict(
+                        cur_backup_obs[unsafe], deterministic=True
+                    )
+                    act[unsafe] = backup_act
+
             nobs, rew, done, infos = self.env.step(act)
 
-            # Store each parallel env's transition in the real buffer individually
+            # Store each parallel env's transition in both buffers
             for i in range(n_envs):
                 terminal = bool(done[i]) and not infos[i].get("TimeLimit.truncated", False)
+                t = np.array([terminal])
                 self.real_buffer.add(
                     obs[i:i+1], nobs[i:i+1], act[i:i+1],
-                    rew[i:i+1], np.array([terminal]), [infos[i]],
+                    rew[i:i+1], t, [infos[i]],
                 )
+                # Also add real transitions to SAC's buffer to anchor Q-values
+                self.sac.replay_buffer.add(
+                    obs[i:i+1], nobs[i:i+1], act[i:i+1],
+                    rew[i:i+1], t, [infos[i]],
+                )
+                ep_info = infos[i].get("episode")
+                if ep_info is not None:
+                    ep_rewards.append(float(ep_info["r"]))
+                    ep_lengths.append(int(ep_info["l"]))
 
+            prev_obs = obs.copy()
             obs = nobs
             step += n_envs
+
+            if step == ac.warmup_steps:
+                print(f"[MBPO] Warmup done ({step} steps). Starting model training + SAC updates.", flush=True)
 
             if step % ac.model_train_freq == 0 and step >= ac.warmup_steps:
                 self._train_dynamics()
 
-            if step >= ac.warmup_steps and self.sac.replay_buffer.size() >= ac.batch_size:
+            if step >= ac.warmup_steps and step % ac.rollout_freq == 0:
                 self._generate_rollouts(self._rollout_length(step))
+
+            if step >= ac.warmup_steps and self.sac.replay_buffer.size() >= ac.batch_size:
                 for _ in range(ac.utd_ratio):
                     self.sac.train(gradient_steps=1, batch_size=ac.batch_size)
+                    logger = self.sac.logger
+                    if hasattr(logger, "name_to_value"):
+                        al = logger.name_to_value.get("train/actor_loss")
+                        cl = logger.name_to_value.get("train/critic_loss")
+                        if al is not None:
+                            actor_losses.append(float(al))
+                        if cl is not None:
+                            critic_losses.append(float(cl))
 
-            if step % 10_000 == 0:
-                print(
-                    f"[MBPO] {step:>8}/{total_timesteps}  "
-                    f"real={self.real_buffer.size():>6}  "
-                    f"model={self.sac.replay_buffer.size():>7}  "
-                    f"rollout_len={self._rollout_length(step)}"
-                )
+            if step % 1_000 == 0:
+                parts = [f"[MBPO] {step:>8}/{total_timesteps}"]
+                if ep_rewards:
+                    parts.append(f"ep_rew={np.mean(ep_rewards[-100:]):.3f}")
+                    parts.append(f"ep_len={np.mean(ep_lengths[-100:]):.0f}")
+                if actor_losses:
+                    parts.append(f"actor_loss={np.mean(actor_losses[-100:]):.3f}")
+                    parts.append(f"critic_loss={np.mean(critic_losses[-100:]):.3f}")
+                parts.append(f"real={self.real_buffer.size()}")
+                parts.append(f"model={self.sac.replay_buffer.size()}")
+                parts.append(f"rollout_len={self._rollout_length(step)}")
+                print("  ".join(parts), flush=True)
 
     def save(self, name: str) -> None:
         self.sac.save(f"{name}_policy")

@@ -14,7 +14,6 @@ env:
   randomize_init_pos: true
   backup_mode: true
   recovery_speed_threshold: 0.05
-  recovery_tilt_threshold: 0.1
   recovery_hole_margin_factor: 2.0
   backup_init_max_speed: 0.075
   # unused in backup_mode but required by schema:

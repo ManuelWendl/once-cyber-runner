@@ -1,5 +1,6 @@
+import json
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from gymnasium.wrappers import FlattenObservation
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.env_util import make_vec_env
@@ -69,8 +70,11 @@ def main(cfg: DictConfig):
         raise ValueError(f"Unknown algo: {algo}")
 
     model.learn(total_timesteps=cfg.total_timesteps, progress_bar=True)
-    model.save(f"{algo}_cyberrunner")
-    env.save(f"{algo}_cyberrunner_vecnormalize.pkl")
+    suffix = "backup" if cfg.env.get("backup_mode", False) else "cyberrunner"
+    model.save(f"{algo}_{suffix}")
+    env.save(f"{algo}_{suffix}_vecnormalize.pkl")
+    with open(f"{algo}_{suffix}_env_cfg.json", "w") as f:
+        json.dump(OmegaConf.to_container(cfg.env, resolve=True), f, indent=2)
 
 
 if __name__ == "__main__":

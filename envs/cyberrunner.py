@@ -1610,13 +1610,31 @@ class CyberRunnerEnv(gym.Env):
         self.data.qpos[5:9] = [1, 0, 0, 0]  # Identity quaternion
 
         if self.randomize_init_pos:
-            self.data.qpos[0] = self.np_random.uniform(*RANGE_ALPHA)
-            self.data.qpos[1] = self.np_random.uniform(*RANGE_BETA)
             max_speed = self.backup_init_max_speed if self.backup_mode else 0.2
-            theta = self.np_random.uniform(0.0, 2 * np.pi)
-            speed = self.np_random.uniform(0.0, max_speed)
-            self.data.qvel[2] = speed * np.cos(theta)
-            self.data.qvel[3] = speed * np.sin(theta)
+            if self.backup_mode:
+                # Board starts flat — the policy must actively brake the ball.
+                # Random initial tilt would passively decelerate the ball before
+                # the policy acts, giving unearned recovery credit.
+                self.data.qpos[0] = 0.0
+                self.data.qpos[1] = 0.0
+                for _ in range(200):
+                    theta = self.np_random.uniform(0.0, 2 * np.pi)
+                    speed = self.np_random.uniform(0.0, max_speed)
+                    self.data.qvel[2] = speed * np.cos(theta)
+                    self.data.qvel[3] = speed * np.sin(theta)
+                    # Reject states that already satisfy recovery conditions
+                    ball_speed = speed  # qvel magnitude equals speed by construction
+                    hole_safe = self._min_hole_distance > HOLE_RADIUS + self.recovery_hole_margin_factor * MARBLE_RADIUS
+                    speed_ok = ball_speed < self.recovery_speed_threshold
+                    if not (hole_safe and speed_ok):
+                        break
+            else:
+                self.data.qpos[0] = self.np_random.uniform(*RANGE_ALPHA)
+                self.data.qpos[1] = self.np_random.uniform(*RANGE_BETA)
+                theta = self.np_random.uniform(0.0, 2 * np.pi)
+                speed = self.np_random.uniform(0.0, max_speed)
+                self.data.qvel[2] = speed * np.cos(theta)
+                self.data.qvel[3] = speed * np.sin(theta)
 
         # Prior-mode handoff randomization: initial tilt + marble velocity so the
         # prior is trained on states it will actually see when the main policy
@@ -1689,8 +1707,9 @@ class CyberRunnerEnv(gym.Env):
         ball_pos_noisy = ball_pos + self._obs_bias["ball"] + ball_noise
         self._prev_ball_pos_noisy = ball_pos_noisy.astype(np.float32)
         self._ball_speed = 0.0
-        self._ball_speed_true = 0.0
-        self._ball_vel_true = np.zeros(2, dtype=np.float32)
+        # Initialise from qvel so the first observation reflects the true initial speed
+        self._ball_vel_true = np.array([self.data.qvel[2], self.data.qvel[3]], dtype=np.float32)
+        self._ball_speed_true = float(np.linalg.norm(self._ball_vel_true))
         self._min_hole_distance = self._compute_min_hole_distance(ball_pos)
         active_checkpoint = self._get_active_checkpoint_waypoint()
         self._prev_checkpoint_dist = (
@@ -2059,12 +2078,10 @@ class CyberRunnerEnv(gym.Env):
         return obs
 
     def _check_recovery_conditions(self) -> bool:
-        """Return True if the ball is in a safe, slow, level state."""
+        """Return True if the ball is in a safe, slow state (away from holes, low speed)."""
         hole_safe = self._min_hole_distance > HOLE_RADIUS + self.recovery_hole_margin_factor * MARBLE_RADIUS
         speed_ok = self._ball_speed_true < self.recovery_speed_threshold
-        tilt = self.data.qpos[:2]
-        tilt_ok = float(np.abs(tilt[0])) < self.recovery_tilt_threshold and float(np.abs(tilt[1])) < self.recovery_tilt_threshold
-        return hole_safe and speed_ok and tilt_ok
+        return hole_safe and speed_ok
 
     def _compute_reward(
         self,
