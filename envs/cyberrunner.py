@@ -1230,6 +1230,7 @@ class CyberRunnerEnv(gym.Env):
         recovery_tilt_threshold: float = 0.02,
         recovery_hole_margin_factor: float = 3.0,
         backup_mode: bool = False,
+        backup_init_max_speed: float = 0.2,
         prior_mode: bool = False,
         prior_task: str = "checkpoint",
         prior_spawn_source: str = "dense_path",
@@ -1288,6 +1289,7 @@ class CyberRunnerEnv(gym.Env):
         self.recovery_tilt_threshold = float(recovery_tilt_threshold)
         self.recovery_hole_margin_factor = float(recovery_hole_margin_factor)
         self.backup_mode = backup_mode
+        self.backup_init_max_speed = float(backup_init_max_speed)
         self.prior_mode = prior_mode
         self.prior_task = prior_task
         self.prior_spawn_source = prior_spawn_source
@@ -1435,6 +1437,7 @@ class CyberRunnerEnv(gym.Env):
         self._in_checkpoint_prev = False
         self._ball_speed = 0.0
         self._ball_speed_true = 0.0
+        self._ball_vel_true = np.zeros(2, dtype=np.float32)
         self._min_hole_distance = np.inf
         self._prev_ball_pos = np.zeros(2, dtype=np.float32)
         self._prev_ball_pos_noisy = np.zeros(2, dtype=np.float32)
@@ -1609,8 +1612,9 @@ class CyberRunnerEnv(gym.Env):
         if self.randomize_init_pos:
             self.data.qpos[0] = self.np_random.uniform(*RANGE_ALPHA)
             self.data.qpos[1] = self.np_random.uniform(*RANGE_BETA)
+            max_speed = self.backup_init_max_speed if self.backup_mode else 0.2
             theta = self.np_random.uniform(0.0, 2 * np.pi)
-            speed = self.np_random.uniform(0.0, 0.2)
+            speed = self.np_random.uniform(0.0, max_speed)
             self.data.qvel[2] = speed * np.cos(theta)
             self.data.qvel[3] = speed * np.sin(theta)
 
@@ -1686,6 +1690,7 @@ class CyberRunnerEnv(gym.Env):
         self._prev_ball_pos_noisy = ball_pos_noisy.astype(np.float32)
         self._ball_speed = 0.0
         self._ball_speed_true = 0.0
+        self._ball_vel_true = np.zeros(2, dtype=np.float32)
         self._min_hole_distance = self._compute_min_hole_distance(ball_pos)
         active_checkpoint = self._get_active_checkpoint_waypoint()
         self._prev_checkpoint_dist = (
@@ -1750,7 +1755,8 @@ class CyberRunnerEnv(gym.Env):
         # Get ball state
         ball_pos = self._get_ball_pos_board_frame()
         dt = TIMESTEP * FRAME_SKIP
-        self._ball_speed_true = float(np.linalg.norm(ball_pos - self._prev_ball_pos) / max(dt, 1e-8))
+        self._ball_vel_true = ((ball_pos - self._prev_ball_pos) / max(dt, 1e-8)).astype(np.float32)
+        self._ball_speed_true = float(np.linalg.norm(self._ball_vel_true))
         self._prev_ball_pos = ball_pos.copy()
         ball_noise = self.np_random.uniform(-BALL_POS_NOISE, BALL_POS_NOISE, size=2)
         ball_pos_noisy = ball_pos + self._obs_bias["ball"] + ball_noise
@@ -2016,6 +2022,15 @@ class CyberRunnerEnv(gym.Env):
             states = np.concatenate(
                 [joint_pos, ball_pos_noisy, vec_to_closest,
                  vec_to_next_wp_to_target]
+            ).astype(np.float32)
+        elif self.backup_mode:
+            # All three recovery conditions are now directly observable:
+            # speed (ball_vel_true + ball_speed_true), tilt (joint_pos), hole margin (min_hole_distance).
+            states = np.concatenate(
+                [joint_pos, ball_pos_noisy,
+                 vec_to_closest,
+                 self._ball_vel_true,
+                 np.array([self._ball_speed_true, 0.0], dtype=np.float32)]
             ).astype(np.float32)
         else:
             states = np.concatenate(
@@ -2398,9 +2413,9 @@ class CyberRunnerEnv(gym.Env):
             terminated = True
             info["termination_reason"] = "hole"
 
-        # Check goal reached
+        # Check goal reached (not applicable in backup_mode — recovery is the only success signal)
         dist_to_goal = np.linalg.norm(ball_pos - self.goal_pos)
-        if (not self.prior_mode) and dist_to_goal < GOAL_THRESHOLD:
+        if (not self.prior_mode) and (not self.backup_mode) and dist_to_goal < GOAL_THRESHOLD:
             terminated = True
             info["termination_reason"] = "goal"
 
@@ -2410,9 +2425,15 @@ class CyberRunnerEnv(gym.Env):
                 "stabilized" if self.prior_mode and self.prior_task == "stabilize" else "checkpoint"
             )
 
-        # Check timeout
+        # Check timeout.
+        # In backup_mode timeout is a genuine failure (ball did not recover), so we use
+        # terminated=True to prevent SB3 from bootstrapping V(s_final) into the Bellman
+        # target — bootstrapping would inflate Q-values and corrupt the probability estimate.
         if self._step_count >= self.episode_length:
-            truncated = True
+            if self.backup_mode:
+                terminated = True
+            else:
+                truncated = True
             info["termination_reason"] = "timeout"
 
         return terminated, truncated, info

@@ -20,6 +20,7 @@ def make_env(cfg):
             recovery_speed_threshold=cfg.env.recovery_speed_threshold,
             recovery_tilt_threshold=cfg.env.recovery_tilt_threshold,
             recovery_hole_margin_factor=cfg.env.recovery_hole_margin_factor,
+            backup_init_max_speed=cfg.env.get("backup_init_max_speed", 0.2),
         ))
     return _init
 
@@ -28,7 +29,9 @@ def make_env(cfg):
 def main(cfg: DictConfig):
     env = VecNormalize(
         make_vec_env(make_env(cfg), n_envs=cfg.algo.n_envs),
-        norm_obs=True, norm_reward=True,
+        norm_obs=True,
+        norm_reward=not cfg.env.get("backup_mode", False),
+        gamma=cfg.algo.gamma,
     )
 
     algo = cfg.algo.name.lower()
@@ -55,6 +58,13 @@ def main(cfg: DictConfig):
             learning_starts=cfg.algo.learning_starts,
             ent_coef=cfg.algo.ent_coef,
         )
+    elif algo == "mbpo":
+        from mbpo import MBPOTrainer
+        trainer = MBPOTrainer(env, cfg, device=cfg.device)
+        trainer.learn(cfg.total_timesteps)
+        trainer.save("mbpo_cyberrunner")
+        env.save("mbpo_cyberrunner_vecnormalize.pkl")
+        return
     else:
         raise ValueError(f"Unknown algo: {algo}")
 
