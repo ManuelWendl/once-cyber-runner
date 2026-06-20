@@ -12,30 +12,32 @@ ent_coef: auto
 ensemble_size: 5
 num_elites: 3
 hidden_sizes: [256, 256, 256]
-model_lr: 1e-3
-model_weight_decay: 1e-4
-model_train_freq: 250          # retrain world model every N env steps
+model_lr: 3e-4
+model_weight_decay: 0
+model_train_freq: 50          # retrain world model every N env steps
 rollout_freq: 250              # regenerate synthetic rollouts every N env steps
-model_train_epochs: 5
-model_batch_size: 4096
+model_train_epochs: 50
+model_batch_size: 512
 
 # ── Buffers ───────────────────────────────────────────────────────────────────
 real_buffer_size: 100_000
-model_buffer_size: 400_000     # SAC's replay buffer (model rollouts)
+model_buffer_size: 200_000     # SAC's replay buffer (model rollouts + mixed real)
 
 # ── Rollout schedule ──────────────────────────────────────────────────────────
 warmup_steps: 20_000           # pure random collection before model training
 rollout_batch_size: 400        # initial states per rollout call
 min_rollout_length: 1
-max_rollout_length: 3
+max_rollout_length: 1
 rollout_schedule_steps: 100_000  # steps over which length grows min→max
 
 # ── Policy update ─────────────────────────────────────────────────────────────
 utd_ratio: 5                   # SAC gradient steps per env step (after warmup)
 
 # ── Backup safety filter ──────────────────────────────────────────────────────
-# If backup_policy_path exists, the world model predicts the next state for every
-# real env action. If V_backup(s') < safety_threshold the backup policy acts instead.
-backup_policy_path: "ppo_backup.zip"
-backup_vecnorm_path: "ppo_backup_vecnormalize.pkl"
-safety_threshold: 0.9
+# If backup_wandb_id is set, the artifact is downloaded automatically (recommended).
+# Otherwise falls back to backup_policy_path / backup_vecnorm_path on disk.
+# If V_backup(s') < safety_threshold the backup policy acts instead.
+backup_wandb_id: zs8rd0rf
+safety_threshold: 0.5
+overwrite_a: true      # store original SAC action + r_min in SAC buffer when backup intervenes
+r_min: 0.0           # penalty reward assigned to unsafe SAC actions in SAC buffer

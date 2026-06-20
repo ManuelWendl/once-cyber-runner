@@ -174,6 +174,9 @@ class MBPOTrainer:
         )
         # SAC.train() requires _logger; silence it — MBPO has its own logging
         self.sac.set_logger(configure_logger(folder=None, format_strings=[]))
+        # We manage all observations in already-normalized space (VecNormalize output).
+        # Nulling this prevents SB3 from double-normalizing obs during predict() and train().
+        self.sac._vec_normalize_env = None
 
         # Real experience buffer (separate from SAC's model buffer)
         self.real_buffer = ReplayBuffer(
@@ -187,8 +190,8 @@ class MBPOTrainer:
         self._ac = ac
 
         # ── optional backup safety filter ─────────────────────────────────
-        # Backup policy (PPO) guards real env collection: if the world model
-        # predicts that the SAC action leads to an unrecoverable next state
+        # Backup policy guards real env collection: if the world model predicts
+        # that the SAC action leads to an unrecoverable next state
         # (V_backup(s') < safety_threshold), the backup policy acts instead.
         self.backup_policy = None
         self.backup_vecnorm = None
@@ -196,17 +199,34 @@ class MBPOTrainer:
 
         bp_path = ac.get("backup_policy_path", "ppo_backup.zip")
         bv_path = ac.get("backup_vecnorm_path", "ppo_backup_vecnormalize.pkl")
+
+        wandb_id = ac.get("backup_wandb_id", None)
+        if wandb_id:
+            import wandb as wb
+            from pathlib import Path
+            project = ac.get("backup_wandb_project", "cyberrunner")
+            api = wb.Api()
+            run = api.run(f"{project}/{wandb_id}")
+            artifact = next((a for a in run.logged_artifacts() if a.type == "model"), None)
+            if artifact is None:
+                raise RuntimeError(f"[MBPO] No model artifact found for wandb run {project}/{wandb_id}")
+            root = Path(artifact.download())
+            bp_path = str(next(root.glob("*.zip")))
+            bv_path = str(next(root.glob("*.pkl")))
+            print(f"[MBPO] Downloaded backup artifact: {bp_path}")
+
         if os.path.exists(bp_path) and os.path.exists(bv_path):
             from gymnasium.wrappers import FlattenObservation
             from envs.cyberrunner import CyberRunnerEnv
-            self.backup_policy = PPO.load(bp_path, device=device)
+            model_cls = PPO if "ppo" in os.path.basename(bp_path).lower() else SAC
+            self.backup_policy = model_cls.load(bp_path, device=device)
             dummy = DummyVecEnv([lambda: FlattenObservation(
                 CyberRunnerEnv(include_vision=False, backup_mode=True)
             )])
             self.backup_vecnorm = VecNormalize.load(bv_path, dummy)
             self.backup_vecnorm.training = False
             self.backup_vecnorm.norm_reward = False
-            print(f"[MBPO] Backup safety filter loaded: {bp_path}  threshold={self.safety_threshold}")
+            print(f"[MBPO] Backup safety filter loaded ({model_cls.__name__}): {bp_path}  threshold={self.safety_threshold}")
         else:
             print(f"[MBPO] No backup policy found at '{bp_path}' — safety filter disabled.")
 
@@ -229,18 +249,16 @@ class MBPOTrainer:
 
         dt = 0.00166666 * 10  # TIMESTEP * FRAME_SKIP = 1/60 s
 
-        joint_pos     = raw[:, 0:2]
-        ball_pos      = raw[:, 2:4]
-        vec_closest   = raw[:, 4:6]
-        checkpoint    = raw[:, 10:13]
-
-        prev_ball_pos = prev_raw[:, 2:4]
+        # Flat layout: [checkpoint(3), joint(2), ball_pos(2), vec_closest(2), ...]
+        # gymnasium sorts Dict keys alphabetically: checkpoint < states
+        ball_pos      = raw[:, 5:7]
+        prev_ball_pos = prev_raw[:, 5:7]
         ball_vel      = (ball_pos - prev_ball_pos) / dt          # (B, 2)
         ball_speed    = np.linalg.norm(ball_vel, axis=1, keepdims=True)  # (B, 1)
         zeros         = np.zeros((len(obs), 1), dtype=np.float32)
 
         backup_raw = np.concatenate(
-            [joint_pos, ball_pos, vec_closest, ball_vel, ball_speed, zeros, checkpoint], axis=1
+            [raw[:, 0:9], ball_vel, ball_speed, zeros], axis=1
         ).astype(np.float32)   # (B, 13)
 
         b_rms = self.backup_vecnorm.obs_rms
@@ -249,20 +267,28 @@ class MBPOTrainer:
         )
         return backup_norm
 
-    def _recovery_values(self, backup_obs: np.ndarray) -> np.ndarray:
-        """Query backup policy value function V(s) = P(recover | s). Returns (B,)."""
+    def _recovery_values(self, backup_obs: np.ndarray, act: np.ndarray | None = None) -> np.ndarray:
+        """Query backup policy safety value V(s) = P(recover | s). Returns (B,).
+        PPO: V(s) directly.
+        SAC: min(Q1,Q2)(s, a) where a is the action about to be executed."""
         obs_t = torch.FloatTensor(backup_obs).to(self.device)
         with torch.no_grad():
-            values = self.backup_policy.policy.predict_values(obs_t)
+            if isinstance(self.backup_policy, PPO):
+                values = self.backup_policy.policy.predict_values(obs_t)
+            else:
+                act_t = torch.FloatTensor(act).to(self.device)
+                q1, q2 = self.backup_policy.policy.critic(obs_t, act_t)
+                values = torch.min(q1, q2)
         return values.cpu().numpy().flatten()
 
     # ── world model training ──────────────────────────────────────────────
 
-    def _train_dynamics(self) -> None:
+    def _train_dynamics(self) -> tuple[float, float]:
         ac = self._ac
         if self.real_buffer.size() < ac.batch_size:
-            return
+            return float("nan"), float("nan")
         self.dynamics.train()
+        train_losses = []
         for _ in range(ac.model_train_epochs):
             b = self.real_buffer.sample(min(ac.model_batch_size, self.real_buffer.size()))
             tgt = torch.cat([b.next_observations - b.observations, b.rewards], -1)
@@ -271,11 +297,15 @@ class MBPOTrainer:
             loss.backward()
             nn.utils.clip_grad_norm_(self.dynamics.parameters(), 1.0)
             self.model_opt.step()
+            train_losses.append(loss.item())
         # Select elites on a held-out validation batch
         b = self.real_buffer.sample(min(2048, self.real_buffer.size()))
         tgt = torch.cat([b.next_observations - b.observations, b.rewards], -1)
         self.dynamics.update_elites(b.observations, b.actions, tgt)
+        with torch.no_grad():
+            val_loss = self.dynamics.nll_loss(b.observations, b.actions, tgt).item()
         self.dynamics.eval()
+        return float(np.mean(train_losses)), val_loss
 
     # ── synthetic rollout generation ──────────────────────────────────────
 
@@ -289,6 +319,7 @@ class MBPOTrainer:
         ac = self._ac
         b = self.real_buffer.sample(ac.rollout_batch_size)
         obs = b.observations.cpu().numpy()   # already in normalized obs space
+        prev_obs = obs.copy()
 
         all_obs, all_nobs, all_act, all_rew = [], [], [], []
         for _ in range(length):
@@ -296,8 +327,22 @@ class MBPOTrainer:
             nobs, rew = self.dynamics.sample(obs, act)
             nobs = np.clip(nobs, -10.0, 10.0)
             rew = np.clip(rew, -10.0, 10.0)   # guard against model exploitation
+
+            if self.backup_policy is not None:
+                backup_obs = self._to_backup_obs(nobs, obs)
+                values = self._recovery_values(backup_obs, act=act)
+                unsafe = values < self.safety_threshold
+                if unsafe.any():
+                    cur_backup_obs = self._to_backup_obs(obs, prev_obs)
+                    backup_act, _ = self.backup_policy.predict(cur_backup_obs[unsafe], deterministic=True)
+                    act[unsafe] = backup_act
+                    nobs_safe, rew_safe = self.dynamics.sample(obs[unsafe], backup_act)
+                    nobs[unsafe] = np.clip(nobs_safe, -10.0, 10.0)
+                    rew[unsafe]  = np.clip(rew_safe,  -10.0, 10.0)
+
             all_obs.append(obs); all_nobs.append(nobs)
             all_act.append(act); all_rew.append(rew)
+            prev_obs = obs
             obs = nobs
 
         self._batch_add_to_sac(
@@ -306,11 +351,12 @@ class MBPOTrainer:
         )
 
     def _batch_add_to_sac(self, obs: np.ndarray, nobs: np.ndarray,
-                           act: np.ndarray, rew: np.ndarray) -> None:
+                           act: np.ndarray, rew: np.ndarray,
+                           dones: np.ndarray | None = None) -> None:
         """Write a batch of transitions directly into SAC's replay buffer arrays."""
         buf = self.sac.replay_buffer
         n = len(obs)
-        done = np.zeros((n, 1), dtype=np.float32)
+        done = np.zeros((n, 1), dtype=np.float32) if dones is None else dones.reshape(n, 1).astype(np.float32)
         rew2 = rew[:, None]    # (n, 1) to match buf.rewards shape (buffer_size, n_envs)
 
         def _write(start: int, src_start: int, src_end: int) -> None:
@@ -339,7 +385,7 @@ class MBPOTrainer:
 
     # ── main loop ─────────────────────────────────────────────────────────
 
-    def learn(self, total_timesteps: int) -> None:
+    def learn(self, total_timesteps: int, wandb_run=None) -> None:
         ac = self._ac
         obs = self.env.reset()
         n_envs = self.env.num_envs
@@ -349,6 +395,12 @@ class MBPOTrainer:
         ep_lengths: list[int] = []
         actor_losses: list[float] = []
         critic_losses: list[float] = []
+        q_values: list[float] = []
+        ent_coefs: list[float] = []
+        backup_triggered: list[float] = []
+        recovery_values: list[float] = []
+        model_train_nlls: list[float] = []
+        model_val_nlls: list[float] = []
 
         prev_obs = obs.copy()
 
@@ -364,14 +416,22 @@ class MBPOTrainer:
             # each env. If the backup policy's value V(s') < safety_threshold,
             # the next state is predicted to be unrecoverable — replace SAC's
             # action with the backup policy's action for that env.
-            if (self.backup_policy is not None
-                    and step >= ac.warmup_steps
-                    and self.real_buffer.size() >= ac.batch_size):
-                nobs_pred, _ = self.dynamics.sample(obs, act)
-                nobs_pred = np.clip(nobs_pred, -10.0, 10.0)
-                backup_obs = self._to_backup_obs(nobs_pred, obs)
-                values = self._recovery_values(backup_obs)
+            sac_act = act.copy()   # original behavioral action before any override
+            unsafe = np.zeros(n_envs, dtype=bool)
+
+            if self.backup_policy is not None and (
+                    isinstance(self.backup_policy, SAC)
+                    or self.real_buffer.size() >= ac.batch_size):
+                if isinstance(self.backup_policy, SAC):
+                    backup_obs = self._to_backup_obs(obs, prev_obs)
+                else:
+                    nobs_pred, _ = self.dynamics.sample(obs, act)
+                    nobs_pred = np.clip(nobs_pred, -10.0, 10.0)
+                    backup_obs = self._to_backup_obs(nobs_pred, obs)
+                values = self._recovery_values(backup_obs, act=act)
                 unsafe = values < self.safety_threshold
+                backup_triggered.append(float(unsafe.mean()))
+                recovery_values.append(float(values.mean()))
                 if unsafe.any():
                     cur_backup_obs = self._to_backup_obs(obs, prev_obs)
                     backup_act, _ = self.backup_policy.predict(
@@ -382,18 +442,29 @@ class MBPOTrainer:
             nobs, rew, done, infos = self.env.step(act)
 
             # Store each parallel env's transition in both buffers
+            overwrite_a = ac.get("overwrite_a", True)
+            r_min = float(ac.get("r_min", 0.0))
             for i in range(n_envs):
                 terminal = bool(done[i]) and not infos[i].get("TimeLimit.truncated", False)
                 t = np.array([terminal])
+                # Real/model buffer always gets the executed action (clean ground truth)
                 self.real_buffer.add(
                     obs[i:i+1], nobs[i:i+1], act[i:i+1],
                     rew[i:i+1], t, [infos[i]],
                 )
-                # Also add real transitions to SAC's buffer to anchor Q-values
-                self.sac.replay_buffer.add(
-                    obs[i:i+1], nobs[i:i+1], act[i:i+1],
-                    rew[i:i+1], t, [infos[i]],
-                )
+                # SAC buffer: if overwrite_a, penalise the original unsafe action
+                # so the critic learns to avoid it, without corrupting model data
+                if overwrite_a and unsafe[i]:
+                    sac_rew = np.array([[r_min]], dtype=np.float32)
+                    self.sac.replay_buffer.add(
+                        obs[i:i+1], nobs[i:i+1], sac_act[i:i+1],
+                        sac_rew, t, [infos[i]],
+                    )
+                else:
+                    self.sac.replay_buffer.add(
+                        obs[i:i+1], nobs[i:i+1], act[i:i+1],
+                        rew[i:i+1], t, [infos[i]],
+                    )
                 ep_info = infos[i].get("episode")
                 if ep_info is not None:
                     ep_rewards.append(float(ep_info["r"]))
@@ -407,7 +478,10 @@ class MBPOTrainer:
                 print(f"[MBPO] Warmup done ({step} steps). Starting model training + SAC updates.", flush=True)
 
             if step % ac.model_train_freq == 0 and step >= ac.warmup_steps:
-                self._train_dynamics()
+                train_nll, val_nll = self._train_dynamics()
+                if not np.isnan(train_nll):
+                    model_train_nlls.append(train_nll)
+                    model_val_nlls.append(val_nll)
 
             if step >= ac.warmup_steps and step % ac.rollout_freq == 0:
                 self._generate_rollouts(self._rollout_length(step))
@@ -419,23 +493,59 @@ class MBPOTrainer:
                     if hasattr(logger, "name_to_value"):
                         al = logger.name_to_value.get("train/actor_loss")
                         cl = logger.name_to_value.get("train/critic_loss")
+                        ec = logger.name_to_value.get("train/ent_coef")
                         if al is not None:
                             actor_losses.append(float(al))
                         if cl is not None:
                             critic_losses.append(float(cl))
+                        if ec is not None:
+                            ent_coefs.append(float(ec))
+
+            if step >= ac.warmup_steps and step % 2_000 == 0 and self.sac.replay_buffer.size() >= ac.batch_size:
+                with torch.no_grad():
+                    b = self.sac.replay_buffer.sample(512)
+                    obs_t = b.observations.to(self.device)
+                    act_t, _ = self.sac.actor.action_log_prob(obs_t)
+                    qs = torch.cat(self.sac.critic(obs_t, act_t), dim=1)
+                    q_values.append(float(qs.min(dim=1).values.mean()))
 
             if step % 1_000 == 0:
                 parts = [f"[MBPO] {step:>8}/{total_timesteps}"]
+                log = {"train/step": step}
                 if ep_rewards:
-                    parts.append(f"ep_rew={np.mean(ep_rewards[-100:]):.3f}")
-                    parts.append(f"ep_len={np.mean(ep_lengths[-100:]):.0f}")
+                    ep_rew = ep_rewards[-1]
+                    ep_len = ep_lengths[-1]
+                    parts.append(f"ep_rew={ep_rew:.3f}")
+                    parts.append(f"ep_len={ep_len:.0f}")
+                    log["train/ep_rew"] = ep_rew
+                    log["train/ep_len"] = ep_len
                 if actor_losses:
-                    parts.append(f"actor_loss={np.mean(actor_losses[-100:]):.3f}")
-                    parts.append(f"critic_loss={np.mean(critic_losses[-100:]):.3f}")
+                    al = np.mean(actor_losses[-100:])
+                    cl = np.mean(critic_losses[-100:])
+                    parts.append(f"actor_loss={al:.3f}")
+                    parts.append(f"critic_loss={cl:.3f}")
+                    log["train/actor_loss"] = al
+                    log["train/critic_loss"] = cl
+                if q_values:
+                    log["train/q_values"] = np.mean(q_values[-20:])
+                if ent_coefs:
+                    log["train/ent_coef"] = np.mean(ent_coefs[-100:])
+                if backup_triggered:
+                    log["train/backup_triggered"] = np.mean(backup_triggered[-100:])
+                if recovery_values:
+                    log["train/recovery_value"] = np.mean(recovery_values[-100:])
+                if model_train_nlls:
+                    log["model/train_nll"] = np.mean(model_train_nlls[-20:])
+                    log["model/val_nll"] = np.mean(model_val_nlls[-20:])
+                log["train/real_buffer"] = self.real_buffer.size()
+                log["train/model_buffer"] = self.sac.replay_buffer.size()
+                log["train/rollout_len"] = self._rollout_length(step)
                 parts.append(f"real={self.real_buffer.size()}")
                 parts.append(f"model={self.sac.replay_buffer.size()}")
                 parts.append(f"rollout_len={self._rollout_length(step)}")
                 print("  ".join(parts), flush=True)
+                if wandb_run is not None:
+                    wandb_run.log(log, step=step)
 
     def save(self, name: str) -> None:
         self.sac.save(f"{name}_policy")

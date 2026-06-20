@@ -15,6 +15,13 @@ env:
   recovery_tilt_threshold: 0.02     # rad (~1.1°) — both joints must be within this
   recovery_hole_margin_factor: 3.0  # ball must be > HOLE_RADIUS + N*MARBLE_RADIUS from any hole
 
+wandb:
+  enabled: true
+  project: cyberrunner
+  name: null  # auto-generated if null
+  tags: []
+  log_interval: 10_000  # timesteps between wandb log calls (same cadence for PPO and SAC)
+
 hydra:
   run:
     dir: .
