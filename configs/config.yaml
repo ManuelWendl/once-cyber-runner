@@ -11,6 +11,8 @@ env:
   episode_length: 2000
   randomize_init_pos: false
   backup_mode: false
+  dense_main_reward: false
+  dense_main_progress_scale: 100.0
   recovery_speed_threshold: 0.03    # m/s — ball must be slower than this
   recovery_tilt_threshold: 0.02     # rad (~1.1°) — both joints must be within this
   recovery_hole_margin_factor: 3.0  # ball must be > HOLE_RADIUS + N*MARBLE_RADIUS from any hole

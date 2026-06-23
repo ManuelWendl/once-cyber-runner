@@ -60,6 +60,8 @@ def make_env(cfg):
             recovery_tilt_threshold=cfg.env.recovery_tilt_threshold,
             recovery_hole_margin_factor=cfg.env.recovery_hole_margin_factor,
             backup_init_max_speed=cfg.env.get("backup_init_max_speed", 0.2),
+            dense_main_reward=cfg.env.get("dense_main_reward", False),
+            dense_main_progress_scale=cfg.env.get("dense_main_progress_scale", 100.0),
         ))
     return _init
 
@@ -75,46 +77,76 @@ def save_artifact(run: wandb.Run, artifact_name: str, file_paths: list[str]) -> 
 def eval_and_log_video(
     run: wandb.Run,
     model,
-    vecnorm_path: str,
-    env_cfg_path: str,
-    n_episodes: int = 3,
+    vecnorm_path: str = None,
+    env_cfg_path: str = None,
     fps: int = 20,
+    predict_fn=None,
+    vec_env=None,
 ) -> None:
-    with open(env_cfg_path) as f:
-        ec = json.load(f)
+    own_env = vec_env is None
+    if own_env:
+        with open(env_cfg_path) as f:
+            ec = json.load(f)
+        eval_env = VecNormalize.load(
+            vecnorm_path,
+            DummyVecEnv([lambda: FlattenObservation(CyberRunnerEnv(
+                render_mode="rgb_array",
+                include_vision=False,
+                episode_length=ec["episode_length"],
+                randomize_init_pos=False,
+                backup_mode=False,
+                recovery_speed_threshold=ec.get("recovery_speed_threshold", 0.03),
+                recovery_tilt_threshold=ec.get("recovery_tilt_threshold", 0.02),
+                recovery_hole_margin_factor=ec.get("recovery_hole_margin_factor", 3.0),
+                backup_init_max_speed=ec.get("backup_init_max_speed", 0.2),
+                reward_every_n_waypoints=ec.get("reward_every_n_waypoints", 3),
+                hole_penalty=ec.get("hole_penalty", 5.0),
+            ))]),
+        )
+        eval_env.training = False
+        eval_env.norm_reward = False
+    else:
+        eval_env = vec_env
+        prev_training = eval_env.training
+        eval_env.training = False
 
-    backup_mode = ec.get("backup_mode", False)
-    eval_env = VecNormalize.load(
-        vecnorm_path,
-        DummyVecEnv([lambda: FlattenObservation(CyberRunnerEnv(
-            render_mode="rgb_array",
-            include_vision=False,
-            episode_length=ec["episode_length"],
-            randomize_init_pos=True,
-            backup_mode=backup_mode,
-            recovery_speed_threshold=ec.get("recovery_speed_threshold", 0.03),
-            recovery_tilt_threshold=ec.get("recovery_tilt_threshold", 0.02),
-            recovery_hole_margin_factor=ec.get("recovery_hole_margin_factor", 3.0),
-            backup_init_max_speed=ec.get("backup_init_max_speed", 0.2),
-            reward_every_n_waypoints=ec.get("reward_every_n_waypoints", 3),
-            hole_penalty=ec.get("hole_penalty", 5.0),
-        ))]),
-    )
-    eval_env.training = False
-    eval_env.norm_reward = False
+    # Enable rgb_array rendering on the underlying env (lazy renderer init)
+    raw_env = eval_env.venv.envs[0].unwrapped
+    prev_render_mode = raw_env.render_mode
+    raw_env.render_mode = "rgb_array"
 
     all_frames: list[np.ndarray] = []
-    for _ in range(n_episodes):
-        obs = eval_env.reset()
-        while True:
-            frame = eval_env.venv.envs[0].unwrapped.render()
-            if frame is not None:
-                all_frames.append(frame)
-            action, _ = model.predict(obs, deterministic=True)
-            obs, _, done, _ = eval_env.step(action)
-            if done[0]:
-                break
-    eval_env.close()
+    total_reward = 0.0
+    step = 0
+    obs = eval_env.reset()
+    prev_obs = obs.copy()
+    while True:
+        frame = raw_env.render()
+        if frame is not None:
+            all_frames.append(frame)
+        if predict_fn is not None:
+            action, _ = predict_fn(obs, prev_obs)
+        else:
+            action, _ = model.predict(obs, deterministic=False)
+        prev_obs = obs.copy()
+        obs, rew, done, _ = eval_env.step(action)
+        total_reward += float(rew[0])
+        step += 1
+        if step % 200 == 0:
+            print(f"[eval] step={step:4d}  cumulative_reward={total_reward:.3f}")
+        if done[0]:
+            break
+    print(f"[eval] done after {step} steps  total_reward={total_reward:.3f}")
+
+    # Restore env state; only close if we created it
+    raw_env.render_mode = prev_render_mode
+    if own_env:
+        eval_env.close()
+    else:
+        eval_env.training = prev_training
+
+    if run is not None:
+        run.log({"eval/total_reward": total_reward, "eval/ep_length": step})
 
     # wandb.Video expects (T, C, H, W)
     frames = np.stack(all_frames).transpose(0, 3, 1, 2)
@@ -164,6 +196,7 @@ def main(cfg: DictConfig):
             learning_starts=cfg.algo.learning_starts,
             gradient_steps=cfg.algo.get("gradient_steps", 1) * cfg.algo.n_envs,
             ent_coef=cfg.algo.ent_coef,
+            target_entropy=cfg.algo.get("target_entropy", "auto"),
         )
     elif algo == "mbpo":
         from mbpo import MBPOTrainer
@@ -180,9 +213,10 @@ def main(cfg: DictConfig):
                 "mbpo_cyberrunner_vecnormalize.pkl",
                 "mbpo_cyberrunner_env_cfg.json",
             ])
-            eval_and_log_video(run, trainer.sac,
-                               "mbpo_cyberrunner_vecnormalize.pkl",
-                               "mbpo_cyberrunner_env_cfg.json")
+            eval_and_log_video(
+                run, trainer.sac, vec_env=trainer.env,
+                predict_fn=trainer.shielded_predict,
+            )
             run.finish()
         return
     else:

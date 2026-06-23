@@ -1,5 +1,5 @@
 name: sac
-n_envs: 16
+n_envs: 64
 learning_rate: 3e-4
 buffer_size: 1_000_000
 batch_size: 256
@@ -7,3 +7,5 @@ tau: 0.005
 gamma: 0.99
 learning_starts: 10_000
 ent_coef: auto
+target_entropy: auto   # "auto" = -dim(A). A float (e.g. 0.0) keeps the policy more
+                       # stochastic; SB3 passes this straight to SAC.

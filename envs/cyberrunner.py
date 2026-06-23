@@ -1258,6 +1258,8 @@ class CyberRunnerEnv(gym.Env):
         prior_recovery_action_penalty: float = PRIOR_RECOVERY_ACTION_PENALTY,
         prior_recovery_action_delta_penalty: float = PRIOR_RECOVERY_ACTION_DELTA_PENALTY,
         prior_recovery_tilt_penalty: float = PRIOR_RECOVERY_TILT_PENALTY,
+        dense_main_reward: bool = False,
+        dense_main_progress_scale: float = 100.0,
     ):
         super().__init__()
         if prior_version not in PRIOR_VERSIONS:
@@ -1281,6 +1283,8 @@ class CyberRunnerEnv(gym.Env):
         self.checkpoint_arrival_reward = checkpoint_arrival_reward
         self.checkpoint_stabilize_reward = checkpoint_stabilize_reward
         self.checkpoint_hold_reward = checkpoint_hold_reward
+        self.dense_main_reward = dense_main_reward
+        self.dense_main_progress_scale = dense_main_progress_scale
         self.safe_hole_margin = safe_hole_margin
         self.checkpoint_speed_ema_alpha = checkpoint_speed_ema_alpha
         self.checkpoint_include_corridors = checkpoint_include_corridors
@@ -1373,20 +1377,17 @@ class CyberRunnerEnv(gym.Env):
         self.board_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "board")
         self.marble_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "marble")
 
-        # Observation space — matches the pre-GPU layout (commit ec3e3ab):
-        #   "states" (10): [α, β, ball_x, ball_y, vec_to_closest_path(2),
-        #                   vec_to_next_wp(2), vec_to_next_next_wp(2)]
-        #   "checkpoint" (3): [vec_x, vec_y, dist] to FIRST SAFE CORNER
-        #                     BACKWARD in the maze path (recomputed every
-        #                     step from the ball's current path progress).
-        # Walls and holes implicitly inferred via path projection / dynamics.
+        # Observation space — minimal Markovian state. Path/waypoint vectors,
+        # scalar speed, and the checkpoint field were all removed; both the
+        # default (behavioral) and backup obs are now the same 6-d vector:
+        #   "states" (6): [α, β, ball_x, ball_y, ball_vx, ball_vy]
+        # ball_pos is noisy (sensor model); velocity is true (board frame).
         if self.prior_obs_mode == PRIOR_VERSION_DENSE:
             states_dim = DENSE_STATES_DIM
         else:
-            states_dim = 10
+            states_dim = 6   # [joint, ball_pos, ball_vel] (default and backup)
         obs_spaces = {
             "states": spaces.Box(low=-np.inf, high=np.inf, shape=(states_dim,), dtype=np.float32),
-            "checkpoint": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
         }
         if self.prior_obs_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
             obs_spaces = {
@@ -1427,6 +1428,7 @@ class CyberRunnerEnv(gym.Env):
         # Episode state
         self._step_count = 0
         self._prev_progress = 0.0
+        self._max_progress_reached = 0.0
         self._seg_idx = 0
         self._closest_point = np.zeros(2, dtype=np.float32)
         self._obs_bias = None
@@ -1435,6 +1437,7 @@ class CyberRunnerEnv(gym.Env):
         self._active_checkpoint_idx = 0
         self._stable_steps = 0
         self._in_checkpoint_prev = False
+        self._arrival_rewarded = False
         self._ball_speed = 0.0
         self._ball_speed_true = 0.0
         self._ball_vel_true = np.zeros(2, dtype=np.float32)
@@ -1667,10 +1670,12 @@ class CyberRunnerEnv(gym.Env):
         # Reset episode state
         self._step_count = 0
         self._max_checkpoint_reached = 0
+        self._max_progress_reached = 0.0
         if not self.prior_mode:
             self._active_checkpoint_idx = 0
         self._stable_steps = 0
         self._in_checkpoint_prev = False
+        self._arrival_rewarded = False
         self._success = False
         self._ep_quiet_steps = 0
         self._ep_ball_speed_sum = 0.0
@@ -1930,15 +1935,10 @@ class CyberRunnerEnv(gym.Env):
         """Get observation with noise.
 
         Returns dict with:
-            "states" (10-dim, all NOISY — sensor model for sim-to-real):
+            "states" (6-dim):
                 [0:2] Joint angles (α, β) + per-episode bias + per-step noise
                 [2:4] Ball position (x, y) + per-episode bias + per-step noise
-                [4:6] Vector from noisy ball pos to closest visible path point
-                [6:8] Vector from noisy ball pos to next waypoint
-                [8:10] Vector from noisy ball pos to waypoint after next
-            "checkpoint" (3-dim):
-                [vec_x, vec_y, distance] to the FIRST safe-corner BACKWARD
-                in the maze path from the ball's current progress.
+                [4:6] True ball velocity (vx, vy), board frame (not noised)
             "image" (64x64x3, only if include_vision):
                 Cropped board image centered on ball
         """
@@ -1951,19 +1951,11 @@ class CyberRunnerEnv(gym.Env):
         ball_pos = self._get_ball_pos_board_frame()
         ball_pos_noisy = (ball_pos + self._obs_bias["ball"] + ball_noise).astype(np.float32)
 
-        # Vec to closest path point (uses geometry from CLEAN ball pos via
-        # self._closest_point, then offsets from NOISY ball — matches old).
+        # Vec to closest path point — still used by the dense / CHECKPOINT_RECOVERY
+        # prior obs below (the default and backup obs no longer include it).
         vec_to_closest = self._closest_point - ball_pos_noisy
-        # Next two waypoints in path order.
-        num_waypoints = len(self.waypoints)
-        next_idx = min(self._seg_idx + 1, num_waypoints - 1)
-        next_next_idx = min(self._seg_idx + 2, num_waypoints - 1)
-        vec_to_next_wp = self.waypoints[next_idx] - ball_pos_noisy
-        vec_to_next_next_wp = self.waypoints[next_next_idx] - ball_pos_noisy
         if not self._path_detected:
             vec_to_closest = np.zeros(2, dtype=np.float32)
-            vec_to_next_wp = np.zeros(2, dtype=np.float32)
-            vec_to_next_next_wp = np.zeros(2, dtype=np.float32)
 
         # First safe corner BACKWARD in the path.
         # For the dense prior the target is FROZEN at reset (`_prior_target`)
@@ -1977,8 +1969,8 @@ class CyberRunnerEnv(gym.Env):
             backward_corner = self._prior_target
         else:
             backward_corner = self._first_backward_safe_corner(self._prev_progress)
-        ckpt_vec = backward_corner - ball_pos_noisy
-        ckpt_dist = float(np.linalg.norm(ckpt_vec))
+        # (``backward_corner`` is still used as a fallback target by the
+        # CHECKPOINT_RECOVERY prior below; the "checkpoint" obs field was removed.)
 
         if (
             self.prior_mode
@@ -2042,26 +2034,17 @@ class CyberRunnerEnv(gym.Env):
                 [joint_pos, ball_pos_noisy, vec_to_closest,
                  vec_to_next_wp_to_target]
             ).astype(np.float32)
-        elif self.backup_mode:
-            # All three recovery conditions are now directly observable:
-            # speed (ball_vel_true + ball_speed_true), tilt (joint_pos), hole margin (min_hole_distance).
-            states = np.concatenate(
-                [joint_pos, ball_pos_noisy,
-                 vec_to_closest,
-                 self._ball_vel_true,
-                 np.array([self._ball_speed_true, 0.0], dtype=np.float32)]
-            ).astype(np.float32)
         else:
+            # Default AND backup obs: [joint(2), ball_pos(2), ball_vel(2)] = 6-d.
+            # ball_pos is noisy (sensor model); velocity is the true board-frame
+            # velocity (not noised) — it makes the dynamics Markovian for the
+            # world model. Path/waypoint vectors and scalar speed were removed.
             states = np.concatenate(
-                [joint_pos, ball_pos_noisy,
-                 vec_to_closest, vec_to_next_wp, vec_to_next_next_wp]
+                [joint_pos, ball_pos_noisy, self._ball_vel_true]
             ).astype(np.float32)
 
         obs = {
             "states": states,
-            "checkpoint": np.array(
-                [ckpt_vec[0], ckpt_vec[1], ckpt_dist], dtype=np.float32,
-            ),
         }
 
         if self.include_vision:
@@ -2140,6 +2123,20 @@ class CyberRunnerEnv(gym.Env):
             self._prev_checkpoint_dist = np.inf
             return w_quiet * quiet + r_action + hole_reward
 
+        if self.dense_main_reward:
+            # Exact port of cyberrunner_env_vision.py:_compute_reward.
+            # Signed step-to-step progress (rewards forward, penalizes backward
+            # motion) + goal bonus. No hole penalty — falling in a hole only
+            # terminates the episode. dense_main_progress_scale plays the role
+            # of PROGRESS_SCALE (=1.0 in the vision env).
+            if curr_progress >= 0 and self._prev_progress >= 0:
+                progress_reward = (float(curr_progress) - float(self._prev_progress)) * self.dense_main_progress_scale
+            else:
+                progress_reward = 0.0
+            dist_to_goal = float(np.linalg.norm(ball_pos - self.goal_pos))
+            goal_reward = GOAL_BONUS if dist_to_goal < GOAL_THRESHOLD else 0.0
+            return progress_reward + goal_reward
+
         checkpoint_reward = 0.0
         active_checkpoint = self._get_active_checkpoint_waypoint()
         in_checkpoint = False
@@ -2168,8 +2165,9 @@ class CyberRunnerEnv(gym.Env):
                 and self._ball_speed < self.checkpoint_speed_threshold
                 and self._min_hole_distance > (HOLE_RADIUS + self.safe_hole_margin)
             )
-            if in_checkpoint and not self._in_checkpoint_prev and not self.prior_mode:
+            if in_checkpoint and not self._arrival_rewarded and not self.prior_mode:
                 checkpoint_reward += self.checkpoint_arrival_reward
+                self._arrival_rewarded = True
             if stable_here:
                 self._stable_steps += 1
                 # Hold reward scaled by closeness to center (1.0 at center, ~0.5 at edge)
@@ -2185,6 +2183,7 @@ class CyberRunnerEnv(gym.Env):
                     self._max_checkpoint_reached += 1
                     self._active_checkpoint_idx += 1
                 self._stable_steps = 0
+                self._arrival_rewarded = False
                 in_checkpoint = False
         else:
             self._stable_steps = 0
@@ -2289,6 +2288,7 @@ class CyberRunnerEnv(gym.Env):
             0.0, float(self._min_hole_distance - HOLE_RADIUS)
         )
         self._in_checkpoint_prev = False
+        self._arrival_rewarded = False
         self._prev_checkpoint_dist = np.inf
         return float(reward + hole_reward)
 
@@ -2586,8 +2586,12 @@ class CyberRunner(gym.Env):
             )
         else:
             spaces_dict.update({
-                "states": gym.spaces.Box(-np.inf, np.inf, (10,), dtype=np.float32),
-                "checkpoint": gym.spaces.Box(-np.inf, np.inf, (3,), dtype=np.float32),
+                # Track the underlying env's states dim (12 by default, 10 in
+                # backup_mode) instead of hardcoding it.
+                "states": gym.spaces.Box(
+                    -np.inf, np.inf,
+                    self._env.observation_space["states"].shape, dtype=np.float32,
+                ),
             })
         spaces_dict.update({
             "log_path_progress": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
@@ -2641,7 +2645,6 @@ class CyberRunner(gym.Env):
             out["prior_state"] = obs["prior_state"]
         else:
             out["states"] = obs["states"]
-            out["checkpoint"] = obs["checkpoint"]
         if self._include_vision:
             out["image"] = obs["image"]
         return out, reward, is_last, {}
@@ -2668,7 +2671,6 @@ class CyberRunner(gym.Env):
             out["prior_state"] = obs["prior_state"]
         else:
             out["states"] = obs["states"]
-            out["checkpoint"] = obs["checkpoint"]
         if self._include_vision:
             out["image"] = obs["image"]
         return out
