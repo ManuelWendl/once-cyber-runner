@@ -1,5 +1,5 @@
 name: sac
-n_envs: 1024
+n_envs: 512
 learning_rate: 3e-4
 buffer_size: 1_000_000
 batch_size: 256
