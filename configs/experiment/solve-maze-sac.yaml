@@ -5,7 +5,7 @@
 defaults:
   - override /algo: sac
 
-total_timesteps: 1_000_000
+total_timesteps: 6_000_000
 
 env:
   reward_every_n_waypoints: 3
