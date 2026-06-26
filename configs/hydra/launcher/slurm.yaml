@@ -1,0 +1,13 @@
+# Hydra submitit SLURM launcher. Used only in multirun mode (`python train.py -m ...`).
+_target_: hydra_plugins.hydra_submitit_launcher.submitit_launcher.SlurmLauncher
+submitit_folder: ${hydra.sweep.dir}/.submitit/%j
+timeout_min: 1440
+cpus_per_task: 1
+tasks_per_node: 1
+mem_per_cpu: 16384
+nodes: 1
+name: ${hydra.job.name}
+array_parallelism: 256
+max_num_timeout: 100
+setup:
+  - '#SBATCH --requeue'

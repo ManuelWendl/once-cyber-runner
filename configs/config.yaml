@@ -1,5 +1,7 @@
 defaults:
   - algo: sac
+  - hardware: euler
+  - override hydra/launcher: slurm
   - _self_
 
 total_timesteps: 1_000_000
@@ -31,4 +33,9 @@ wandb:
 hydra:
   run:
     dir: .
+  sweep:
+    # Multirun / SLURM: each job gets its own subdir so per-run artifacts
+    # (model .zip, vecnormalize.pkl, env_cfg.json) don't collide.
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
   output_subdir: null

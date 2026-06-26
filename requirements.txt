@@ -3,5 +3,6 @@ stable-baselines3[extra]
 mujoco==3.3.0
 numpy
 Pillow
-hydra-core
+hydra-core>=1.3,<1.4
+hydra-submitit-launcher==1.2.0
 wandb
