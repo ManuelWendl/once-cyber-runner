@@ -5,7 +5,7 @@ n_envs: 4
 learning_rate: 3e-4
 batch_size: 256
 tau: 0.005
-gamma: 0.99
+gamma: 1
 ent_coef: auto   # thermostat: holds policy at target_entropy and self-adjusts α.
                  # A fixed small value removes the entropy TARGET, so the policy
                  # collapses (entropy free-falls) and ep_rew destabilizes.
@@ -38,14 +38,10 @@ max_rollout_length: 1
 rollout_schedule_steps: 200_000  # steps over which length grows min→max
 
 # ── Exploration ───────────────────────────────────────────────────────────────
-optimism: 0.2                  # rollout reward += optimism * ‖σ‖₂ (model prediction
+optimism: 0.1                  # rollout reward += optimism * ‖σ‖₂ (model prediction
                                # uncertainty). Optimism in the face of uncertainty;
                                # 0.0 disables. Tune against train/model_unc (the mean
                                # ‖σ‖₂) so the bonus is a sensible fraction of the reward.
 
 # ── Policy update ─────────────────────────────────────────────────────────────
 utd_ratio: 1                   # SAC gradient steps per env step (after warmup)
-
-# ── Backup safety filter ──────────────────────────────────────────────────────
-backup_wandb_id: u5feg86g #zs8rd0rf
-safety_threshold: 0.9

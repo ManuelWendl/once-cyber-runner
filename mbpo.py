@@ -21,12 +21,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
-import os
-from stable_baselines3 import SAC, PPO
+from stable_baselines3 import SAC
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.logger import configure as configure_logger
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from omegaconf import DictConfig
 
 
@@ -284,102 +282,13 @@ class MBPOTrainer:
 
         self._ac = ac
 
-        # ── optional backup safety filter ─────────────────────────────────
-        # Backup policy guards real env collection: if the world model predicts
-        # that the SAC action leads to an unrecoverable next state
-        # (V_backup(s') < safety_threshold), the backup policy acts instead.
-        self.backup_policy = None
-        self.backup_vecnorm = None
-        self.safety_threshold = float(ac.get("safety_threshold", 0.3))
+    def predict(self, obs: np.ndarray, prev_obs: np.ndarray | None = None, deterministic: bool = True):
+        """Plain SAC predict. ``prev_obs`` is accepted and ignored so existing
+        eval callers passing ``(obs, prev_obs)`` keep working."""
+        return self.sac.predict(obs, deterministic=deterministic)
 
-        bp_path = ac.get("backup_policy_path", "ppo_backup.zip")
-        bv_path = ac.get("backup_vecnorm_path", "ppo_backup_vecnormalize.pkl")
-
-        wandb_id = ac.get("backup_wandb_id", None)
-        if wandb_id:
-            import wandb as wb
-            from pathlib import Path
-            project = ac.get("backup_wandb_project", "cyberrunner")
-            api = wb.Api()
-            run = api.run(f"{project}/{wandb_id}")
-            artifact = next((a for a in run.logged_artifacts() if a.type == "model"), None)
-            if artifact is None:
-                raise RuntimeError(f"[MBPO] No model artifact found for wandb run {project}/{wandb_id}")
-            root = Path(artifact.download())
-            bp_path = str(next(root.glob("*.zip")))
-            bv_path = str(next(root.glob("*.pkl")))
-            print(f"[MBPO] Downloaded backup artifact: {bp_path}")
-
-        if os.path.exists(bp_path) and os.path.exists(bv_path):
-            from gymnasium.wrappers import FlattenObservation
-            from envs.cyberrunner import CyberRunnerEnv
-            model_cls = PPO if "ppo" in os.path.basename(bp_path).lower() else SAC
-            self.backup_policy = model_cls.load(bp_path, device=device)
-            dummy = DummyVecEnv([lambda: FlattenObservation(
-                CyberRunnerEnv(include_vision=False, backup_mode=True)
-            )])
-            self.backup_vecnorm = VecNormalize.load(bv_path, dummy)
-            self.backup_vecnorm.training = False
-            self.backup_vecnorm.norm_reward = False
-            print(f"[MBPO] Backup safety filter loaded ({model_cls.__name__}): {bp_path}  threshold={self.safety_threshold}")
-        else:
-            print(f"[MBPO] No backup policy found at '{bp_path}' — safety filter disabled.")
-
-    # ── backup obs conversion & safety check ─────────────────────────────
-
-    def _to_backup_obs(self, obs: np.ndarray) -> np.ndarray:
-        """
-        Convert behavioral obs → backup obs.
-
-        Both policies now share the identical physical layout
-        [joint(2), ball_pos(2), ball_vel(2)] (6-d), so this is purely a
-        renormalization: de-normalize with the behavioral VecNormalize stats,
-        then re-normalize with the backup's. In imagination the velocity is the
-        world model's prediction for the state.
-        """
-        rms = self.env.obs_rms
-        raw = obs * np.sqrt(rms.var + 1e-8) + rms.mean   # (B, 6) physical units
-        b_rms = self.backup_vecnorm.obs_rms
-        return np.clip(
-            (raw - b_rms.mean) / np.sqrt(b_rms.var + 1e-8), -10.0, 10.0
-        ).astype(np.float32)
-
-    def _recovery_values(self, backup_obs: np.ndarray, act: np.ndarray | None = None) -> np.ndarray:
-        """Query backup policy safety value V(s) = P(recover | s). Returns (B,).
-        PPO: V(s) directly.
-        SAC: min(Q1,Q2)(s, a) where a is the action about to be executed."""
-        obs_t = torch.FloatTensor(backup_obs).to(self.device)
-        with torch.no_grad():
-            if isinstance(self.backup_policy, PPO):
-                values = self.backup_policy.policy.predict_values(obs_t)
-            else:
-                act_t = torch.FloatTensor(act).to(self.device)
-                q1, q2 = self.backup_policy.policy.critic(obs_t, act_t)
-                values = torch.min(q1, q2)
-        return values.cpu().numpy().flatten()
-
-    def shielded_predict(self, obs: np.ndarray, prev_obs: np.ndarray | None = None, deterministic: bool = True):
-        """SAC predict with backup safety filter applied (mirrors real-env shielding in learn()).
-
-        ``prev_obs`` is deprecated and ignored — velocity now comes from the
-        observation itself. The parameter is retained so existing callers
-        (e.g. eval scripts passing ``(obs, prev_obs)``) keep working.
-        """
-        act, state = self.sac.predict(obs, deterministic=deterministic)
-        if self.backup_policy is not None:
-            if isinstance(self.backup_policy, SAC):
-                backup_obs = self._to_backup_obs(obs)
-            else:
-                nobs_pred, _, _ = self.dynamics.sample(obs, act)
-                nobs_pred = np.clip(nobs_pred, -10.0, 10.0)
-                backup_obs = self._to_backup_obs(nobs_pred)
-            values = self._recovery_values(backup_obs, act=act)
-            unsafe = values < self.safety_threshold
-            if unsafe.any():
-                cur_backup_obs = self._to_backup_obs(obs)
-                backup_act, _ = self.backup_policy.predict(cur_backup_obs[unsafe], deterministic=True)
-                act[unsafe] = backup_act
-        return act, state
+    # Backwards-compatible alias (the safety shield has been removed).
+    shielded_predict = predict
 
     # ── world model training ──────────────────────────────────────────────
 
@@ -429,46 +338,15 @@ class MBPOTrainer:
             nobs = np.clip(nobs, -10.0, 10.0)
             rew = np.clip(rew, -10.0, 10.0)   # guard against model exploitation
 
-            if self.backup_policy is not None:
-                # Shield decision, mirroring the real-env filter in learn():
-                #   SAC backup → Q_backup(s, a_sac);  PPO backup → V_backup(s'_sac).
-                # cur_backup_obs is the current-state backup obs; the SAC path
-                # reuses it for both the safety value and the backup action.
-                if isinstance(self.backup_policy, SAC):
-                    cur_backup_obs = self._to_backup_obs(obs)
-                    values = self._recovery_values(cur_backup_obs, act=act)
-                else:
-                    cur_backup_obs = None
-                    values = self._recovery_values(self._to_backup_obs(nobs), act=act)
-                unsafe = values < self.safety_threshold
-                if unsafe.any():
-                    # In reality the unsafe SAC action is NOT executed — the backup
-                    # takes over and the ball ends up in the backup's resulting
-                    # state with the backup action's reward. Mirror that: store the
-                    # SAC action (so the critic learns the consequence of proposing
-                    # it), but make the next state AND reward the model's prediction
-                    # for the BACKUP action. This keeps the dynamics/reward query
-                    # on-distribution — backup actions are what the model was trained
-                    # on in unsafe states.
-                    if cur_backup_obs is None:
-                        cur_backup_obs = self._to_backup_obs(obs)
-                    backup_act, _ = self.backup_policy.predict(
-                        cur_backup_obs[unsafe], deterministic=True
-                    )
-                    nobs_backup, rew_backup, unc_backup = self.dynamics.sample(obs[unsafe], backup_act)
-                    nobs[unsafe] = np.clip(nobs_backup, -10.0, 10.0)
-                    rew[unsafe] = np.clip(rew_backup + self.optimism * unc_backup, -10.0, 10.0)
-
             all_obs.append(obs)
             all_nobs.append(nobs)
-            all_act.append(act)   # stored action is always the SAC action
+            all_act.append(act)
             all_rew.append(rew)
             obs = nobs
 
-        # No terminals in imagination: the shield redirects would-be-unsafe
-        # (e.g. hole-bound) transitions to the backup's recovery state, so the
-        # ball never reaches an absorbing state — and with no zero-value terminal
-        # there is no "escape" for the policy to exploit when Q dips negative.
+        # No terminals in imagination — the model never predicts an absorbing
+        # state, so there is no zero-value terminal for the policy to exploit
+        # when Q dips negative.
         self._batch_add_to_sac(
             np.concatenate(all_obs), np.concatenate(all_nobs),
             np.concatenate(all_act), np.concatenate(all_rew),
@@ -522,8 +400,6 @@ class MBPOTrainer:
         q_values: list[float] = []
         policy_entropies: list[float] = []
         ent_coefs: list[float] = []
-        backup_triggered: list[float] = []
-        recovery_values: list[float] = []
         model_train_nlls: list[float] = []
         model_val_nlls: list[float] = []
 
@@ -533,33 +409,6 @@ class MBPOTrainer:
                 act = np.stack([self.env.action_space.sample() for _ in range(n_envs)])
             else:
                 act, _ = self.sac.predict(obs, deterministic=False)
-
-            # ── backup safety filter on real env actions ───────────────────
-            # After warmup, use the world model to predict the next state for
-            # each env. If the backup policy's value V(s') < safety_threshold,
-            # the next state is predicted to be unrecoverable — replace SAC's
-            # action with the backup policy's action for that env.
-            unsafe = np.zeros(n_envs, dtype=bool)
-
-            if self.backup_policy is not None and (
-                    isinstance(self.backup_policy, SAC)
-                    or self.real_buffer.size() >= ac.batch_size):
-                if isinstance(self.backup_policy, SAC):
-                    backup_obs = self._to_backup_obs(obs)
-                else:
-                    nobs_pred, _, _ = self.dynamics.sample(obs, act)
-                    nobs_pred = np.clip(nobs_pred, -10.0, 10.0)
-                    backup_obs = self._to_backup_obs(nobs_pred)
-                values = self._recovery_values(backup_obs, act=act)
-                unsafe = values < self.safety_threshold
-                backup_triggered.append(float(unsafe.mean()))
-                recovery_values.append(float(values.mean()))
-                if unsafe.any():
-                    cur_backup_obs = self._to_backup_obs(obs)
-                    backup_act, _ = self.backup_policy.predict(
-                        cur_backup_obs[unsafe], deterministic=True
-                    )
-                    act[unsafe] = backup_act
 
             nobs, rew, done, infos = self.env.step(act)
 
@@ -649,15 +498,6 @@ class MBPOTrainer:
                     ec = np.mean(ent_coefs[-100:])
                     log["train/ent_coef"] = ec
                     parts.append(f"ent_coef={ec:.3f}")
-                if backup_triggered:
-                    bt = np.mean(backup_triggered[-100:])
-                    log["train/backup_triggered"] = bt
-                    # Fraction of real steps where the shield overwrote the SAC action.
-                    # High → the model trains on shielded behavior but rollouts imagine
-                    # raw SAC → train/imagine action mismatch drives model_rew off.
-                    parts.append(f"shield={bt:.3f}")
-                if recovery_values:
-                    log["train/recovery_value"] = np.mean(recovery_values[-100:])
                 if model_train_nlls:
                     log["model/train_nll"] = np.mean(model_train_nlls[-20:])
                     log["model/val_nll"] = np.mean(model_val_nlls[-20:])

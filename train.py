@@ -6,7 +6,6 @@ import numpy as np
 import hydra
 import wandb
 from omegaconf import DictConfig, OmegaConf
-from gymnasium.wrappers import FlattenObservation
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
@@ -49,20 +48,19 @@ class WandbCallback(BaseCallback):
 
 def make_env(cfg):
     def _init():
-        return FlattenObservation(CyberRunnerEnv(
-            include_vision=False,
+        return CyberRunnerEnv(
             reward_every_n_waypoints=cfg.env.reward_every_n_waypoints,
             hole_penalty=cfg.env.hole_penalty,
+            dense_main_progress_scale=cfg.env.get("dense_main_progress_scale", 100.0),
             episode_length=cfg.env.episode_length,
             randomize_init_pos=cfg.env.randomize_init_pos,
-            backup_mode=cfg.env.backup_mode,
-            recovery_speed_threshold=cfg.env.recovery_speed_threshold,
-            recovery_tilt_threshold=cfg.env.recovery_tilt_threshold,
-            recovery_hole_margin_factor=cfg.env.recovery_hole_margin_factor,
-            backup_init_max_speed=cfg.env.get("backup_init_max_speed", 0.2),
-            dense_main_reward=cfg.env.get("dense_main_reward", False),
-            dense_main_progress_scale=cfg.env.get("dense_main_progress_scale", 100.0),
-        ))
+            layout=cfg.env.get("layout", "hard"),
+            obs_n_stack=cfg.env.get("obs_n_stack", 1),
+            prior_mode=cfg.env.get("prior_mode", False),
+            recovery_speed_threshold=cfg.env.get("recovery_speed_threshold", 0.03),
+            recovery_hole_margin_factor=cfg.env.get("recovery_hole_margin_factor", 3.0),
+            prior_init_max_speed=cfg.env.get("prior_init_max_speed", 0.2),
+        )
     return _init
 
 
@@ -89,19 +87,20 @@ def eval_and_log_video(
             ec = json.load(f)
         eval_env = VecNormalize.load(
             vecnorm_path,
-            DummyVecEnv([lambda: FlattenObservation(CyberRunnerEnv(
+            DummyVecEnv([lambda: CyberRunnerEnv(
                 render_mode="rgb_array",
-                include_vision=False,
                 episode_length=ec["episode_length"],
                 randomize_init_pos=False,
-                backup_mode=False,
+                layout=ec.get("layout", "hard"),
+                obs_n_stack=ec.get("obs_n_stack", 1),
+                prior_mode=ec.get("prior_mode", False),
                 recovery_speed_threshold=ec.get("recovery_speed_threshold", 0.03),
-                recovery_tilt_threshold=ec.get("recovery_tilt_threshold", 0.02),
                 recovery_hole_margin_factor=ec.get("recovery_hole_margin_factor", 3.0),
-                backup_init_max_speed=ec.get("backup_init_max_speed", 0.2),
+                prior_init_max_speed=ec.get("prior_init_max_speed", 0.2),
                 reward_every_n_waypoints=ec.get("reward_every_n_waypoints", 3),
                 hole_penalty=ec.get("hole_penalty", 5.0),
-            ))]),
+                dense_main_progress_scale=ec.get("dense_main_progress_scale", 100.0),
+            )]),
         )
         eval_env.training = False
         eval_env.norm_reward = False
@@ -168,7 +167,7 @@ def main(cfg: DictConfig):
     env = VecNormalize(
         make_vec_env(make_env(cfg), n_envs=cfg.algo.n_envs),
         norm_obs=True,
-        norm_reward=not cfg.env.get("backup_mode", False),
+        norm_reward=not cfg.env.get("prior_mode", False),
         gamma=cfg.algo.gamma,
     )
 
@@ -226,7 +225,7 @@ def main(cfg: DictConfig):
     callbacks = [WandbCallback(log_interval=log_interval)] if run is not None else []
     model.learn(total_timesteps=cfg.total_timesteps, progress_bar=True, callback=callbacks)
 
-    suffix = "backup" if cfg.env.get("backup_mode", False) else "cyberrunner"
+    suffix = "prior" if cfg.env.get("prior_mode", False) else "cyberrunner"
     model.save(f"{algo}_{suffix}")
     env.save(f"{algo}_{suffix}_vecnormalize.pkl")
     with open(f"{algo}_{suffix}_env_cfg.json", "w") as f:

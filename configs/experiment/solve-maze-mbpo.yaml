@@ -8,11 +8,6 @@ defaults:
 total_timesteps: 400_000
 
 env:
-  dense_main_reward: true
-  dense_main_progress_scale: 100.0  # ~0.0003 raw reward/step is below the world
-                                    # model's noise floor (it can't even predict the
-                                    # reward SIGN). ×100 lifts it to ~0.03/step so both
-                                    # the dynamics reward head and SAC get real signal.
   reward_every_n_waypoints: 3
   hole_penalty: 5.0
   episode_length: 2000
