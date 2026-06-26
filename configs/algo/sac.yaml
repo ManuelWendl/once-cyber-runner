@@ -1,10 +1,10 @@
 name: sac
-n_envs: 1024
+n_envs: 512
 learning_rate: 3e-4
 buffer_size: 1_000_000
 batch_size: 256
 tau: 0.005
-gamma: 0.99
+gamma: 0.995
 learning_starts: 10_000
 gradient_steps: 1    # UTD ratio: SAC gradient updates per collected transition
                      # (multiplied by n_envs internally in train.py)
