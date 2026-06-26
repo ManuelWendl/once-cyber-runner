@@ -196,6 +196,7 @@ def main(cfg: DictConfig):
             gradient_steps=cfg.algo.get("gradient_steps", 1) * cfg.algo.n_envs,
             ent_coef=cfg.algo.ent_coef,
             target_entropy=cfg.algo.get("target_entropy", "auto"),
+            policy_kwargs=dict(net_arch=list(cfg.algo.get("net_arch", [256, 256]))),
         )
     elif algo == "mbpo":
         from mbpo import MBPOTrainer

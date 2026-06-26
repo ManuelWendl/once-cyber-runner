@@ -1,5 +1,6 @@
 name: sac
-n_envs: 32
+n_envs: 64
+net_arch: [256, 256, 256]   # MLP hidden sizes, shared by actor and critics
 learning_rate: 3e-4
 buffer_size: 1_000_000
 batch_size: 256
