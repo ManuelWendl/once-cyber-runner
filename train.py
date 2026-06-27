@@ -202,6 +202,10 @@ def main(cfg: DictConfig):
             ent_coef=cfg.algo.ent_coef,
             target_entropy=cfg.algo.get("target_entropy", "auto"),
             seed=cfg.seed,
+            policy_kwargs=dict(net_arch=dict(
+                pi=list(cfg.algo.get("pi_arch", [256, 256])),
+                qf=list(cfg.algo.get("qf_arch", [512, 512, 512])),
+            )),
         )
     elif algo == "mbpo":
         from mbpo import MBPOTrainer
