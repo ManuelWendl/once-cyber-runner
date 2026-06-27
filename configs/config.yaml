@@ -17,7 +17,7 @@ env:
   obs_n_stack: 5                    # stack the last N (observation, action) frames so a
                                     # feed-forward policy can infer velocity (1 = no stacking)
   episode_length: 2000
-  randomize_init_pos: false
+  randomize_init_pos: true
   layout: hard
   # Prior (recovery / stabilization) branch — see CyberRunnerEnv.prior_mode.
   prior_mode: false
