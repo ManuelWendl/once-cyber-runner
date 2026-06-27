@@ -1,15 +1,15 @@
 name: sac
 n_envs: 32
 pi_arch: [256, 256]        # actor MLP hidden sizes
-qf_arch: [512, 512, 512]   # critic (twin Q) MLP hidden sizes
+qf_arch: [256, 256]   # critic (twin Q) MLP hidden sizes
 learning_rate: 3e-4
 buffer_size: 1_000_000
 batch_size: 256
 tau: 0.005
-gamma: 0.99
+gamma: 0.999
 learning_starts: 10_000
 gradient_steps: 2    # UTD ratio: SAC gradient updates per collected transition
                      # (multiplied by n_envs internally in train.py)
 ent_coef: auto
-target_entropy: auto   # "auto" = -dim(A). A float (e.g. 0.0) keeps the policy more
+target_entropy: 0   # "auto" = -dim(A). A float (e.g. 0.0) keeps the policy more
                        # stochastic; SB3 passes this straight to SAC.
