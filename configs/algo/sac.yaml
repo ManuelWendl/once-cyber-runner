@@ -11,5 +11,5 @@ learning_starts: 10_000
 gradient_steps: 2    # UTD ratio: SAC gradient updates per collected transition
                      # (multiplied by n_envs internally in train.py)
 ent_coef: auto
-target_entropy: 0   # "auto" = -dim(A). A float (e.g. 0.0) keeps the policy more
+target_entropy: auto   # "auto" = -dim(A). A float (e.g. 0.0) keeps the policy more
                        # stochastic; SB3 passes this straight to SAC.
