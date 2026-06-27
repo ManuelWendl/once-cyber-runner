@@ -33,11 +33,14 @@ wandb:
   log_interval: 10_000  # timesteps between wandb log calls (same cadence for PPO and SAC)
 
 hydra:
+  # Write all run output (working dir, saved artifacts, submitit logs) under
+  # $SCRATCH on the cluster — home/project quota is small. Falls back to the
+  # repo dir locally where $SCRATCH is unset.
   run:
-    dir: .
+    dir: ${oc.env:SCRATCH,.}/cyberrunner_runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
   sweep:
     # Multirun / SLURM: each job gets its own subdir so per-run artifacts
     # (model .zip, vecnormalize.pkl, env_cfg.json) don't collide.
-    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: ${oc.env:SCRATCH,.}/cyberrunner_runs/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
     subdir: ${hydra.job.num}
   output_subdir: null

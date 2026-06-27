@@ -161,11 +161,16 @@ def main(cfg: DictConfig):
     wb_cfg = cfg.get("wandb", {})
     run = None
     if wb_cfg.get("enabled", False):
+        # Keep the wandb cache off the small cluster home/project quota: write
+        # under $WANDB_DIR if set, else $SCRATCH, else the current dir.
+        wandb_dir = os.environ.get("WANDB_DIR") or os.environ.get("SCRATCH") or "."
+        os.makedirs(wandb_dir, exist_ok=True)
         run = wandb.init(
             project=wb_cfg.get("project", "cyberrunner"),
             name=wb_cfg.get("name", None) or None,
             tags=list(wb_cfg.get("tags", [])),
             config=OmegaConf.to_container(cfg, resolve=True),
+            dir=wandb_dir,
         )
 
     env = VecNormalize(
@@ -202,10 +207,6 @@ def main(cfg: DictConfig):
             ent_coef=cfg.algo.ent_coef,
             target_entropy=cfg.algo.get("target_entropy", "auto"),
             seed=cfg.seed,
-            policy_kwargs=dict(net_arch=dict(
-                pi=list(cfg.algo.get("pi_arch", [256, 256])),
-                qf=list(cfg.algo.get("qf_arch", [512, 512, 512])),
-            )),
         )
     elif algo == "mbpo":
         from mbpo import MBPOTrainer

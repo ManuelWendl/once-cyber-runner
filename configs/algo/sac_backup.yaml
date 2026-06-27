@@ -1,7 +1,5 @@
 name: sac
 n_envs: 64
-pi_arch: [256, 256]        # actor MLP hidden sizes
-qf_arch: [512, 512, 512]   # critic (twin Q) MLP hidden sizes
 learning_rate: 3e-4
 buffer_size: 1_000_000
 batch_size: 256
