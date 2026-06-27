@@ -25,6 +25,7 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.logger import configure as configure_logger
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
+from stable_baselines3.common.utils import set_random_seed
 from omegaconf import DictConfig
 
 
@@ -196,10 +197,16 @@ class EnsembleDynamics(nn.Module):
 
 class MBPOTrainer:
 
-    def __init__(self, env, cfg: DictConfig, device: str = "cpu") -> None:
+    def __init__(self, env, cfg: DictConfig, device: str = "cpu", seed: int = 0) -> None:
         self.env = env
         self.device = device
+        self.seed = int(seed)
         ac = cfg.algo
+
+        # Seed all RNGs (Python, NumPy, Torch) and the env's action sampler so
+        # the warmup random exploration and model rollouts are reproducible.
+        set_random_seed(self.seed)
+        self.env.action_space.seed(self.seed)
 
         obs_dim = int(np.prod(env.observation_space.shape))
         act_dim = int(np.prod(env.action_space.shape))
@@ -253,6 +260,7 @@ class MBPOTrainer:
             learning_starts=0,
             ent_coef=ac.ent_coef,
             target_entropy=ac.get("target_entropy", "auto"),
+            seed=self.seed,
         )
         # Swap SAC's plain replay buffer for one that mixes in real data at
         # sample time according to real_ratio.

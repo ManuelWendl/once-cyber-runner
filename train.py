@@ -9,6 +9,7 @@ from omegaconf import DictConfig, OmegaConf
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from envs.cyberrunner import CyberRunnerEnv
@@ -154,6 +155,9 @@ def eval_and_log_video(
 
 @hydra.main(config_path="configs", config_name="config", version_base=None)
 def main(cfg: DictConfig):
+    # Seed all RNGs (Python, NumPy, Torch) for reproducibility.
+    set_random_seed(cfg.seed)
+
     wb_cfg = cfg.get("wandb", {})
     run = None
     if wb_cfg.get("enabled", False):
@@ -165,7 +169,7 @@ def main(cfg: DictConfig):
         )
 
     env = VecNormalize(
-        make_vec_env(make_env(cfg), n_envs=cfg.algo.n_envs),
+        make_vec_env(make_env(cfg), n_envs=cfg.algo.n_envs, seed=cfg.seed),
         norm_obs=True,
         norm_reward=not cfg.env.get("prior_mode", False),
         gamma=cfg.algo.gamma,
@@ -183,6 +187,7 @@ def main(cfg: DictConfig):
             gae_lambda=cfg.algo.gae_lambda,
             clip_range=cfg.algo.clip_range,
             ent_coef=cfg.algo.ent_coef,
+            seed=cfg.seed,
         )
     elif algo == "sac":
         model = SAC(
@@ -196,10 +201,11 @@ def main(cfg: DictConfig):
             gradient_steps=cfg.algo.get("gradient_steps", 1) * cfg.algo.n_envs,
             ent_coef=cfg.algo.ent_coef,
             target_entropy=cfg.algo.get("target_entropy", "auto"),
+            seed=cfg.seed,
         )
     elif algo == "mbpo":
         from mbpo import MBPOTrainer
-        trainer = MBPOTrainer(env, cfg, device=cfg.device)
+        trainer = MBPOTrainer(env, cfg, device=cfg.device, seed=cfg.seed)
         trainer.learn(cfg.total_timesteps, wandb_run=run)
         trainer.save("mbpo_cyberrunner")
         env.save("mbpo_cyberrunner_vecnormalize.pkl")

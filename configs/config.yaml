@@ -6,6 +6,8 @@ defaults:
 
 total_timesteps: 1_000_000
 device: cuda
+seed: 0   # global RNG seed (env, SB3 policy/sampling, world model). Vary per run
+          # for sweeps: python train.py -m +experiment=... seed=0,1,2
 
 env:
   reward_every_n_waypoints: 3
