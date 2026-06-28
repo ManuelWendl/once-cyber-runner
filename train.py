@@ -162,7 +162,12 @@ def eval_and_log_video(
     # wandb.Video expects (T, C, H, W)
     frames = np.stack(all_frames).transpose(0, 3, 1, 2)
     if run is not None:
-        run.log({"eval/video": wandb.Video(frames, fps=fps, format="mp4")})
+        try:
+            run.log({"eval/video": wandb.Video(frames, fps=fps, format="mp4")})
+        except Exception as e:
+            # e.g. moviepy/ffmpeg missing — log the eval but don't crash the run.
+            print(f"[eval] video logging failed ({e}); skipping. "
+                  "Install with: pip install 'wandb[media]'")
 
 
 @hydra.main(config_path="configs", config_name="config", version_base=None)

@@ -5,4 +5,4 @@ numpy
 Pillow
 hydra-core>=1.3,<1.4
 hydra-submitit-launcher==1.2.0
-wandb
+wandb[media]   # [media] pulls moviepy/imageio-ffmpeg, needed for wandb.Video
