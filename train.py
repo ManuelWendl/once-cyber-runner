@@ -86,7 +86,14 @@ def eval_and_log_video(
     fps: int = 20,
     predict_fn=None,
     vec_env=None,
+    log_step: int = None,
 ) -> None:
+    # Align the eval logs with the training timeline. WandbCallback logs with an
+    # explicit step=num_timesteps, which keeps wandb's internal auto-step at ~0;
+    # logging the eval without a step would park it at step 0 ("no matching
+    # media" in the video panel). Pin it to the final timestep instead.
+    if log_step is None:
+        log_step = getattr(model, "num_timesteps", None) or None
     own_env = vec_env is None
     if own_env:
         with open(env_cfg_path) as f:
@@ -151,7 +158,7 @@ def eval_and_log_video(
         eval_env.training = prev_training
 
     if run is not None:
-        run.log({"eval/total_reward": total_reward, "eval/ep_length": step})
+        run.log({"eval/total_reward": total_reward, "eval/ep_length": step}, step=log_step)
 
     # Skip the video (don't crash) if rendering produced no frames — e.g. a
     # headless node without a usable GL backend (set MUJOCO_GL=egl or osmesa).
@@ -163,7 +170,7 @@ def eval_and_log_video(
     frames = np.stack(all_frames).transpose(0, 3, 1, 2)
     if run is not None:
         try:
-            run.log({"eval/video": wandb.Video(frames, fps=fps, format="mp4")})
+            run.log({"eval/video": wandb.Video(frames, fps=fps, format="mp4")}, step=log_step)
         except Exception as e:
             # e.g. moviepy/ffmpeg missing — log the eval but don't crash the run.
             print(f"[eval] video logging failed ({e}); skipping. "
@@ -243,6 +250,7 @@ def main(cfg: DictConfig):
             eval_and_log_video(
                 run, trainer.sac, vec_env=trainer.env,
                 predict_fn=trainer.shielded_predict,
+                log_step=cfg.total_timesteps,
             )
             run.finish()
         return
