@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+
+# Headless offscreen rendering for the eval video on cluster nodes (no display).
+# Must be set before mujoco is imported (via envs.cyberrunner below).
+os.environ.setdefault("MUJOCO_GL", "egl")
+
 import numpy as np
 import hydra
 import wandb
@@ -148,9 +153,16 @@ def eval_and_log_video(
     if run is not None:
         run.log({"eval/total_reward": total_reward, "eval/ep_length": step})
 
+    # Skip the video (don't crash) if rendering produced no frames — e.g. a
+    # headless node without a usable GL backend (set MUJOCO_GL=egl or osmesa).
+    if not all_frames:
+        print("[eval] no frames captured — skipping video (headless GL unavailable)")
+        return
+
     # wandb.Video expects (T, C, H, W)
     frames = np.stack(all_frames).transpose(0, 3, 1, 2)
-    run.log({"eval/video": wandb.Video(frames, fps=fps, format="mp4")})
+    if run is not None:
+        run.log({"eval/video": wandb.Video(frames, fps=fps, format="mp4")})
 
 
 @hydra.main(config_path="configs", config_name="config", version_base=None)
