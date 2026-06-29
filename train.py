@@ -72,25 +72,10 @@ def make_env(cfg):
 
 def save_artifact(run: wandb.Run, artifact_name: str, file_paths: list[str]) -> None:
     artifact = wandb.Artifact(name=artifact_name, type="model")
-    added = []
     for path in file_paths:
         if os.path.exists(path):
             artifact.add_file(path)
-            added.append(path)
-    if not added:
-        print(f"[artifact] WARNING: none of {file_paths} exist — nothing uploaded for {artifact_name}")
-        return
-    logged = run.log_artifact(artifact)
-    # Block until the upload is actually committed server-side. Without this,
-    # log_artifact only queues the upload and run.finish() flushes it with a
-    # timeout — on slow cluster egress the big model blob can be dropped, so the
-    # run shows "finished" but has no model artifact to download later.
-    try:
-        logged.wait()
-        print(f"[artifact] uploaded {artifact_name} ({len(added)} files): {added}")
-    except Exception as e:
-        print(f"[artifact] WARNING: artifact upload did not confirm ({e}). "
-              "Model is still saved on disk in the run working dir.")
+    run.log_artifact(artifact)
 
 
 def eval_and_log_video(
