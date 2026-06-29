@@ -38,7 +38,7 @@ max_rollout_length: 1
 rollout_schedule_steps: 200_000  # steps over which length grows min→max
 
 # ── Exploration ───────────────────────────────────────────────────────────────
-optimism: 0.1                  # rollout reward += optimism * ‖σ‖₂ (model prediction
+optimism: 0.0                  # rollout reward += optimism * ‖σ‖₂ (model prediction
                                # uncertainty). Optimism in the face of uncertainty;
                                # 0.0 disables. Tune against train/model_unc (the mean
                                # ‖σ‖₂) so the bonus is a sensible fraction of the reward.
