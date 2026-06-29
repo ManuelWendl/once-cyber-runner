@@ -101,13 +101,46 @@ class EnsembleLinear(nn.Module):
         return x @ self.W + self.b
 
 
+class SamplingType:
+    """Rollout sampling scheme for the probabilistic ensemble — the PyTorch
+    counterpart of the reference ``SamplingType`` (``mean`` / ``TS1`` / ``TSInf``
+    / ``DS``):
+
+    - ``mean``  : average the ensemble means, sample only aleatoric noise.
+    - ``TS1``   : trajectory sampling 1 — pick ONE ensemble member at random for
+                  the whole batch on every call (the reference default).
+    - ``TSInf`` : trajectory sampling ∞ — keep a fixed ensemble member for the
+                  duration of a rollout; the index is set once per rollout via
+                  ``EnsembleDynamics.set_sampling_idx``.
+    - ``DS``    : distribution sampling — moment-match the ensemble into one
+                  Gaussian (aleatoric + epistemic variance) and sample from it.
+    """
+
+    NAMES = ("mean", "TS1", "TSInf", "DS")
+
+    def __init__(self, name: str = "TS1") -> None:
+        self.set(name)
+
+    def set(self, name: str) -> None:
+        assert name in self.NAMES, f"sampling type must be one of {self.NAMES}"
+        self.name = name
+
+
 class EnsembleDynamics(nn.Module):
     """
-    Probabilistic ensemble.
+    Probabilistic ensemble — PyTorch port of the reference Bayesian dynamics
+    model's default ``ProbabilisticEnsembleModel`` path.
 
-    Predicts (delta_obs, reward) jointly as a Gaussian.
-    Operates in the same observation/reward space as the data it's trained on
-    (i.e. the normalized space when VecNormalize is in use).
+    Predicts ONLY ``delta_obs`` as a Gaussian (reward is supplied separately by
+    an analytic reward function, mirroring the reference's external
+    ``RewardModel``). The variance head outputs a standard deviation
+    soft-clamped to ``[sig_min, sig_max]`` (reference parameterization) rather
+    than the learnable-logvar-bounds scheme. A held-out per-dimension
+    calibration multiplier (``calib_alpha``) recalibrates the predictive std at
+    sampling time, replacing elite selection.
+
+    Operates in the same observation space as the data it's trained on (the
+    normalized space when VecNormalize is in use).
     """
 
     def __init__(
@@ -116,79 +149,187 @@ class EnsembleDynamics(nn.Module):
         act_dim: int,
         hidden: tuple[int, ...],
         ensemble_size: int,
-        num_elites: int,
+        sig_min: float = 1e-3,
+        sig_max: float = 1e3,
+        sampling_type: str = "TS1",
     ) -> None:
         super().__init__()
         self.obs_dim = obs_dim
         self.ensemble_size = ensemble_size
-        self.num_elites = num_elites
-        self.elite_idxs: list[int] = list(range(num_elites))
+        self.sig_min = float(sig_min)
+        self.sig_max = float(sig_max)
+        self.sampling = SamplingType(sampling_type)
+        # TS-∞ ensemble index, set once per rollout (ignored by the other modes).
+        self.sampling_idx = 0
 
-        out_dim = (obs_dim + 1) * 2   # mean + logvar for [delta_obs, reward]
+        out_dim = obs_dim * 2   # mean + std for delta_obs (reward is analytic)
         dims = [obs_dim + act_dim] + list(hidden) + [out_dim]
         self.net = nn.ModuleList([
             EnsembleLinear(ensemble_size, dims[i], dims[i + 1])
             for i in range(len(dims) - 1)
         ])
-        # Learnable log_var bounds (prevents variance explosion / collapse)
-        self.max_logvar = nn.Parameter(0.5 * torch.ones(obs_dim + 1))
-        self.min_logvar = nn.Parameter(-10.0 * torch.ones(obs_dim + 1))
+        # Per-dimension calibration multiplier applied to the predicted std at
+        # prediction time (opax-style recalibration; 1.0 until calibrated).
+        self.register_buffer("calib_alpha", torch.ones(obs_dim))
+
+    def set_sampling_type(self, name: str) -> None:
+        self.sampling.set(name)
+
+    def set_sampling_idx(self, idx: int) -> None:
+        self.sampling_idx = int(idx) % self.ensemble_size
 
     def _forward(self, obs: torch.Tensor, act: torch.Tensor):
-        """obs/act: (B, d) → mean, logvar each (E, B, obs_dim+1)."""
+        """obs/act: (B, d) → mean, std each (E, B, obs_dim).
+
+        The std head is soft-clamped to ``[sig_min, sig_max]`` (reference's
+        sig_min/sig_max aleatoric-std bounds)."""
         x = torch.cat([obs, act], -1).unsqueeze(0).expand(self.ensemble_size, -1, -1)
         for layer in self.net[:-1]:
             x = F.silu(layer(x))
         x = self.net[-1](x)
-        mean, logvar = x.chunk(2, -1)
-        logvar = self.max_logvar - F.softplus(self.max_logvar - logvar)
-        logvar = self.min_logvar + F.softplus(logvar - self.min_logvar)
-        return mean, logvar
+        mean, raw_std = x.chunk(2, -1)
+        std = F.softplus(raw_std) + self.sig_min
+        std = std.clamp(self.sig_min, self.sig_max)
+        return mean, std
 
     def nll_loss(self, obs: torch.Tensor, act: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Gaussian NLL summed over output dims, averaged over batch and ensemble."""
-        mean, logvar = self._forward(obs, act)
+        """Gaussian NLL (std parameterization) summed over output dims, averaged
+        over batch and ensemble. Matches the reference ``gaussian_log_likelihood``
+        (constant term dropped)."""
+        mean, std = self._forward(obs, act)
         tgt = target.unsqueeze(0).expand_as(mean)
-        nll = (logvar + (mean - tgt).pow(2) * torch.exp(-logvar)).sum(-1).mean()
-        # Keep log_var bounds tight
-        reg = 1e-2 * (self.max_logvar.sum() - self.min_logvar.sum())
-        return nll + reg
+        nll = (torch.log(std) + 0.5 * ((tgt - mean) / std).pow(2)).sum(-1).mean()
+        return nll
 
     @torch.no_grad()
-    def sample(self, obs: np.ndarray, act: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def sample(self, obs: np.ndarray, act: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
-        One-step prediction for a batch.
-        Randomly assigns each sample to one elite model (MBPO-style).
-        Returns: next_obs (B, obs_dim), reward (B,), uncertainty (B,)
-            uncertainty = ‖σ‖₂, the L2 norm (over the obs+reward output dims) of
-            the predicted standard deviation of the sampled elite — used as an
-            optimism / exploration bonus on the rollout reward.
+        One-step prediction for a batch using the configured ``SamplingType``.
+
+        Returns: next_obs (B, obs_dim), uncertainty (B,)
+            uncertainty = ‖σ_tot‖₂ — the L2 norm of the DS total predictive std
+            combining ALEATORIC (mean of per-member variances) and EPISTEMIC
+            (variance of per-member means) uncertainty — used as the optimism /
+            exploration bonus on the analytic rollout reward.
         """
         dev = next(self.parameters()).device
         obs_t = torch.from_numpy(obs).float().to(dev)
         act_t = torch.from_numpy(act).float().to(dev)
-        mean, logvar = self._forward(obs_t, act_t)   # (E, B, D)
-        std = (0.5 * logvar).exp()
+        mean, std = self._forward(obs_t, act_t)    # (E, B, D)
+        std = std * self.calib_alpha               # recalibrated aleatoric std
+        E = mean.shape[0]
 
-        B = obs.shape[0]
-        e_idx = torch.from_numpy(np.random.choice(self.elite_idxs, B)).long()
-        b_idx = torch.arange(B, device=dev)
-        m = mean[e_idx, b_idx]    # (B, obs_dim+1)
-        s = std[e_idx, b_idx]
-        out = m + s * torch.randn_like(m)
+        # DS moments (used for the optimism bonus regardless of sampling mode).
+        al_var = std.pow(2).mean(0)                # (B, D) aleatoric
+        ep_var = mean.var(0)                       # (B, D) epistemic
+        tot_std = (al_var + ep_var).sqrt()         # (B, D)
+        unc = tot_std.norm(dim=1)                  # (B,) ‖σ_tot‖₂
 
-        delta = out[:, :-1].cpu().numpy()
-        rew   = out[:, -1].cpu().numpy()
-        unc   = s.norm(dim=1).cpu().numpy()   # ‖σ‖₂ over output dims, (B,)
-        return obs + delta, rew, unc
+        name = self.sampling.name
+        if name == "mean":
+            m = mean.mean(0)
+            out = m + al_var.sqrt() * torch.randn_like(m)
+        elif name == "TS1":
+            idx = int(torch.randint(0, E, (1,)).item())
+            out = mean[idx] + std[idx] * torch.randn_like(mean[idx])
+        elif name == "TSInf":
+            idx = int(self.sampling_idx) % E
+            out = mean[idx] + std[idx] * torch.randn_like(mean[idx])
+        elif name == "DS":
+            out = mean.mean(0) + tot_std * torch.randn_like(tot_std)
+        else:
+            raise ValueError(f"unknown sampling type {name!r}")
+
+        delta = out.cpu().numpy()
+        return obs + delta, unc.cpu().numpy()
 
     @torch.no_grad()
-    def update_elites(self, obs: torch.Tensor, act: torch.Tensor, target: torch.Tensor) -> None:
-        """Rank ensemble members by validation NLL; keep the best num_elites."""
-        mean, logvar = self._forward(obs, act)
+    def update_calibration(self, obs: torch.Tensor, act: torch.Tensor, target: torch.Tensor) -> float:
+        """Recalibrate the predictive std on a held-out batch (PyTorch
+        equivalent of the reference ``calculate_calibration_alpha``).
+
+        Sets a per-dimension multiplier ``alpha`` so that the recalibrated
+        Gaussian has unit-variance standardized residuals — alpha[d]² = E[((y−μ)/σ)²].
+        Returns a scalar calibration-error proxy: |E[z²/alpha²] − 1|."""
+        mean, std = self._forward(obs, act)
         tgt = target.unsqueeze(0).expand_as(mean)
-        per_model = (logvar + (mean - tgt).pow(2) * torch.exp(-logvar)).mean([1, 2])
-        self.elite_idxs = torch.argsort(per_model)[:self.num_elites].tolist()
+        z2 = ((tgt - mean) / std).pow(2)           # (E, B, D)
+        alpha = z2.mean(dim=(0, 1)).clamp_min(1e-8).sqrt()   # (D,)
+        self.calib_alpha = alpha
+        scaled = z2 / alpha.pow(2)
+        return float((scaled.mean() - 1.0).abs())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analytic reward model (closed-form, replaces a learned reward head)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AnalyticCyberRunnerReward:
+    """Closed-form maze reward — the PyTorch-side analogue of the reference's
+    separate ``RewardModel``, here an exact analytic function rather than a
+    learned net.
+
+    It mirrors ``CyberRunnerEnv._compute_reward`` (main task): dense signed
+    path-progress shaping + goal bonus + hole penalty. The dynamics model and
+    rollouts live in VecNormalize's NORMALIZED observation space, so the reward
+    first un-normalizes obs to recover raw board ball positions (dims [2:4]),
+    then evaluates the same progress/goal/hole terms the env uses, returning the
+    same RAW reward the env stores (norm_reward is disabled for MBPO).
+    """
+
+    def __init__(self, vecnorm, raw_env) -> None:
+        from envs.cyberrunner import (
+            compute_path_progress, GOAL_BONUS, GOAL_THRESHOLD, HOLE_RADIUS,
+        )
+        if getattr(raw_env, "prior_mode", False):
+            raise NotImplementedError(
+                "AnalyticCyberRunnerReward only implements the main-task reward; "
+                "prior_mode (recovery) reward depends on ball velocity not present "
+                "in a single observation."
+            )
+        self._vecnorm = vecnorm
+        self._progress = compute_path_progress
+        self._GOAL_BONUS = float(GOAL_BONUS)
+        self._GOAL_THRESHOLD = float(GOAL_THRESHOLD)
+        self._HOLE_RADIUS = float(HOLE_RADIUS)
+        self.waypoints = raw_env.waypoints
+        self.seg_lengths = raw_env.seg_lengths
+        self.cum_distances = raw_env.cum_distances
+        self.walls_h = raw_env.walls_h
+        self.walls_v = raw_env.walls_v
+        self.holes = raw_env.holes
+        self.goal_pos = raw_env.goal_pos
+        self.scale = float(raw_env.dense_main_progress_scale)
+        self.hole_penalty = float(raw_env.hole_penalty)
+
+    def _ball_pos(self, obs_norm: np.ndarray) -> np.ndarray:
+        """Un-normalize a batch of normalized obs and return raw ball xy (B, 2)."""
+        raw = self._vecnorm.unnormalize_obs(np.asarray(obs_norm, dtype=np.float32))
+        return np.asarray(raw)[:, 2:4]
+
+    def _progress_of(self, ball: np.ndarray) -> float:
+        p, _, _, _ = self._progress(
+            ball, self.waypoints, self.seg_lengths, self.cum_distances,
+            self.walls_h, self.walls_v, self.holes,
+        )
+        return float(p)
+
+    def reward(self, obs: np.ndarray, action: np.ndarray, next_obs: np.ndarray) -> np.ndarray:
+        """Vectorized over the batch; returns raw reward (B,)."""
+        ball_prev = self._ball_pos(obs)
+        ball_next = self._ball_pos(next_obs)
+        n = ball_next.shape[0]
+        out = np.zeros(n, dtype=np.float32)
+        for i in range(n):
+            pp = self._progress_of(ball_prev[i])
+            pn = self._progress_of(ball_next[i])
+            dense = (pn - pp) * self.scale if (pn >= 0 and pp >= 0) else 0.0
+            goal = self._GOAL_BONUS if np.linalg.norm(ball_next[i] - self.goal_pos) < self._GOAL_THRESHOLD else 0.0
+            hole = -self.hole_penalty if np.any(
+                np.linalg.norm(self.holes - ball_next[i], axis=1) < self._HOLE_RADIUS
+            ) else 0.0
+            out[i] = dense + goal + hole
+        return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,8 +357,17 @@ class MBPOTrainer:
             act_dim=act_dim,
             hidden=tuple(ac.hidden_sizes),
             ensemble_size=ac.ensemble_size,
-            num_elites=ac.num_elites,
+            sig_min=float(ac.get("sig_min", 1e-3)),
+            sig_max=float(ac.get("sig_max", 1e3)),
+            sampling_type=ac.get("sampling_type", "TS1"),
         ).to(device)
+
+        # Analytic reward function — the closed-form maze reward, replacing the
+        # old joint reward head (mirrors the reference's separate RewardModel).
+        # Pull the raw CyberRunnerEnv out from under the VecNormalize wrapper so
+        # we can read its path/hole geometry; un-normalization uses the wrapper.
+        raw_env = env.venv.envs[0].unwrapped
+        self.reward_model = AnalyticCyberRunnerReward(env, raw_env)
 
         self.model_opt = Adam(
             self.dynamics.parameters(),
@@ -248,6 +398,7 @@ class MBPOTrainer:
         # ‖σ‖₂ for tuning the coefficient against the reward scale.
         self.optimism = float(ac.get("optimism", 0.0))
         self._unc_mean = float("nan")
+        self._calib_err = float("nan")
 
         # SAC operates on synthetic rollouts stored in its replay buffer
         self.sac = SAC(
@@ -308,17 +459,18 @@ class MBPOTrainer:
         train_losses = []
         for _ in range(ac.model_train_epochs):
             b = self.real_buffer.sample(min(ac.model_batch_size, self.real_buffer.size()))
-            tgt = torch.cat([b.next_observations - b.observations, b.rewards], -1)
+            # Target is delta_obs only — reward is supplied analytically.
+            tgt = b.next_observations - b.observations
             loss = self.dynamics.nll_loss(b.observations, b.actions, tgt)
             self.model_opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.dynamics.parameters(), 1.0)
             self.model_opt.step()
             train_losses.append(loss.item())
-        # Select elites on a held-out validation batch
+        # Recalibrate predictive std on a held-out validation batch.
         b = self.real_buffer.sample(min(2048, self.real_buffer.size()))
-        tgt = torch.cat([b.next_observations - b.observations, b.rewards], -1)
-        self.dynamics.update_elites(b.observations, b.actions, tgt)
+        tgt = b.next_observations - b.observations
+        self._calib_err = self.dynamics.update_calibration(b.observations, b.actions, tgt)
         with torch.no_grad():
             val_loss = self.dynamics.nll_loss(b.observations, b.actions, tgt).item()
         self.dynamics.eval()
@@ -337,10 +489,16 @@ class MBPOTrainer:
         b = self.real_buffer.sample(ac.rollout_batch_size)
         obs = b.observations.cpu().numpy()   # already in normalized obs space
 
+        # TS-∞: fix one ensemble member for the whole rollout (no-op for the
+        # other sampling modes).
+        self.dynamics.set_sampling_idx(int(np.random.randint(self.dynamics.ensemble_size)))
+
         all_obs, all_nobs, all_act, all_rew = [], [], [], []
         for _ in range(length):
             act, _ = self.sac.predict(obs, deterministic=False)
-            nobs, rew, unc = self.dynamics.sample(obs, act)
+            nobs, unc = self.dynamics.sample(obs, act)
+            # Reward from the analytic model (raw scale), not the dynamics net.
+            rew = self.reward_model.reward(obs, act, nobs)
             rew = rew + self.optimism * unc   # optimism / UCB exploration bonus
             self._unc_mean = float(unc.mean())
             nobs = np.clip(nobs, -10.0, 10.0)
@@ -531,23 +689,10 @@ class MBPOTrainer:
                     rrew = float(self.real_buffer.rewards[:rn].mean())
                     log["train/real_rew_mean"] = rrew
                     parts.append(f"real_rew={rrew:.4f}")
-                # ── isolate model reward bias from off-distribution drift ──
-                # Predict reward on a REAL (obs, act) batch — the model's own
-                # training distribution — and compare to the true stored reward.
-                # pred ≪ true  → model under-prediction bias (heteroscedastic NLL
-                #                on a right-skewed reward). On-distribution problem.
-                # pred ≈ true  → the negative rollout reward is off-distribution /
-                #                policy drift, not a model fitting bug.
-                if self.real_buffer.size() >= self._ac.batch_size:
-                    with torch.no_grad():
-                        rb = self.real_buffer.sample(512)
-                        mean, _ = self.dynamics._forward(rb.observations, rb.actions)
-                        pred_rew = float(mean[:, :, -1].mean())   # mean over ensemble & batch
-                        true_rew = float(rb.rewards.mean())
-                    log["model/pred_rew_on_real"] = pred_rew
-                    log["model/true_rew_on_real"] = true_rew
-                    log["model/rew_bias"] = pred_rew - true_rew
-                    parts.append(f"pred_on_real={pred_rew:.4f}(true={true_rew:.4f})")
+                # Calibration error of the recalibrated predictive std (|E[z²/α²]−1|).
+                if not np.isnan(self._calib_err):
+                    log["model/calib_err"] = self._calib_err
+                    parts.append(f"calib_err={self._calib_err:.3f}")
                 parts.append(f"real={self.real_buffer.size()}")
                 parts.append(f"model={self.sac.replay_buffer.size()}")
                 parts.append(f"rollout_len={self._rollout_length(step)}")

@@ -16,7 +16,7 @@ target_entropy: auto   # "auto" = -dim(A) = -2. That default over-concentrates t
 
 # ── World model ───────────────────────────────────────────────────────────────
 ensemble_size: 5
-num_elites: 3
+num_elites: 3                  # (unused) elites replaced by std calibration
 hidden_sizes: [512, 512, 512]
 model_lr: 3e-4
 model_weight_decay: 0
@@ -24,6 +24,9 @@ model_train_freq: 50          # retrain world model every N env steps
 rollout_freq: 250              # regenerate synthetic rollouts every N env steps
 model_train_epochs: 50
 model_batch_size: 512
+sig_min: 1e-3                  # min aleatoric std (reference sig_min clamp)
+sig_max: 1e3                   # max aleatoric std (reference sig_max clamp)
+sampling_type: TS1             # rollout sampling: mean | TS1 | TSInf | DS
 
 # ── Buffers ───────────────────────────────────────────────────────────────────
 real_buffer_size: 1_000_000
