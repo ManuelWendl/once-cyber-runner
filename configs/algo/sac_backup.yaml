@@ -1,0 +1,10 @@
+name: sac
+n_envs: 64
+learning_rate: 3e-4
+buffer_size: 1_000_000
+batch_size: 256
+tau: 0.005
+gamma: 0.99         # 0.99 stable for SAC critic; 1.0 breaks Bellman contraction
+learning_starts: 10_000
+gradient_steps: 1    # UTD per env step (multiplied by n_envs internally)
+ent_coef: auto

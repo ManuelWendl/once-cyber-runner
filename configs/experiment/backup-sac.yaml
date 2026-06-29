@@ -1,0 +1,21 @@
+# @package _global_
+# Prior (recovery) policy: binary recovery reward within a short episode.
+# Reward = 1 if ball reaches recovery state (slow, hole-safe), 0 otherwise.
+# gamma=0.99 (SAC) so Q(s,a) tracks discounted recovery probability.
+# Run: python train.py +experiment=backup-sac
+
+defaults:
+  - override /algo: sac_backup
+
+total_timesteps: 1_000_000
+
+env:
+  episode_length: 100
+  randomize_init_pos: true
+  prior_mode: true
+  recovery_speed_threshold: 0.01
+  recovery_hole_margin_factor: 1.5
+  prior_init_max_speed: 0.4
+  # unused in prior_mode but required by schema:
+  reward_every_n_waypoints: 3
+  hole_penalty: 5.0

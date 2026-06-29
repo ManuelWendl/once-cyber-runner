@@ -1,0 +1,13 @@
+# @package _global_
+# SAC baseline — stable off-policy learning, auto-tuned entropy
+# Run: python train.py +experiment=solve-maze-sac
+
+defaults:
+  - override /algo: sac
+
+total_timesteps: 2_000_000
+
+env:
+  reward_every_n_waypoints: 3
+  hole_penalty: 5.0
+  episode_length: 2000

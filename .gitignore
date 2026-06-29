@@ -6,6 +6,8 @@ logs/
 models/
 out/
 *.db
+gifs/
+artifacts/
 
 # Generated docs / scratch reports
 docs/dense_prior_explained.tex

@@ -1,5 +1,4 @@
 import tempfile
-import time
 from typing import Any
 
 import gymnasium as gym
@@ -54,67 +53,6 @@ JOINT_ANGLE_NOISE = 0.25 * np.pi / 180  # 0.25 degrees
 PROGRESS_SCALE = 1.0
 GOAL_BONUS = 10.0
 GOAL_THRESHOLD = 0.004  # 4mm
-CHECKPOINT_REWARD = 1.0  # paid per reward-waypoint crossed under modulo-N sparsification
-
-# Prior versions.  Keep the legacy prior as the default so old experiments are
-# reproducible; checkpoint_recovery is the new real-transferable stabilizer;
-# dense is the dense Wed-style reward (touching_wall + safe_margin +
-# speed penalty + per-step hold + saturate) with success criterion that does
-# NOT gate on hole margin (stable near a hole is acceptable).
-PRIOR_VERSION_LEGACY = "legacy"
-PRIOR_VERSION_CHECKPOINT_RECOVERY = "checkpoint_recovery"
-PRIOR_VERSION_DENSE = "dense"
-PRIOR_VERSIONS = (
-    PRIOR_VERSION_LEGACY,
-    PRIOR_VERSION_CHECKPOINT_RECOVERY,
-    PRIOR_VERSION_DENSE,
-)
-LEGACY_PRIOR_OBS_DIM = 13
-CHECKPOINT_RECOVERY_OBS_DIM = 12
-# dense states (8): [α, β, ball_x, ball_y, vec_to_closest_path(2),
-#                    vec_to_next_waypoint_toward_target(2)]
-# Plus 3-dim checkpoint vector (vec to target + dist) → 11 total.
-DENSE_STATES_DIM = 8
-DENSE_OBS_DIM = DENSE_STATES_DIM + 3
-
-# Checkpoint-recovery reward defaults.  These are mirrored in the MJX env.
-PRIOR_RECOVERY_V_REF = 0.04
-PRIOR_RECOVERY_QUIET_THRESHOLD_SPEED = 0.05
-PRIOR_RECOVERY_ALIVE_REWARD = 0.02
-PRIOR_RECOVERY_W_PROGRESS = 8.0
-PRIOR_RECOVERY_W_BASIN = 0.5
-PRIOR_RECOVERY_W_QUIET = 1.0
-PRIOR_RECOVERY_W_HOLD = 1.0
-PRIOR_RECOVERY_ACTION_PENALTY = 0.005
-PRIOR_RECOVERY_ACTION_DELTA_PENALTY = 0.01
-PRIOR_RECOVERY_TILT_PENALTY = 0.05
-
-# dense reward defaults — restored from commit ec3e3ab (last Wed).
-# Speed gate uses the current v_ref (0.03) instead of Wed's looser 0.05.
-PRIOR_DENSE_SPEED_COEF = 0.05         # weight on linear -speed shaping
-PRIOR_DENSE_SAFE_MARGIN_COEF = 2.0    # weight on min(safe_margin, clip)
-PRIOR_DENSE_SAFE_MARGIN_CLIP = 0.02   # safe_margin saturates here
-PRIOR_DENSE_TOUCHING_WALL_BONUS = 0.15
-PRIOR_DENSE_QUIET_SPEED = 0.05        # speed gate for stable-step counter (Wed-style, relaxed)
-PRIOR_DENSE_WALL_CONTACT_MARGIN = 0.002  # ball is "touching" if d < r_w + r_m + this
-# Progress-to-safe-corner shaping (port of `main:cyberrunner_env.py:_compute_reward`
-# but targeting the first BACKWARD safe corner instead of the maze goal).
-# Symmetric: rewards moving toward, penalizes moving away.
-PRIOR_DENSE_PROGRESS_SCALE = 20.0
-# One-time bump paid the first step the ball enters the corner basin (i.e.
-# crosses target_dist < checkpoint_radius). Marks the transition from the
-# "approach" phase to the "stabilize" phase. Sized to clearly dominate the
-# hole-penalty hit so the policy is willing to navigate risky terrain to
-# reach the target rather than freeze at a safe far-from-everything spot.
-PRIOR_DENSE_ARRIVAL_BONUS = 50.0
-# Per-step bonus paid AFTER arrival when the ball is inside the basin AND
-# slow. Shape: STAY_BONUS · exp(−(speed / v_ref)²) · 1[in_basin]. Quietness
-# gating means oscillating in-and-out fast still earns close to zero per
-# step, while parking earns ~STAY_BONUS. Max episode budget ≈ 500 · 0.2
-# = 100 (similar order to ARRIVAL_BONUS), but the realistic accumulation is
-# smaller because the ball is rarely fully quiet for a full 500 steps.
-PRIOR_DENSE_STAY_BONUS = 0.4
-PRIOR_DENSE_STAY_V_REF = 0.05  # v_ref for the quiet shape; aligned with QUIET_SPEED
 
 
 # ============================================================================
@@ -319,6 +257,244 @@ def get_hard_layout() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 
 
 # ============================================================================
+# EASY MAZE LAYOUT
+# ============================================================================
+
+
+def get_easy_layout() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return the easy maze layout arrays."""
+    walls_h = np.array(
+        [
+            [0.045, 0.154, 0.2115],
+            [0.159, 0.176, 0.1855],
+            [0.024, 0.111, 0.173],
+            [0.116, 0.171, 0.1545],
+            [0.050, 0.1565, 0.0735],
+            [0.0265, 0.045, 0.049],
+            [0.0, 0.0875, 0.1135],
+            [0.0, 0.0165, 0.0855],
+            [0.077, 0.1885, 0.020],
+            [0.1625, 0.1835, 0.110],
+            [0.1885, 0.2245, 0.069],
+            [0.2295, 0.2475, 0.069],
+            [0.1885, 0.2245, 0.1285],
+            [0.2295, 0.245, 0.154],
+            [0.2135, 0.242, 0.185],
+            [0.196, 0.2135, 0.2065],
+            [0.252, 0.276, 0.107],
+            [0.2585, 0.276, 0.1715],
+        ],
+        dtype=np.float32,
+    )
+
+    walls_v = np.array(
+        [
+            [0.199, 0.214, 0.0425],
+            [0.183, 0.231, 0.1565],
+            [0.159, 0.184, 0.0215],
+            [0.076, 0.1755, 0.1135],
+            [0.0465, 0.0835, 0.0475],
+            [0.0465, 0.071, 0.103],
+            [0.116, 0.132, 0.0355],
+            [0.116, 0.132, 0.0705],
+            [0.0, 0.044, 0.0745],
+            [0.0225, 0.0365, 0.137],
+            [0.0225, 0.131, 0.186],
+            [0.046, 0.1825, 0.227],
+            [0.1875, 0.209, 0.216],
+            [0.0, 0.0295, 0.2135],
+        ],
+        dtype=np.float32,
+    )
+
+    holes = np.array(
+        [
+            [0.0315, 0.1865],
+            [0.055, 0.128],
+            [0.032, 0.064],
+            [0.1735, 0.0335],
+            [0.150, 0.110],
+            [0.174, 0.170],
+            [0.2415, 0.142],
+            [0.2415, 0.055],
+        ],
+        dtype=np.float32,
+    )
+
+    waypoints = np.array(
+        [
+            [0.1405, 0.222],
+            [0.0415, 0.222],
+            [0.009, 0.197],
+            [0.009, 0.159],
+            [0.0275, 0.1425],
+            [0.061, 0.153],
+            [0.089, 0.143],
+            [0.102, 0.116],
+            [0.074, 0.093],
+            [0.048, 0.098],
+            [0.0275, 0.087],
+            [0.012, 0.057],
+            [0.012, 0.029],
+            [0.061, 0.029],
+            [0.061, 0.058],
+            [0.089, 0.058],
+            [0.089, 0.035],
+            [0.120, 0.035],
+            [0.120, 0.058],
+            [0.170, 0.058],
+            [0.170, 0.091],
+            [0.130, 0.091],
+            [0.130, 0.121],
+            [0.200, 0.156],
+            [0.200, 0.187],
+            [0.181, 0.219],
+            [0.232, 0.219],
+            [0.253, 0.186],
+            [0.253, 0.169],
+            [0.264, 0.137],
+            [0.242, 0.113],
+            [0.242, 0.094],
+            [0.264, 0.074],
+            [0.264, 0.040],
+            [0.202, 0.040],
+            [0.202, 0.007],
+            [0.0935, 0.007],
+        ],
+        dtype=np.float32,
+    )
+
+    return walls_h, walls_v, holes, waypoints
+
+
+# ============================================================================
+# MEDIUM MAZE LAYOUT
+# ============================================================================
+
+
+def get_medium_layout() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return the medium maze layout arrays."""
+    walls_h = np.array(
+        [
+            [0.0, 0.048, 0.199],
+            [0.0, 0.058, 0.145],
+            [0.0, 0.058, 0.118],
+            [0.027, 0.0405, 0.076],
+            [0.0, 0.043, 0.0295],
+            [0.072, 0.081, 0.1735],
+            [0.072, 0.178, 0.210],
+            [0.183, 0.276, 0.213],
+            [0.066, 0.131, 0.0945],
+            [0.0865, 0.102, 0.1205],
+            [0.068, 0.0915, 0.0425],
+            [0.0965, 0.206, 0.031],
+            [0.1185, 0.159, 0.1685],
+            [0.164, 0.179, 0.085],
+            [0.189, 0.2135, 0.111],
+            [0.2185, 0.276, 0.1235],
+            [0.2185, 0.244, 0.0895],
+            [0.244, 0.276, 0.154],
+            [0.184, 0.210, 0.1625],
+            [0.226, 0.251, 0.192],
+        ],
+        dtype=np.float32,
+    )
+
+    walls_v = np.array(
+        [
+            [0.2015, 0.231, 0.0455],
+            [0.1475, 0.178, 0.035],
+            [0.059, 0.089, 0.043],
+            [0.0, 0.042, 0.0455],
+            [0.188, 0.231, 0.1805],
+            [0.171, 0.2125, 0.0695],
+            [0.097, 0.147, 0.084],
+            [0.0715, 0.092, 0.0685],
+            [0.052, 0.092, 0.1285],
+            [0.0, 0.068, 0.094],
+            [0.0335, 0.0625, 0.187],
+            [0.114, 0.142, 0.140],
+            [0.144, 0.183, 0.116],
+            [0.077, 0.171, 0.1615],
+            [0.0, 0.053, 0.230],
+            [0.087, 0.126, 0.216],
+            [0.0665, 0.092, 0.2465],
+            [0.1505, 0.160, 0.1865],
+            [0.165, 0.174, 0.2075],
+            [0.1805, 0.1895, 0.2285],
+        ],
+        dtype=np.float32,
+    )
+
+    holes = np.array(
+        [
+            [0.030, 0.1865],
+            [0.057, 0.130],
+            [0.0565, 0.0875],
+            [0.031, 0.065],
+            [0.058, 0.036],
+            [0.105, 0.070],
+            [0.175, 0.0695],
+            [0.150, 0.111],
+            [0.1275, 0.1485],
+            [0.080, 0.160],
+            [0.081, 0.186],
+            [0.152, 0.193],
+            [0.219, 0.176],
+            [0.2425, 0.143],
+            [0.175, 0.143],
+            [0.242, 0.0575],
+        ],
+        dtype=np.float32,
+    )
+
+    waypoints = np.array(
+        [
+            [0.166, 0.2205],
+            [0.057, 0.2205],
+            [0.057, 0.160],
+            [0.072, 0.144],
+            [0.072, 0.105],
+            [0.015, 0.105],
+            [0.015, 0.0455],
+            [0.081, 0.060],
+            [0.081, 0.083],
+            [0.1195, 0.083],
+            [0.1195, 0.043],
+            [0.144, 0.043],
+            [0.144, 0.096],
+            [0.099, 0.139],
+            [0.099, 0.194],
+            [0.1295, 0.194],
+            [0.1295, 0.179],
+            [0.190, 0.179],
+            [0.213, 0.201],
+            [0.264, 0.201],
+            [0.264, 0.174],
+            [0.239, 0.174],
+            [0.219, 0.145],
+            [0.176, 0.124],
+            [0.176, 0.097],
+            [0.198, 0.097],
+            [0.198, 0.072],
+            [0.218, 0.051],
+            [0.218, 0.015],
+            [0.108, 0.015],
+        ],
+        dtype=np.float32,
+    )
+
+    return walls_h, walls_v, holes, waypoints
+
+
+_LAYOUT_LOADERS = {
+    "hard": get_hard_layout,
+    "medium": get_medium_layout,
+    "easy": get_easy_layout,
+}
+
+
+# ============================================================================
 # PATH UTILITIES
 # ============================================================================
 
@@ -329,296 +505,6 @@ def compute_waypoint_distances(waypoints: np.ndarray) -> tuple[np.ndarray, np.nd
     seg_lengths = np.linalg.norm(seg_vectors, axis=1)
     cum_distances = np.concatenate([[0.0], np.cumsum(seg_lengths)])
     return seg_lengths.astype(np.float32), cum_distances.astype(np.float32)
-
-
-def _project_points_to_path(
-    points: np.ndarray,
-    waypoints: np.ndarray,
-    return_closest: bool = False,
-    return_seg_idx: bool = False,
-):
-    """Project points onto the reference path and return path progress and offset.
-
-    With ``return_closest=True`` also returns the closest path point per input.
-    With ``return_seg_idx=True`` also returns the segment index. Both flags are
-    additive and append to the return tuple in this order:
-    ``(progress, offset[, closest_pt][, seg_idx])``.
-    """
-    seg_starts = waypoints[:-1]
-    seg_ends = waypoints[1:]
-    seg_vecs = seg_ends - seg_starts
-    seg_lengths = np.linalg.norm(seg_vecs, axis=1)
-    cum_distances = np.concatenate([[0.0], np.cumsum(seg_lengths)])
-
-    rel = points[:, None, :] - seg_starts[None, :, :]
-    seg_len_sq = np.maximum(np.sum(seg_vecs**2, axis=1), 1e-10)
-    t = np.sum(rel * seg_vecs[None, :, :], axis=-1) / seg_len_sq[None, :]
-    t_clipped = np.clip(t, 0.0, 1.0)
-    closest = seg_starts[None, :, :] + t_clipped[..., None] * seg_vecs[None, :, :]
-    offsets = np.linalg.norm(points[:, None, :] - closest, axis=-1)
-    best_seg = np.argmin(offsets, axis=1)
-    best_offset = offsets[np.arange(len(points)), best_seg]
-    best_t = t_clipped[np.arange(len(points)), best_seg]
-    progress = cum_distances[best_seg] + best_t * seg_lengths[best_seg]
-    progress = progress.astype(np.float32)
-    best_offset = best_offset.astype(np.float32)
-    if not (return_closest or return_seg_idx):
-        return progress, best_offset
-    out: list = [progress, best_offset]
-    if return_closest:
-        out.append(closest[np.arange(len(points)), best_seg].astype(np.float32))
-    if return_seg_idx:
-        out.append(best_seg.astype(np.int32))
-    return tuple(out)
-
-
-def _point_to_segment_distance(points: np.ndarray, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
-    """Return minimum Euclidean distance from each point to a set of 2D line segments."""
-    seg_vecs = ends - starts
-    seg_len_sq = np.maximum(np.sum(seg_vecs**2, axis=1), 1e-10)
-    rel = points[:, None, :] - starts[None, :, :]
-    t = np.sum(rel * seg_vecs[None, :, :], axis=-1) / seg_len_sq[None, :]
-    t = np.clip(t, 0.0, 1.0)
-    closest = starts[None, :, :] + t[..., None] * seg_vecs[None, :, :]
-    return np.linalg.norm(points[:, None, :] - closest, axis=-1).min(axis=1)
-
-
-def _segment_crosses_walls(p: np.ndarray, q: np.ndarray, wall_starts: np.ndarray, wall_ends: np.ndarray) -> bool:
-    """Return True if segment p→q crosses any wall segment (2D cross-product test)."""
-    r = q - p
-    s = wall_ends - wall_starts          # (W, 2)
-    rxs = r[0] * s[:, 1] - r[1] * s[:, 0]
-    nonpar = np.abs(rxs) > 1e-10
-    qmp = wall_starts - p                # (W, 2)
-    t = (qmp[:, 0] * s[:, 1] - qmp[:, 1] * s[:, 0]) / np.where(nonpar, rxs, 1.0)
-    u = (qmp[:, 0] * r[1]    - qmp[:, 1] * r[0]   ) / np.where(nonpar, rxs, 1.0)
-    return bool((nonpar & (t > 0) & (t < 1) & (u > 0) & (u < 1)).any())
-
-
-def _segment_distance_matrix(points: np.ndarray, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
-    """Return full (N_points, N_segments) matrix of distances to 2D line segments."""
-    seg_vecs = ends - starts
-    seg_len_sq = np.maximum(np.sum(seg_vecs**2, axis=1), 1e-10)
-    rel = points[:, None, :] - starts[None, :, :]
-    t = np.sum(rel * seg_vecs[None, :, :], axis=-1) / seg_len_sq[None, :]
-    t = np.clip(t, 0.0, 1.0)
-    closest = starts[None, :, :] + t[..., None] * seg_vecs[None, :, :]
-    return np.linalg.norm(points[:, None, :] - closest, axis=-1)
-
-
-def select_safe_checkpoints(
-    waypoints: np.ndarray,
-    holes: np.ndarray,
-    walls_h: np.ndarray,
-    walls_v: np.ndarray,
-    reward_every_n_waypoints: int,
-    include_corridors: bool = True,
-    grid_res: float = 0.002,
-) -> np.ndarray:
-    """Pick geometrically safe checkpoints where the ball can physically stabilize.
-
-    Two classes qualify:
-    - Corner: close to both a horizontal AND a vertical surface (two perpendicular supports).
-    - Single-wall: close to exactly one surface family, not sandwiched on the same axis.
-      The policy can hold the ball against a single wall with a slight tilt.
-    Corridor midpoints (sandwiched on either axis) are excluded. Hole clearance is a
-    hard filter with wall-blocked line-of-sight. Result is deduplicated and path-ordered.
-    Setting ``include_corridors=False`` keeps only true corner basins.
-    """
-    corner_slack      = 0.003   # 3 mm: wall must be this close to touching (corner)
-    single_wall_slack = 0.0015  # 1.5 mm: must be nearly touching for single-wall support
-    corridor_slack    = 0.010   # 10 mm: if walls within this on BOTH sides of same axis → corridor
-    touch_wall = WALL_RADIUS + MARBLE_RADIUS
-    touch_edge = MARBLE_RADIUS
-
-    xs = np.arange(MARBLE_RADIUS, BOARD_WIDTH - MARBLE_RADIUS + 1e-9, grid_res, dtype=np.float32)
-    ys = np.arange(MARBLE_RADIUS, BOARD_HEIGHT - MARBLE_RADIUS + 1e-9, grid_res, dtype=np.float32)
-    xx, yy = np.meshgrid(xs, ys, indexing="xy")
-    candidates = np.stack([xx.ravel(), yy.ravel()], axis=-1)
-
-    cx = candidates[:, 0]  # (N,)
-    cy = candidates[:, 1]
-
-    # --- Perpendicular ray-casting ---
-    # For each candidate cast 4 axis-aligned rays. A horizontal wall at y=hy only
-    # contributes to the up/down ray if the candidate's x falls within [hx0, hx1]
-    # (i.e., the wall is directly above/below). Likewise for vertical walls.
-    # This avoids the endpoint-distance artefact of _segment_distance_matrix.
-
-    hx0_arr = walls_h[:, 0][None, :]   # (1, Wh)
-    hx1_arr = walls_h[:, 1][None, :]
-    hy_arr  = walls_h[:, 2][None, :]
-    in_x = (cx[:, None] >= hx0_arr - 1e-6) & (cx[:, None] <= hx1_arr + 1e-6)  # (N, Wh)
-    dy = hy_arr - cy[:, None]                                                    # (N, Wh)
-    ray_up   = np.where(in_x & (dy > 0),  dy, np.inf).min(axis=1)   # (N,)
-    ray_down = np.where(in_x & (dy < 0), -dy, np.inf).min(axis=1)
-
-    vy0_arr = walls_v[:, 0][None, :]   # (1, Wv)
-    vy1_arr = walls_v[:, 1][None, :]
-    vx_arr  = walls_v[:, 2][None, :]
-    in_y = (cy[:, None] >= vy0_arr - 1e-6) & (cy[:, None] <= vy1_arr + 1e-6)  # (N, Wv)
-    dx = vx_arr - cx[:, None]                                                    # (N, Wv)
-    ray_right = np.where(in_y & (dx > 0),  dx, np.inf).min(axis=1)  # (N,)
-    ray_left  = np.where(in_y & (dx < 0), -dx, np.inf).min(axis=1)
-
-    # Combined gap to nearest surface (wall or board edge) in each direction.
-    # gap = 0 means touching, negative means overlapping.
-    gap_up    = np.minimum(ray_up    - touch_wall, BOARD_HEIGHT - cy - touch_edge)
-    gap_down  = np.minimum(ray_down  - touch_wall, cy            - touch_edge)
-    gap_right = np.minimum(ray_right - touch_wall, BOARD_WIDTH - cx - touch_edge)
-    gap_left  = np.minimum(ray_left  - touch_wall, cx            - touch_edge)
-
-    close_up    = gap_up    < corner_slack
-    close_down  = gap_down  < corner_slack
-    close_right = gap_right < corner_slack
-    close_left  = gap_left  < corner_slack
-
-    in_h_corridor = (gap_up < corridor_slack) & (gap_down < corridor_slack)
-    in_v_corridor = (gap_left < corridor_slack) & (gap_right < corridor_slack)
-
-    is_corner = (
-        (close_up | close_down) & (close_right | close_left)
-        & ~(in_h_corridor & in_v_corridor)
-    )
-    # Single-wall: nearly touching exactly one wall family (H or V), not sandwiched
-    sw_up    = gap_up    < single_wall_slack
-    sw_down  = gap_down  < single_wall_slack
-    sw_right = gap_right < single_wall_slack
-    sw_left  = gap_left  < single_wall_slack
-    is_single_wall = (
-        ((sw_up | sw_down) & ~(close_right | close_left) & ~in_h_corridor)
-        | ((sw_right | sw_left) & ~(close_up | close_down) & ~in_v_corridor)
-    )
-    is_safe = is_corner | (is_single_wall if include_corridors else False)
-
-    # Wall clearance for validity (use _segment_distance_matrix — fine for overlap check)
-    h_starts = np.stack([walls_h[:, 0], walls_h[:, 2]], axis=1)
-    h_ends   = np.stack([walls_h[:, 1], walls_h[:, 2]], axis=1)
-    v_starts = np.stack([walls_v[:, 2], walls_v[:, 0]], axis=1)
-    v_ends   = np.stack([walls_v[:, 2], walls_v[:, 1]], axis=1)
-    all_wall_dist = _point_to_segment_distance(candidates, np.vstack([h_starts, v_starts]), np.vstack([h_ends, v_ends]))
-    wall_clearance = all_wall_dist - touch_wall
-    edge_clearance = np.minimum.reduce([cx, BOARD_WIDTH - cx, cy, BOARD_HEIGHT - cy]) - touch_edge
-
-    # --- Hole clearance with wall-blocked line-of-sight ---
-    # A hole only threatens a candidate if there is no wall between them.
-    # Tight wall-supported corners can safely tolerate a slightly smaller extra
-    # restart margin than generic free-space points.
-    # Corners: tight margin (two supports). Single-wall: larger margin (less constrained).
-    clearance_margin = HOLE_RADIUS + MARBLE_RADIUS + np.where(is_corner, 0.006, 0.010)
-    hole_dist_mat = np.linalg.norm(candidates[:, None, :] - holes[None, :, :], axis=-1)  # (N, H)
-    # Start with simple distance; candidates that are far enough are trivially safe.
-    hole_clearance = hole_dist_mat.min(axis=1) - clearance_margin
-    # For candidates where some hole is too close, check if a wall blocks the path.
-    at_risk = np.where(hole_clearance < 0)[0]
-    if len(at_risk) > 0:
-        wall_s = np.vstack([h_starts, v_starts])
-        wall_e = np.vstack([h_ends,   v_ends  ])
-        for i in at_risk:
-            margin_i = clearance_margin[i]
-            close_hole_idxs = np.where(hole_dist_mat[i] < margin_i)[0]
-            worst = -np.inf
-            for j in close_hole_idxs:
-                if _segment_crosses_walls(candidates[i], holes[j], wall_s, wall_e):
-                    # Wall blocks this hole — not a hazard
-                    continue
-                # Unblocked: use its clearance
-                worst = max(worst, margin_i - hole_dist_mat[i, j])
-            # If all close holes were blocked, candidate is safe
-            hole_clearance[i] = -worst if worst > -np.inf else margin_i
-
-    progress, path_offset, closest_path_pts = _project_points_to_path(
-        candidates, waypoints, return_closest=True,
-    )
-    # Keep checkpoints relevant to maze progression, but allow slightly off-path
-    # corner basins that are genuinely good stop/restart locations.
-    max_path_offset = 0.065
-
-    pre_valid = (
-        (hole_clearance > 0.0)
-        & (wall_clearance >= -1e-6)
-        & (edge_clearance >= -1e-6)
-        & (path_offset < max_path_offset)
-        & is_safe
-    )
-    # Path reachability: drop candidates whose centerline path to the closest
-    # path point grazes a wall (sub-mm clearance), e.g. an LOS that barely
-    # skirts a wall endpoint into a sealed-off pocket. Threshold is set to
-    # WALL_RADIUS — comfortably above the numeric grazing regime but well
-    # below the (WALL_RADIUS + MARBLE_RADIUS) gap where the ball can
-    # physically squeeze through, so legitimate narrow corridors stay valid.
-    wall_s_all = np.vstack([h_starts, v_starts])
-    wall_e_all = np.vstack([h_ends, v_ends])
-    min_clearance = WALL_RADIUS
-    n_samples = 32
-    ts = np.linspace(0.0, 1.0, n_samples, dtype=np.float32)
-    reachable = np.ones(len(candidates), dtype=bool)
-    for i in np.where(pre_valid)[0]:
-        p = candidates[i]
-        q = closest_path_pts[i]
-        seg_pts = p[None, :] + ts[:, None] * (q - p)[None, :]
-        min_d = _point_to_segment_distance(seg_pts, wall_s_all, wall_e_all).min()
-        if min_d < min_clearance:
-            reachable[i] = False
-    valid = pre_valid & reachable
-    if not np.any(valid):
-        return np.zeros((0, 2), dtype=np.float32)
-
-    is_corner_v = is_corner[valid]
-    candidates = candidates[valid]
-    progress = progress[valid]
-    hole_clearance = hole_clearance[valid]
-    gap_up_v    = gap_up[valid]
-    gap_down_v  = gap_down[valid]
-    gap_left_v  = gap_left[valid]
-    gap_right_v = gap_right[valid]
-    touch_score = np.minimum.reduce([gap_up_v, gap_down_v, gap_left_v, gap_right_v])
-    quality = 0.5 * hole_clearance - 10.0 * touch_score
-
-    # Wall endpoints: single-wall points must be near one to avoid mid-corridor placement.
-    h_ep = np.vstack([
-        np.stack([walls_h[:, 0], walls_h[:, 2]], axis=1),
-        np.stack([walls_h[:, 1], walls_h[:, 2]], axis=1),
-    ])
-    v_ep = np.vstack([
-        np.stack([walls_v[:, 2], walls_v[:, 0]], axis=1),
-        np.stack([walls_v[:, 2], walls_v[:, 1]], axis=1),
-    ])
-    endpoints = np.vstack([h_ep, v_ep])  # (E, 2)
-    dist_to_ep = np.linalg.norm(candidates[:, None, :] - endpoints[None, :, :], axis=-1).min(axis=1)
-    max_ep_dist = 0.025  # single-wall must be within 2.5 cm of a wall junction/endpoint
-
-    # Two-pass greedy NMS
-    # Pass 1: corners only, original spacing (preserves all previously selected corners)
-    min_sep_c  = max(0.010, 0.018 - 0.001 * float(reward_every_n_waypoints))
-    # Pass 2: single-wall fills gaps, wider spacing to stay sparse
-    min_sep_sw = 0.030
-
-    selected_idx: list[int] = []
-
-    def _nms_add(idx: int, min_sep: float) -> bool:
-        cand = candidates[idx]
-        if not selected_idx:
-            selected_idx.append(idx)
-            return True
-        sel = candidates[np.asarray(selected_idx)]
-        if np.all(np.linalg.norm(sel - cand, axis=1) >= min_sep):
-            selected_idx.append(idx)
-            return True
-        return False
-
-    corner_idxs = np.where(is_corner_v)[0]
-    for idx in corner_idxs[np.argsort(-quality[corner_idxs])]:
-        _nms_add(int(idx), min_sep_c)
-
-    if include_corridors:
-        sw_idxs = np.where(~is_corner_v & (dist_to_ep < max_ep_dist))[0]
-        for idx in sw_idxs[np.argsort(-quality[sw_idxs])]:
-            _nms_add(int(idx), min_sep_sw)
-
-    selected_idx_arr = np.asarray(selected_idx, dtype=np.int32)
-    progress_order = np.argsort(progress[selected_idx_arr])
-    return candidates[selected_idx_arr][progress_order].astype(np.float32)
 
 
 # ============================================================================
@@ -848,18 +734,8 @@ def check_endpoint_connected(
     return False
 
 
-def _generate_board_texture(
-    holes: np.ndarray,
-    waypoints: np.ndarray,
-    checkpoint_points: np.ndarray | None = None,
-):
-    """Generate the board texture used by the simulator.
-
-    Checkpoints are intentionally *not* baked into this texture so vision policies
-    do not observe synthetic green markers that do not exist on the real system.
-    The ``checkpoint_points`` argument is kept for API compatibility with older
-    call sites and offline visualization utilities.
-    """
+def _generate_board_texture(holes: np.ndarray, waypoints: np.ndarray):
+    """Generate a board texture image with holes and path baked in."""
     # Board floor geom spans -0.007 to 0.283 in x, -0.007 to 0.238 in y
     # (centered at [0.138, 0.1155] with half-size [0.145, 0.1225])
     # Maze coordinates start at 0, so offset by 0.007 to place them correctly.
@@ -890,13 +766,7 @@ def _generate_board_texture(
     return img.transpose(Image.FLIP_TOP_BOTTOM)
 
 
-def build_model(
-    walls_h: np.ndarray,
-    walls_v: np.ndarray,
-    holes: np.ndarray,
-    waypoints: np.ndarray,
-    checkpoint_points: np.ndarray | None = None,
-) -> mujoco.MjModel:
+def build_model(walls_h: np.ndarray, walls_v: np.ndarray, holes: np.ndarray, waypoints: np.ndarray) -> mujoco.MjModel:
     """Build the MuJoCo model using mjSpec."""
     spec = mujoco.MjSpec()
     spec.modelname = "cyberrunner"
@@ -904,7 +774,7 @@ def build_model(
     spec.option.timestep = TIMESTEP
 
     # Board texture with holes and path baked in
-    board_img = _generate_board_texture(holes, waypoints, checkpoint_points)
+    board_img = _generate_board_texture(holes, waypoints)
 
     tex = spec.add_texture()
     tex.name = "board_tex"
@@ -1006,12 +876,6 @@ def build_model(
 
     # Maze walls
     _add_maze_walls(board, walls_h, walls_v)
-
-    # Vision camera (attached to board, tracks ball by repositioning before render)
-    vision_cam = board.add_camera(pos=[0.138, 0.1155, 0.4], zaxis=[0, 0, 1])
-    vision_cam.name = "vision_cam"
-    # Narrow FOV to cover ~6cm at camera height (0.4 - 0.0705 = 0.3295m above board)
-    vision_cam.fovy = np.degrees(2 * np.arctan(0.03 / 0.3295))
 
     # Actuators
     _add_actuators(spec)
@@ -1194,15 +1058,40 @@ def _add_marble(world, start_pos: np.ndarray):
 
 class CyberRunnerEnv(gym.Env):
     """
-    Simplified CyberRunner environment.
+    Simplified CyberRunner environment (flat state observation, no vision).
 
-    Observation space: [joint_alpha, joint_beta, ball_x, ball_y, rel_path_points...]
-        - 4 base values + 20 relative path point values = 24 total
-        - All values have noise applied (per-episode bias + per-step noise)
+    Observation space:
+        Base frame (10-dim Box):
+            [0:2] Joint angles (alpha, beta) with noise
+            [2:4] Ball position (x, y) with noise
+            [4:6] Vector from ball to closest visible path point
+            [6:8] Vector from ball to next waypoint
+            [8:10] Vector from ball to waypoint after next
+        With ``obs_n_stack > 1`` only the kinematic part — joint angles + ball
+        position (dims [0:4]) — is stacked together with the action that
+        produced it (6 dims per frame), since stacking those across steps is
+        what reveals velocity. The observation is those ``obs_n_stack`` frames
+        concatenated newest-first, followed by the newest path-direction
+        vectors (dims [4:10], kept once because they barely change step to
+        step) — ``obs_n_stack * 6 + 6`` dims total.
 
     Action space: [-1, 1]^2 for alpha and beta motor commands
 
-    Reward: Path progress (change in distance along path) + goal bonus
+    Reward:
+        Main task: dense signed path-progress shaping
+        ``(curr_progress - prev_progress) * dense_main_progress_scale`` + goal
+        bonus + hole penalty.
+        Prior branch (``prior_mode=True``): the recovery/stabilization task —
+        the ball is reset to a random hole-safe state and the policy is
+        rewarded for bringing it to a slow, hole-safe (recovered) state.
+
+    Prior branch (``prior_mode=True``):
+        - Random resetting: marble spawns at a random hole-safe position with a
+          random velocity (and flat board), so the policy sees the kind of
+          fast-moving states it must recover from.
+        - Terminations: reaching a recovered state (success), falling into a
+          hole (failure), and timeout are all terminal (terminated=True) so the
+          value function is not bootstrapped past the episode boundary.
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
@@ -1212,200 +1101,81 @@ class CyberRunnerEnv(gym.Env):
         render_mode: str | None = None,
         episode_length: int = 2000,
         randomize_init_pos: bool = False,
-        include_vision: bool = True,
         reward_every_n_waypoints: int = 3,
         hole_penalty: float = 5.0,
-        checkpoint_radius: float = 0.010,
-        checkpoint_hold_steps: int = 12,
-        checkpoint_speed_threshold: float = 0.015,
-        checkpoint_arrival_reward: float = 0.2,
-        checkpoint_stabilize_reward: float = 1.0,
-        checkpoint_hold_reward: float = 0.02,
-        safe_hole_margin: float = 0.004,
-        checkpoint_speed_ema_alpha: float = 0.8,
-        checkpoint_include_corridors: bool = True,
+        dense_main_progress_scale: float = 100.0,
+        layout: str = "hard",
         prior_mode: bool = False,
-        prior_task: str = "checkpoint",
-        prior_spawn_source: str = "dense_path",
-        prior_start_waypoint_window: int = 3,
-        prior_init_ball_speed: float = 0.0,
-        prior_init_tilt_frac: float = 0.0,
-        prior_min_checkpoint_start_dist: float = 0.02,
-        prior_max_checkpoint_start_dist: float = 0.12,
-        prior_spawn_min_hole_margin: float = 0.02,
-        prior_start_point_spacing: float = 0.01,
-        prior_spawn_merge_radius: float = 0.0,
-        checkpoint_progress_reward_scale: float = 20.0,
-        terminate_on_checkpoint_stabilized: bool = False,
-        prior_survival_bonus: float = 100.0,
-        prior_version: str = PRIOR_VERSION_LEGACY,
-        prior_reward_mode: str | None = None,
-        prior_obs_mode: str | None = None,
-        prior_recovery_v_ref: float = PRIOR_RECOVERY_V_REF,
-        prior_recovery_quiet_threshold_speed: float = PRIOR_RECOVERY_QUIET_THRESHOLD_SPEED,
-        prior_recovery_alive_reward: float = PRIOR_RECOVERY_ALIVE_REWARD,
-        prior_recovery_w_progress: float = PRIOR_RECOVERY_W_PROGRESS,
-        prior_recovery_w_basin: float = PRIOR_RECOVERY_W_BASIN,
-        prior_recovery_w_quiet: float = PRIOR_RECOVERY_W_QUIET,
-        prior_recovery_w_hold: float = PRIOR_RECOVERY_W_HOLD,
-        prior_recovery_action_penalty: float = PRIOR_RECOVERY_ACTION_PENALTY,
-        prior_recovery_action_delta_penalty: float = PRIOR_RECOVERY_ACTION_DELTA_PENALTY,
-        prior_recovery_tilt_penalty: float = PRIOR_RECOVERY_TILT_PENALTY,
+        recovery_speed_threshold: float = 0.03,
+        recovery_hole_margin_factor: float = 3.0,
+        prior_init_max_speed: float = 0.2,
+        obs_n_stack: int = 1,
     ):
         super().__init__()
-        if prior_version not in PRIOR_VERSIONS:
-            raise ValueError(f"Unknown prior_version={prior_version!r}; expected one of {PRIOR_VERSIONS}")
-        prior_reward_mode = prior_reward_mode or prior_version
-        prior_obs_mode = prior_obs_mode or prior_version
-        if prior_reward_mode not in PRIOR_VERSIONS:
-            raise ValueError(f"Unknown prior_reward_mode={prior_reward_mode!r}; expected one of {PRIOR_VERSIONS}")
-        if prior_obs_mode not in PRIOR_VERSIONS:
-            raise ValueError(f"Unknown prior_obs_mode={prior_obs_mode!r}; expected one of {PRIOR_VERSIONS}")
 
         self.render_mode = render_mode
         self.episode_length = episode_length
         self.randomize_init_pos = randomize_init_pos
-        self.include_vision = include_vision
         self.reward_every_n_waypoints = reward_every_n_waypoints
         self.hole_penalty = hole_penalty
-        self.checkpoint_radius = checkpoint_radius
-        self.checkpoint_hold_steps = checkpoint_hold_steps
-        self.checkpoint_speed_threshold = checkpoint_speed_threshold
-        self.checkpoint_arrival_reward = checkpoint_arrival_reward
-        self.checkpoint_stabilize_reward = checkpoint_stabilize_reward
-        self.checkpoint_hold_reward = checkpoint_hold_reward
-        self.safe_hole_margin = safe_hole_margin
-        self.checkpoint_speed_ema_alpha = checkpoint_speed_ema_alpha
-        self.checkpoint_include_corridors = checkpoint_include_corridors
-        self.prior_mode = prior_mode
-        self.prior_task = prior_task
-        self.prior_spawn_source = prior_spawn_source
-        self.prior_start_waypoint_window = prior_start_waypoint_window
-        self.prior_init_ball_speed = prior_init_ball_speed
-        self.prior_init_tilt_frac = prior_init_tilt_frac
-        self.prior_min_checkpoint_start_dist = prior_min_checkpoint_start_dist
-        self.prior_max_checkpoint_start_dist = prior_max_checkpoint_start_dist
-        self.prior_spawn_min_hole_margin = prior_spawn_min_hole_margin
-        self.prior_start_point_spacing = prior_start_point_spacing
-        self.prior_spawn_merge_radius = prior_spawn_merge_radius
-        self.checkpoint_progress_reward_scale = checkpoint_progress_reward_scale
-        self.terminate_on_checkpoint_stabilized = terminate_on_checkpoint_stabilized
-        self.prior_survival_bonus = float(prior_survival_bonus)
-        self.prior_version = prior_version
-        self.prior_reward_mode = prior_reward_mode
-        self.prior_obs_mode = prior_obs_mode
-        self.prior_recovery_v_ref = float(prior_recovery_v_ref)
-        self.prior_recovery_quiet_threshold_speed = float(prior_recovery_quiet_threshold_speed)
-        self.prior_recovery_alive_reward = float(prior_recovery_alive_reward)
-        self.prior_recovery_w_progress = float(prior_recovery_w_progress)
-        self.prior_recovery_w_basin = float(prior_recovery_w_basin)
-        self.prior_recovery_w_quiet = float(prior_recovery_w_quiet)
-        self.prior_recovery_w_hold = float(prior_recovery_w_hold)
-        self.prior_recovery_action_penalty = float(prior_recovery_action_penalty)
-        self.prior_recovery_action_delta_penalty = float(prior_recovery_action_delta_penalty)
-        self.prior_recovery_tilt_penalty = float(prior_recovery_tilt_penalty)
+        self.dense_main_progress_scale = float(dense_main_progress_scale)
+
+        # Frame stacking: instead of a recurrent policy, expose the last
+        # ``obs_n_stack`` (base-observation, action) frames concatenated
+        # newest-first. Consecutive ball positions across frames let a
+        # feed-forward policy infer velocity (absent from a single frame).
+        self.obs_n_stack = max(1, int(obs_n_stack))
+
+        # Prior (recovery/stabilization) branch parameters.
+        self.prior_mode = bool(prior_mode)
+        self.recovery_speed_threshold = float(recovery_speed_threshold)
+        self.recovery_hole_margin_factor = float(recovery_hole_margin_factor)
+        self.prior_init_max_speed = float(prior_init_max_speed)
 
         # Load maze layout
-        self.walls_h, self.walls_v, self.holes, self.waypoints = get_hard_layout()
-        self._wall_starts = np.vstack([
-            np.stack([self.walls_h[:, 0], self.walls_h[:, 2]], axis=1),
-            np.stack([self.walls_v[:, 2], self.walls_v[:, 0]], axis=1),
-        ]).astype(np.float32)
-        self._wall_ends = np.vstack([
-            np.stack([self.walls_h[:, 1], self.walls_h[:, 2]], axis=1),
-            np.stack([self.walls_v[:, 2], self.walls_v[:, 1]], axis=1),
-        ]).astype(np.float32)
-        self.checkpoint_points = select_safe_checkpoints(
-            self.waypoints,
-            self.holes,
-            self.walls_h,
-            self.walls_v,
-            self.reward_every_n_waypoints,
-            include_corridors=self.checkpoint_include_corridors,
-        )
-        # Corner-only safe checkpoints for the prior's stabilization target.
-        # Strict corners (two perpendicular wall supports) only — no single-wall
-        # or corridor fallbacks — so the target is always a geometrically robust
-        # resting spot.
-        self._corner_points = select_safe_checkpoints(
-            self.waypoints,
-            self.holes,
-            self.walls_h,
-            self.walls_v,
-            self.reward_every_n_waypoints,
-            include_corridors=False,
-        )
-        if len(self._corner_points) == 0:
-            # Fallback so the prior target assignment never crashes.
-            self._corner_points = self.checkpoint_points
-        corner_progress_raw, _ = _project_points_to_path(self._corner_points, self.waypoints)
-        self._corner_progresses = corner_progress_raw.astype(np.float32) * 10.0
-        self.prior_start_points = self._build_prior_start_points()
+        if layout not in _LAYOUT_LOADERS:
+            raise ValueError(
+                f"Unknown layout {layout!r}; expected one of {list(_LAYOUT_LOADERS)}"
+            )
+        self.walls_h, self.walls_v, self.holes, self.waypoints = _LAYOUT_LOADERS[layout]()
 
         # Precompute path data
         self.seg_lengths, self.cum_distances = compute_waypoint_distances(self.waypoints)
         self.goal_pos = self.waypoints[-1]
 
         # Build model
-        self.model = build_model(
-            self.walls_h,
-            self.walls_v,
-            self.holes,
-            self.waypoints,
-            self.checkpoint_points,
-        )
+        self.model = build_model(self.walls_h, self.walls_v, self.holes, self.waypoints)
         self.data = mujoco.MjData(self.model)
 
         # Get body IDs
         self.board_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "board")
         self.marble_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "marble")
 
-        # Observation space — matches the pre-GPU layout (commit ec3e3ab):
-        #   "states" (10): [α, β, ball_x, ball_y, vec_to_closest_path(2),
-        #                   vec_to_next_wp(2), vec_to_next_next_wp(2)]
-        #   "checkpoint" (3): [vec_x, vec_y, dist] to FIRST SAFE CORNER
-        #                     BACKWARD in the maze path (recomputed every
-        #                     step from the ball's current path progress).
-        # Walls and holes implicitly inferred via path projection / dynamics.
-        if self.prior_obs_mode == PRIOR_VERSION_DENSE:
-            states_dim = DENSE_STATES_DIM
-        else:
-            states_dim = 10
-        obs_spaces = {
-            "states": spaces.Box(low=-np.inf, high=np.inf, shape=(states_dim,), dtype=np.float32),
-            "checkpoint": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
-        }
-        if self.prior_obs_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
-            obs_spaces = {
-                "prior_state": spaces.Box(
-                    low=-np.inf, high=np.inf,
-                    shape=(CHECKPOINT_RECOVERY_OBS_DIM,), dtype=np.float32,
-                )
-            }
-        if self.include_vision:
-            self.img_size = 64
-            obs_spaces["image"] = spaces.Box(0, 255, (self.img_size, self.img_size, 3), np.uint8)
-            self.vision_cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "vision_cam")
-            self.vision_renderer = mujoco.Renderer(self.model, height=self.img_size, width=self.img_size)
-            # Disable expensive rendering features for 64x64 observation
-            self.vision_renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = False
-            self.vision_renderer.scene.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = False
-            self.vision_renderer.scene.flags[mujoco.mjtRndFlag.mjRND_FOG] = False
-            # Disable decoration overlays to reduce update_scene work
-            self.vision_vopt = mujoco.MjvOption()
-            self.vision_vopt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = False
-            self.vision_vopt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
-            self.vision_vopt.flags[mujoco.mjtVisFlag.mjVIS_JOINT] = False
-            self.vision_vopt.flags[mujoco.mjtVisFlag.mjVIS_ACTUATOR] = False
-            self.vision_vopt.flags[mujoco.mjtVisFlag.mjVIS_COM] = False
-            self.vision_vopt.flags[mujoco.mjtVisFlag.mjVIS_LIGHT] = False
-            self.vision_vopt.flags[mujoco.mjtVisFlag.mjVIS_TENDON] = False
-        else:
-            self.vision_renderer = None
-        self.observation_space = spaces.Dict(obs_spaces)
-
         # Action: alpha and beta motor commands
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+
+        # Observation space. The base frame is the 10-dim kinematic +
+        # path-relative state. Only the kinematic part — joint angles + ball
+        # position (the first 4 dims) — is stacked together with the action,
+        # since stacking those across steps is what reveals velocity. The
+        # path-direction vectors (last 6 dims) barely change step-to-step, so
+        # only their newest value is appended once.
+        # With stacking (obs_n_stack > 1) the observation is:
+        #   [ (angle, ball_pos, action) × obs_n_stack  (newest first) ]
+        #   ++ [ newest path vectors (6) ]
+        self._base_obs_dim = 10
+        self._action_dim = 2
+        self._stack_obs_dim = 4   # [alpha, beta, ball_x, ball_y]
+        self._path_dim = self._base_obs_dim - self._stack_obs_dim  # 6
+        if self.obs_n_stack > 1:
+            self._frame_dim = self._stack_obs_dim + self._action_dim  # 6
+            obs_dim = self.obs_n_stack * self._frame_dim + self._path_dim
+        else:
+            obs_dim = self._base_obs_dim
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+        )
+        self._frames: list[np.ndarray] = []
 
         # Rendering
         self.renderer = None
@@ -1418,162 +1188,47 @@ class CyberRunnerEnv(gym.Env):
         self._closest_point = np.zeros(2, dtype=np.float32)
         self._obs_bias = None
         self._path_detected = False
-        self._max_checkpoint_reached = 0
-        self._active_checkpoint_idx = 0
-        self._stable_steps = 0
-        self._in_checkpoint_prev = False
-        self._ball_speed = 0.0
-        self._ball_speed_true = 0.0
-        self._min_hole_distance = np.inf
         self._prev_ball_pos = np.zeros(2, dtype=np.float32)
-        self._prev_ball_pos_noisy = np.zeros(2, dtype=np.float32)
-        self._prev_checkpoint_dist = np.inf
-        self._success = False
-        self._prior_target = np.zeros(2, dtype=np.float32)
-        self._prior_phi_prev = 0.0
-        self._prev_action = np.zeros(2, dtype=np.float32)
-        self._prev_action_for_obs = np.zeros(2, dtype=np.float32)
-        self._prev_target_dist = np.inf
-        self._target_dist_min = np.inf
-        # Dense-version progress shaping: track the first-backward safe-corner
-        # target between steps so we can reward (prev_dist − curr_dist).
-        # Reset to current target on corner crossings so the discontinuity
-        # does not produce a spurious progress reward.
-        self._prev_dense_target = np.full(2, np.nan, dtype=np.float32)
-        self._prev_dense_target_dist = np.inf
-        # Sticky "ball entered the corner basin once this episode" flag —
-        # drives the phased dense reward (approach vs stabilize).
-        self._dense_arrived = False
-        # Path-segment index of the frozen dense target. Used by the dense
-        # obs to expose `vec_to_next_wp_toward_target`. -1 = not set.
-        self._prior_target_seg_idx = -1
-        self._stable_steps_max = 0
-        self._ep_inside_checkpoint_steps = 0
-        self._reward_terms: dict[str, float] = {}
-        # Per-episode running sums for parity with GPU progress_fn metrics.
-        self._ep_quiet_steps = 0
-        self._ep_ball_speed_sum = 0.0
-        self._ep_safe_hole_margin_sum = 0.0
+        self._ball_vel = np.zeros(2, dtype=np.float32)
+        self._ball_speed = 0.0
+        self._min_hole_distance = np.inf
+        self._recovered = False
 
-    def _sample_spawn_idx(self) -> int:
-        """Pick a uniform random spawn index from the prior_start_points bank."""
-        n = len(self.prior_start_points)
-        return int(self.np_random.integers(0, n))
+    # ── helpers ────────────────────────────────────────────────────────────
 
-    def get_num_spawns(self) -> int:
-        return int(len(self.prior_start_points))
+    def _compute_min_hole_distance(self, ball_pos: np.ndarray) -> float:
+        return float(np.linalg.norm(self.holes - ball_pos, axis=1).min())
 
-    def get_spawn_points(self) -> np.ndarray:
-        return np.asarray(self.prior_start_points, dtype=np.float32).copy()
+    def _check_recovery(self) -> bool:
+        """True when the ball is slow and safely away from every hole."""
+        hole_safe = self._min_hole_distance > HOLE_RADIUS + self.recovery_hole_margin_factor * MARBLE_RADIUS
+        speed_ok = self._ball_speed < self.recovery_speed_threshold
+        return hole_safe and speed_ok
 
-    def _build_prior_start_points(self) -> np.ndarray:
-        """Recoverable start states for prior-mode resets."""
-        if self.prior_spawn_source == "waypoints":
-            candidates = np.asarray(self.waypoints, dtype=np.float32)
-        else:
-            spacing = float(self.prior_start_point_spacing)
-            samples = [self.waypoints[0]]
-            for i in range(len(self.waypoints) - 1):
-                start = self.waypoints[i]
-                end = self.waypoints[i + 1]
-                seg = end - start
-                seg_len = float(np.linalg.norm(seg))
-                if seg_len < 1e-8:
-                    continue
-                num = max(1, int(np.ceil(seg_len / spacing)))
-                ts = np.linspace(0.0, 1.0, num + 1, endpoint=False)[1:]
-                for t in ts:
-                    samples.append((1.0 - t) * start + t * end)
-            samples.append(self.waypoints[-1])
-            candidates = np.asarray(samples, dtype=np.float32)
+    def _sample_safe_position(self) -> np.ndarray:
+        """Uniformly sample a board position that is hole-safe for spawning."""
+        margin = MARBLE_RADIUS + HOLE_RADIUS
+        for _ in range(1000):
+            x = self.np_random.uniform(MARBLE_RADIUS, BOARD_WIDTH - MARBLE_RADIUS)
+            y = self.np_random.uniform(MARBLE_RADIUS, BOARD_HEIGHT - MARBLE_RADIUS)
+            candidate = np.array([x, y], dtype=np.float32)
+            if np.linalg.norm(self.holes - candidate, axis=1).min() > margin:
+                return candidate
+        return self.waypoints[0].astype(np.float32)
 
-        if len(self.checkpoint_points) == 0:
-            return candidates
-
-        min_hole_dists = np.linalg.norm(candidates[:, None, :] - self.holes[None, :, :], axis=2).min(axis=1)
-        safe_mask = min_hole_dists > (HOLE_RADIUS + self.prior_spawn_min_hole_margin)
-        if self.prior_task == "checkpoint":
-            dists = np.linalg.norm(candidates[:, None, :] - self.checkpoint_points[None, :, :], axis=2)
-            nearest_dists = dists.min(axis=1)
-            safe_mask &= (
-                (nearest_dists >= self.prior_min_checkpoint_start_dist)
-                & (nearest_dists <= self.prior_max_checkpoint_start_dist)
-            )
-        filtered = candidates[safe_mask]
-        if not len(filtered):
-            return candidates
-
-        merge_radius = float(self.prior_spawn_merge_radius)
-        if merge_radius <= 0.0 or len(filtered) <= 1:
-            return filtered
-
-        _, progresses = _project_points_to_path(filtered, self.waypoints)
-        order = np.argsort(progresses)
-        kept: list[np.ndarray] = []
-        merge_radius_sq = merge_radius * merge_radius
-        for idx in order:
-            point = filtered[idx]
-            if any(np.sum((point - prev) ** 2) < merge_radius_sq for prev in kept):
-                continue
-            kept.append(point)
-        return np.asarray(kept, dtype=np.float32)
+    # ── gym API ──────────────────────────────────────────────────────────────
 
     def reset(
         self, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[np.ndarray, dict[str, Any]]:
         super().reset(seed=seed)
-        options = options or {}
 
         # Reset MuJoCo
         mujoco.mj_resetData(self.model, self.data)
 
         # Set initial marble position
-        if self.prior_mode and "spawn_point" in options:
-            init_pos = np.asarray(options["spawn_point"], dtype=np.float32)
-            dists = np.linalg.norm(self.checkpoint_points - init_pos[None], axis=1)
-            self._active_checkpoint_idx = int(np.argmin(dists))
-        elif self.prior_mode and self.prior_task != "checkpoint":
-            # Stabilize-task path (used by `dense` / `checkpoint_recovery`):
-            # the spawn bank is already filtered for hole-safety at build time,
-            # so a single uniform sample suffices.
-            idx = self._sample_spawn_idx()
-            init_pos = self.prior_start_points[idx]
-            dists = np.linalg.norm(self.checkpoint_points - init_pos[None], axis=1)
-            self._active_checkpoint_idx = int(np.argmin(dists))
-        elif self.prior_mode:
-            # Legacy checkpoint-task path: keep the permutation+retry logic so
-            # the per-candidate distance/safety filter still gates the choice.
-            sampled_points = self.prior_start_points[self.np_random.permutation(len(self.prior_start_points))]
-            init_pos = None
-            chosen_checkpoint_idx = None
-
-            for candidate_pos in sampled_points:
-                dists = np.linalg.norm(self.checkpoint_points - candidate_pos[None], axis=1)
-                nearest_idx = int(np.argmin(dists))
-                nearest_dist = float(dists[nearest_idx])
-                min_hole_dist = self._compute_min_hole_distance(candidate_pos)
-                recoverable_from_holes = (
-                    min_hole_dist > (HOLE_RADIUS + self.prior_spawn_min_hole_margin)
-                )
-                if (
-                    self.prior_min_checkpoint_start_dist <= nearest_dist <= self.prior_max_checkpoint_start_dist
-                    and recoverable_from_holes
-                ):
-                    init_pos = candidate_pos
-                    chosen_checkpoint_idx = nearest_idx
-                    break
-
-            if init_pos is None:
-                safe_candidates = []
-                for candidate_pos in sampled_points:
-                    min_hole_dist = self._compute_min_hole_distance(candidate_pos)
-                    if min_hole_dist > (HOLE_RADIUS + self.prior_spawn_min_hole_margin):
-                        safe_candidates.append(candidate_pos)
-                init_pos = safe_candidates[0] if safe_candidates else sampled_points[0]
-                dists = np.linalg.norm(self.checkpoint_points - init_pos[None], axis=1)
-                chosen_checkpoint_idx = int(np.argmin(dists))
-
-            self._active_checkpoint_idx = int(chosen_checkpoint_idx)
+        if self.prior_mode:
+            init_pos = self._sample_safe_position()
         elif self.randomize_init_pos:
             idx = self.np_random.integers(0, len(self.waypoints))
             init_pos = self.waypoints[idx]
@@ -1587,24 +1242,24 @@ class CyberRunnerEnv(gym.Env):
         self.data.qpos[4] = 0.0793  # Height above board
         self.data.qpos[5:9] = [1, 0, 0, 0]  # Identity quaternion
 
-        # Prior-mode handoff randomization: initial tilt + marble velocity so the
-        # prior is trained on states it will actually see when the main policy
-        # hands over control (fast-moving ball, non-zero board tilt).
+        # Prior branch: random handoff state — flat board, random ball velocity,
+        # rejecting states that already satisfy the recovery condition so the
+        # policy never gets unearned credit for a state it didn't stabilize.
         if self.prior_mode:
-            tilt_frac = float(self.prior_init_tilt_frac)
-            if tilt_frac > 0.0:
-                self.data.qpos[0] = self.np_random.uniform(
-                    RANGE_ALPHA[0] * tilt_frac, RANGE_ALPHA[1] * tilt_frac
-                )
-                self.data.qpos[1] = self.np_random.uniform(
-                    RANGE_BETA[0] * tilt_frac, RANGE_BETA[1] * tilt_frac
-                )
-            v_max = float(self.prior_init_ball_speed)
-            if v_max > 0.0:
+            self.data.qpos[0] = 0.0
+            self.data.qpos[1] = 0.0
+            self._min_hole_distance = self._compute_min_hole_distance(init_pos)
+            for _ in range(200):
                 theta = self.np_random.uniform(0.0, 2 * np.pi)
-                speed = self.np_random.uniform(0.0, v_max)
+                speed = self.np_random.uniform(0.0, self.prior_init_max_speed)
                 self.data.qvel[2] = speed * np.cos(theta)
                 self.data.qvel[3] = speed * np.sin(theta)
+                already_recovered = (
+                    self._min_hole_distance > HOLE_RADIUS + self.recovery_hole_margin_factor * MARBLE_RADIUS
+                    and speed < self.recovery_speed_threshold
+                )
+                if not already_recovered:
+                    break
 
         # Forward dynamics
         mujoco.mj_forward(self.model, self.data)
@@ -1617,99 +1272,34 @@ class CyberRunnerEnv(gym.Env):
 
         # Reset episode state
         self._step_count = 0
-        self._max_checkpoint_reached = 0
-        if not self.prior_mode:
-            self._active_checkpoint_idx = 0
-        self._stable_steps = 0
-        self._in_checkpoint_prev = False
-        self._success = False
-        self._ep_quiet_steps = 0
-        self._ep_ball_speed_sum = 0.0
-        self._ep_safe_hole_margin_sum = 0.0
-        self._prev_action = np.zeros(2, dtype=np.float32)
-        self._prev_action_for_obs = np.zeros(2, dtype=np.float32)
-        self._prev_target_dist = np.inf
-        self._target_dist_min = np.inf
-        self._prev_dense_target = np.full(2, np.nan, dtype=np.float32)
-        self._prev_dense_target_dist = np.inf
-        # Sticky "ball entered the corner basin once this episode" flag —
-        # drives the phased dense reward (approach vs stabilize).
-        self._dense_arrived = False
-        # Path-segment index of the frozen dense target. Used by the dense
-        # obs to expose `vec_to_next_wp_toward_target`. -1 = not set.
-        self._prior_target_seg_idx = -1
-        self._stable_steps_max = 0
-        self._ep_inside_checkpoint_steps = 0
-        self._reward_terms = {
-            "reward_progress": 0.0,
-            "reward_basin": 0.0,
-            "reward_quiet": 0.0,
-            "reward_hold": 0.0,
-            "reward_action": 0.0,
-            "reward_action_delta": 0.0,
-            "reward_tilt": 0.0,
-            "reward_hole": 0.0,
-        }
+        self._recovered = False
         ball_pos = self._get_ball_pos_board_frame()
         self._prev_ball_pos = ball_pos.copy()
-        ball_noise = self.np_random.uniform(-BALL_POS_NOISE, BALL_POS_NOISE, size=2)
-        ball_pos_noisy = ball_pos + self._obs_bias["ball"] + ball_noise
-        self._prev_ball_pos_noisy = ball_pos_noisy.astype(np.float32)
-        self._ball_speed = 0.0
-        self._ball_speed_true = 0.0
+        self._ball_vel = np.array([self.data.qvel[2], self.data.qvel[3]], dtype=np.float32)
+        self._ball_speed = float(np.linalg.norm(self._ball_vel))
         self._min_hole_distance = self._compute_min_hole_distance(ball_pos)
-        active_checkpoint = self._get_active_checkpoint_waypoint()
-        self._prev_checkpoint_dist = (
-            float(np.linalg.norm(ball_pos - active_checkpoint))
-            if active_checkpoint is not None
-            else np.inf
-        )
         self._prev_progress, self._seg_idx, _, self._closest_point = compute_path_progress(
             ball_pos, self.waypoints, self.seg_lengths, self.cum_distances, self.walls_h, self.walls_v, self.holes
         )
         self._path_detected = self._prev_progress >= 0
 
-        # Prior stabilize target: nearest strict corner at-or-behind the ball's
-        # spawn progress. Forward targets would let the prior advance the
-        # frontier (i.e. do exploration), which SOOPER reserves for Dreamer.
-        if self.prior_mode and self.prior_task == "stabilize":
-            ball_progress = float(self._prev_progress) if self._prev_progress >= 0 else 0.0
-            eps = 0.005  # float tolerance for "at current progress"
-            backward_mask = self._corner_progresses <= (ball_progress + eps)
-            if backward_mask.any():
-                candidates = self._corner_points[backward_mask]
-                candidate_progresses = self._corner_progresses[backward_mask]
-                progress_gap = ball_progress - candidate_progresses
-            else:
-                candidates = self._corner_points
-                progress_gap = np.abs(self._corner_progresses - ball_progress)
-            self._prior_target = candidates[int(np.argmin(progress_gap))].astype(np.float32)
-            # Cache the target's path segment index so the dense obs can
-            # expose the next waypoint along the polyline going toward it.
-            _, _, target_seg_idx = _project_points_to_path(
-                self._prior_target[None, :], self.waypoints, return_seg_idx=True,
-            )
-            self._prior_target_seg_idx = int(target_seg_idx[0])
-            self._prior_phi_prev = float(
-                -5.0 * float(np.linalg.norm(ball_pos - self._prior_target))
-                - 0.5 * self._ball_speed
-            )
-            self._prev_target_dist = float(np.linalg.norm(ball_pos - self._prior_target))
-            self._target_dist_min = self._prev_target_dist
-        else:
-            self._prior_target = np.zeros(2, dtype=np.float32)
-            self._prior_target_seg_idx = -1
-            self._prior_phi_prev = 0.0
+        # Initialise the frame stack: fill it with the first base observation
+        # and zero actions (no action has been taken yet).
+        base_obs = self._get_base_obs()
+        if self.obs_n_stack > 1:
+            frame0 = np.concatenate(
+                [base_obs[:self._stack_obs_dim], np.zeros(self._action_dim, dtype=np.float32)]
+            ).astype(np.float32)
+            self._frames = [frame0.copy() for _ in range(self.obs_n_stack)]
 
-        obs = self._get_obs()
-        info = self._build_info(ball_pos, self._prev_progress)
+        obs = self._stacked_obs(base_obs)
+        info = {"path_progress": self._prev_progress}
 
         return obs, info
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         # Apply action
         action_clipped = np.clip(action, -1.0, 1.0).astype(np.float32)
-        prev_action = self._prev_action.copy()
         self.data.ctrl[:] = action_clipped
 
         # Step physics
@@ -1721,14 +1311,9 @@ class CyberRunnerEnv(gym.Env):
         # Get ball state
         ball_pos = self._get_ball_pos_board_frame()
         dt = TIMESTEP * FRAME_SKIP
-        self._ball_speed_true = float(np.linalg.norm(ball_pos - self._prev_ball_pos) / max(dt, 1e-8))
+        self._ball_vel = ((ball_pos - self._prev_ball_pos) / max(dt, 1e-8)).astype(np.float32)
+        self._ball_speed = float(np.linalg.norm(self._ball_vel))
         self._prev_ball_pos = ball_pos.copy()
-        ball_noise = self.np_random.uniform(-BALL_POS_NOISE, BALL_POS_NOISE, size=2)
-        ball_pos_noisy = ball_pos + self._obs_bias["ball"] + ball_noise
-        obs_ball_speed = float(np.linalg.norm(ball_pos_noisy - self._prev_ball_pos_noisy) / max(dt, 1e-8))
-        self._prev_ball_pos_noisy = ball_pos_noisy.astype(np.float32)
-        alpha = self.checkpoint_speed_ema_alpha
-        self._ball_speed = float(alpha * self._ball_speed + (1.0 - alpha) * obs_ball_speed)
         self._min_hole_distance = self._compute_min_hole_distance(ball_pos)
 
         # Compute path progress and get segment info
@@ -1738,126 +1323,37 @@ class CyberRunnerEnv(gym.Env):
         self._path_detected = curr_progress >= 0
 
         # Compute reward
-        reward = self._compute_reward(
-            ball_pos, curr_progress, self._seg_idx,
-            action_clipped, prev_action, ball_pos_noisy.astype(np.float32),
-        )
+        reward = self._compute_reward(ball_pos, curr_progress, self._seg_idx)
 
         # Check termination
         terminated, truncated, info = self._check_termination(ball_pos)
 
-        # Survival bonus: ball survived the full episode without falling in
-        # a hole (timeout truncation, no in-hole termination). Only paid for
-        # the legacy survival reward — dense and checkpoint_recovery
-        # already provide dense per-step shaping, so the +100 lump sum would
-        # only destabilize VecNormalize.
-        if (
-            self.prior_mode and self.prior_task == "stabilize"
-            and self.prior_reward_mode == PRIOR_VERSION_LEGACY
-            and truncated and not terminated
-        ):
-            reward += self.prior_survival_bonus
-            info["termination_reason"] = "survived"
-
         # Update state
         if curr_progress >= 0:
             self._prev_progress = curr_progress
-        self._prev_action = action_clipped.copy()
-        self._prev_action_for_obs = action_clipped.copy()
 
-        obs = self._get_obs()
-        info.update(self._build_info(ball_pos, curr_progress))
+        # Push the new (angle+ball_pos, executed action) frame and build the stack.
+        base_obs = self._get_base_obs()
+        if self.obs_n_stack > 1:
+            frame = np.concatenate(
+                [base_obs[:self._stack_obs_dim], action_clipped]
+            ).astype(np.float32)
+            self._frames.append(frame)
+            del self._frames[:-self.obs_n_stack]
+        obs = self._stacked_obs(base_obs)
+        info["path_progress"] = curr_progress
 
         return obs, reward, terminated, truncated, info
 
-    def _compute_min_hole_distance(self, ball_pos: np.ndarray) -> float:
-        hole_distances = np.linalg.norm(self.holes - ball_pos, axis=1)
-        return float(np.min(hole_distances))
-
-    def _min_wall_distance(self, ball_pos: np.ndarray) -> float:
-        """Closest distance from ball center to any wall segment or board edge."""
-        wall_d = float(_point_to_segment_distance(ball_pos[None, :], self._wall_starts, self._wall_ends).min())
-        edge_d = float(min(ball_pos[0], BOARD_WIDTH - ball_pos[0],
-                           ball_pos[1], BOARD_HEIGHT - ball_pos[1])) + WALL_RADIUS
-        return min(wall_d, edge_d)
-
-    def _get_active_checkpoint_waypoint(self) -> np.ndarray | None:
-        if self._active_checkpoint_idx >= len(self.checkpoint_points):
-            return None
-        return self.checkpoint_points[self._active_checkpoint_idx]
-
-    def _first_backward_safe_corner(self, ball_progress: float) -> np.ndarray:
-        """Return the safe corner with the largest path-progress ≤ ball_progress.
-
-        Falls back to the corner closest to ``ball_progress`` (forward) if no
-        backward corner exists. Used as the prior's stabilization target.
-        """
-        if len(self._corner_points) == 0:
-            return np.zeros(2, dtype=np.float32)
-        bp = float(ball_progress) if ball_progress >= 0 else 0.0
-        eps = 0.005
-        backward_mask = self._corner_progresses <= (bp + eps)
-        if backward_mask.any():
-            cands = self._corner_points[backward_mask]
-            cprog = self._corner_progresses[backward_mask]
-            return cands[int(np.argmax(cprog))].astype(np.float32)
-        # No backward corner — pick the closest forward one.
-        gaps = np.abs(self._corner_progresses - bp)
-        return self._corner_points[int(np.argmin(gaps))].astype(np.float32)
-
-    def _build_info(self, ball_pos: np.ndarray, curr_progress: float) -> dict[str, Any]:
-        active_checkpoint = self._get_active_checkpoint_waypoint()
-        checkpoint_dist = (
-            float(np.linalg.norm(ball_pos - active_checkpoint))
-            if active_checkpoint is not None
-            else np.inf
-        )
-        if self.prior_mode and self.prior_task == "stabilize":
-            prior_target_dist = float(np.linalg.norm(ball_pos - self._prior_target))
-        else:
-            prior_target_dist = float("nan")
-        inside_frac = float(self._ep_inside_checkpoint_steps / max(self._step_count, 1))
-        observed_speed_mean = float(self._ep_ball_speed_sum / max(self._step_count, 1))
-        return {
-            "path_progress": float(curr_progress),
-            "checkpoint_dist": checkpoint_dist,
-            "ball_speed": float(self._ball_speed),
-            "observed_speed": float(self._ball_speed),
-            "quiet_threshold_speed": float(self.prior_recovery_quiet_threshold_speed),
-            "ball_speed_true": float(self._ball_speed_true),
-            "min_hole_distance": float(self._min_hole_distance),
-            "safe_hole_margin": float(self._min_hole_distance - HOLE_RADIUS),
-            "active_checkpoint_idx": int(self._active_checkpoint_idx),
-            "unlocked_checkpoint_idx": int(self._max_checkpoint_reached),
-            "stable_steps": int(self._stable_steps),
-            "stable_steps_final": int(self._stable_steps),
-            "stable_steps_max": int(self._stable_steps_max),
-            "success": float(self._success),
-            "quiet_steps": int(self._ep_quiet_steps),
-            "quiet_frac": float(self._ep_quiet_steps / max(self._step_count, 1)),
-            "mean_observed_speed": observed_speed_mean,
-            "checkpoint_dist_final": prior_target_dist,
-            "checkpoint_dist_min": float(self._target_dist_min),
-            "inside_checkpoint_frac": inside_frac,
-            "prior_target_dist": prior_target_dist,
-            **self._reward_terms,
-            # Episode running sums (read on episode-end by WandbCallback).
-            "ep_quiet_steps": int(self._ep_quiet_steps),
-            "ep_ball_speed_sum": float(self._ep_ball_speed_sum),
-            "ep_safe_hole_margin_sum": float(self._ep_safe_hole_margin_sum),
-            "log_path_progress": np.array([curr_progress], dtype=np.float32),
-            "log_checkpoint_dist": np.array([checkpoint_dist], dtype=np.float32),
-            "log_ball_speed": np.array([self._ball_speed], dtype=np.float32),
-            "log_observed_speed": np.array([self._ball_speed], dtype=np.float32),
-            "log_ball_speed_true": np.array([self._ball_speed_true], dtype=np.float32),
-            "log_min_hole_distance": np.array([self._min_hole_distance], dtype=np.float32),
-            "log_safe_hole_margin": np.array([self._min_hole_distance - HOLE_RADIUS], dtype=np.float32),
-            "log_active_checkpoint_idx": np.array([self._active_checkpoint_idx], dtype=np.float32),
-            "log_unlocked_checkpoint_idx": np.array([self._max_checkpoint_reached], dtype=np.float32),
-            "log_stable_steps": np.array([self._stable_steps], dtype=np.float32),
-            "log_success": np.array([float(self._success)], dtype=np.float32),
-            "log_prior_target_dist": np.array([prior_target_dist], dtype=np.float32),
-        }
+    def _stacked_obs(self, base_obs: np.ndarray) -> np.ndarray:
+        """Return the observation. Without stacking, the plain base obs. With
+        stacking, the last ``obs_n_stack`` (angle+ball_pos, action) frames
+        concatenated newest-first, followed by the newest path-direction
+        vectors (kept once, not stacked)."""
+        if self.obs_n_stack <= 1:
+            return base_obs
+        path = base_obs[self._stack_obs_dim:]
+        return np.concatenate(self._frames[::-1] + [path]).astype(np.float32)
 
     def _get_ball_pos_board_frame(self) -> np.ndarray:
         """Get ball position in board frame."""
@@ -1872,475 +1368,79 @@ class CyberRunnerEnv(gym.Env):
 
         return pos_board[:2].astype(np.float32)
 
-    def _get_obs(self) -> dict[str, np.ndarray]:
-        """Get observation with noise.
-
-        Returns dict with:
-            "states" (10-dim, all NOISY — sensor model for sim-to-real):
-                [0:2] Joint angles (α, β) + per-episode bias + per-step noise
-                [2:4] Ball position (x, y) + per-episode bias + per-step noise
-                [4:6] Vector from noisy ball pos to closest visible path point
-                [6:8] Vector from noisy ball pos to next waypoint
-                [8:10] Vector from noisy ball pos to waypoint after next
-            "checkpoint" (3-dim):
-                [vec_x, vec_y, distance] to the FIRST safe-corner BACKWARD
-                in the maze path from the ball's current progress.
-            "image" (64x64x3, only if include_vision):
-                Cropped board image centered on ball
-        """
-        # Per-step sensor noise
+    def _get_base_obs(self) -> np.ndarray:
+        """Get the 10-dim noisy base observation (see class docstring)."""
+        # Per-step noise
         ball_noise = self.np_random.uniform(-BALL_POS_NOISE, BALL_POS_NOISE, size=2)
         joint_noise = self.np_random.uniform(-JOINT_ANGLE_NOISE, JOINT_ANGLE_NOISE, size=2)
 
-        # Noisy joint angles and ball position
+        # Joint angles with bias + noise
         joint_pos = self.data.qpos[:2] + self._obs_bias["joint"] + joint_noise
-        ball_pos = self._get_ball_pos_board_frame()
-        ball_pos_noisy = (ball_pos + self._obs_bias["ball"] + ball_noise).astype(np.float32)
 
-        # Vec to closest path point (uses geometry from CLEAN ball pos via
-        # self._closest_point, then offsets from NOISY ball — matches old).
+        # Ball position with bias + noise
+        ball_pos = self._get_ball_pos_board_frame()
+        ball_pos_noisy = ball_pos + self._obs_bias["ball"] + ball_noise
+
+        # Vector to closest visible path point
         vec_to_closest = self._closest_point - ball_pos_noisy
-        # Next two waypoints in path order.
+
+        # Vectors to next two waypoints
         num_waypoints = len(self.waypoints)
-        next_idx = min(self._seg_idx + 1, num_waypoints - 1)
-        next_next_idx = min(self._seg_idx + 2, num_waypoints - 1)
-        vec_to_next_wp = self.waypoints[next_idx] - ball_pos_noisy
-        vec_to_next_next_wp = self.waypoints[next_next_idx] - ball_pos_noisy
+        next_wp_idx = min(self._seg_idx + 1, num_waypoints - 1)
+        next_next_wp_idx = min(self._seg_idx + 2, num_waypoints - 1)
+
+        vec_to_next_wp = self.waypoints[next_wp_idx] - ball_pos_noisy
+        vec_to_next_next_wp = self.waypoints[next_next_wp_idx] - ball_pos_noisy
+
         if not self._path_detected:
             vec_to_closest = np.zeros(2, dtype=np.float32)
             vec_to_next_wp = np.zeros(2, dtype=np.float32)
             vec_to_next_next_wp = np.zeros(2, dtype=np.float32)
 
-        # First safe corner BACKWARD in the path.
-        # For the dense prior the target is FROZEN at reset (`_prior_target`)
-        # so the obs and reward agree on a stable goal across the episode;
-        # other modes recompute it every step from the ball's current progress.
-        if (
-            self.prior_obs_mode == PRIOR_VERSION_DENSE
-            and np.all(np.isfinite(self._prior_target))
-            and not np.allclose(self._prior_target, 0.0)
-        ):
-            backward_corner = self._prior_target
-        else:
-            backward_corner = self._first_backward_safe_corner(self._prev_progress)
-        ckpt_vec = backward_corner - ball_pos_noisy
-        ckpt_dist = float(np.linalg.norm(ckpt_vec))
+        return np.concatenate(
+            [joint_pos, ball_pos_noisy, vec_to_closest, vec_to_next_wp, vec_to_next_next_wp]
+        ).astype(np.float32)
 
-        if (
-            self.prior_mode
-            and self.prior_task == "stabilize"
-            and self.prior_obs_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY
-        ):
-            target = self._prior_target
-            if not np.isfinite(target).all() or np.allclose(target, 0.0):
-                target = backward_corner
-            target_vec = target - ball_pos_noisy
-            target_dist = float(np.linalg.norm(target_vec))
-            inside_checkpoint = float(target_dist < self.checkpoint_radius)
-            obs = {
-                "prior_state": np.array(
-                    [
-                        joint_pos[0], joint_pos[1],
-                        ball_pos_noisy[0], ball_pos_noisy[1],
-                        target_vec[0], target_vec[1], target_dist,
-                        vec_to_closest[0], vec_to_closest[1],
-                        self._prev_action_for_obs[0], self._prev_action_for_obs[1],
-                        inside_checkpoint,
-                    ],
-                    dtype=np.float32,
-                )
-            }
-            if self.include_vision:
-                ball_board = self._get_ball_pos_board_frame()
-                cam_local = np.array([ball_board[0], ball_board[1], 0.4])
-                board_pos = self.data.xpos[self.board_body_id]
-                board_mat = self.data.xmat[self.board_body_id].reshape(3, 3)
-                self.data.cam_xpos[self.vision_cam_id] = board_pos + board_mat @ cam_local
-                self.vision_renderer.update_scene(self.data, camera="vision_cam", scene_option=self.vision_vopt)
-                obs["image"] = self.vision_renderer.render()
-            return obs
+    def _compute_reward(self, ball_pos: np.ndarray, curr_progress: float, seg_idx: int) -> float:
+        if self.prior_mode:
+            # Recovery task: binary reward — 1.0 the moment the ball reaches a
+            # slow, hole-safe state. With gamma=1.0, V(s) then estimates the
+            # probability of recovering within the episode.
+            if self._check_recovery():
+                self._recovered = True
+                return 1.0
+            return 0.0
 
-        if self.prior_obs_mode == PRIOR_VERSION_DENSE:
-            # Next waypoint along the path going BACKWARD toward the frozen
-            # safe-corner target. Path is start→goal ordered, target's
-            # progress ≤ ball's progress, so the next backward path step is
-            # the start of the segment the ball is currently on.
-            #   seg_idx > target_seg_idx  →  next = waypoints[seg_idx]
-            #   seg_idx == target_seg_idx →  next = target itself (final hop)
-            #   seg_idx < target_seg_idx  →  next = waypoints[seg_idx+1]
-            #     (rare: ball drifted past target, must come back forward)
-            tgt_seg = self._prior_target_seg_idx
-            num_wp = len(self.waypoints)
-            if tgt_seg < 0 or not self._path_detected:
-                next_wp_toward_target = ball_pos_noisy  # zero vector after subtract
-            elif self._seg_idx > tgt_seg:
-                next_wp_toward_target = self.waypoints[self._seg_idx]
-            elif self._seg_idx < tgt_seg:
-                next_wp_toward_target = self.waypoints[
-                    min(self._seg_idx + 1, num_wp - 1)
-                ]
-            else:
-                next_wp_toward_target = self._prior_target
-            vec_to_next_wp_to_target = (
-                next_wp_toward_target - ball_pos_noisy
-            ).astype(np.float32)
-            states = np.concatenate(
-                [joint_pos, ball_pos_noisy, vec_to_closest,
-                 vec_to_next_wp_to_target]
-            ).astype(np.float32)
-        else:
-            states = np.concatenate(
-                [joint_pos, ball_pos_noisy,
-                 vec_to_closest, vec_to_next_wp, vec_to_next_next_wp]
-            ).astype(np.float32)
-
-        obs = {
-            "states": states,
-            "checkpoint": np.array(
-                [ckpt_vec[0], ckpt_vec[1], ckpt_dist], dtype=np.float32,
-            ),
-        }
-
-        if self.include_vision:
-            # Move vision camera above the ball (in board frame)
-            ball_board = self._get_ball_pos_board_frame()
-            cam_local = np.array([ball_board[0], ball_board[1], 0.4])
-            board_pos = self.data.xpos[self.board_body_id]
-            board_mat = self.data.xmat[self.board_body_id].reshape(3, 3)
-            self.data.cam_xpos[self.vision_cam_id] = board_pos + board_mat @ cam_local
-            # Render directly at 64x64
-            self.vision_renderer.update_scene(self.data, camera="vision_cam", scene_option=self.vision_vopt)
-            obs["image"] = self.vision_renderer.render()
-
-        return obs
-
-    def _compute_reward(
-        self,
-        ball_pos: np.ndarray,
-        curr_progress: float,
-        seg_idx: int,
-        action: np.ndarray | None = None,
-        prev_action: np.ndarray | None = None,
-        ball_pos_observed: np.ndarray | None = None,
-    ) -> float:
-        """Stabilized frontier checkpoints + goal bonus + hole penalty."""
-        if self.prior_mode and self.prior_task == "stabilize":
-            if self.prior_reward_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
-                return self._compute_checkpoint_recovery_reward(ball_pos, action, prev_action, ball_pos_observed)
-            if self.prior_reward_mode == PRIOR_VERSION_DENSE:
-                return self._compute_dense_reward(ball_pos, curr_progress, seg_idx)
-            # Survival-shaped reward. Goal: ball stays alive on the board for
-            # the full 500-step episode without falling into a hole.
-            #   quiet = exp(-(speed / v_ref)²)   ∈ [0, 1]   (low velocity good)
-            #   r = w_quiet · quiet − k_a · ‖action‖² − P_hole · 1[in_hole]
-            # Distance to holes is NOT in the reward — if the ball stabilizes
-            # anywhere safe (including near a hole edge), that is fine.
-            v_ref = 0.03
-            w_quiet = 1.0
-            k_a = 0.005
-
-            quiet = float(np.exp(-(self._ball_speed / v_ref) ** 2))
-            action = np.asarray(self.data.ctrl, dtype=np.float32)
-            r_action = -k_a * float(np.dot(action, action))
-
-            # Stable-step counter on the quiet criterion (no hole-margin gate).
-            in_quiet = quiet > 0.5
-            if in_quiet:
-                self._stable_steps += 1
-                self._ep_quiet_steps += 1
-            else:
-                self._stable_steps = 0
-            if self._stable_steps >= self.checkpoint_hold_steps:
-                self._success = True
-            self._stable_steps_max = max(self._stable_steps_max, self._stable_steps)
-            # Per-episode running sums for parity-aligned wandb metrics.
-            self._ep_ball_speed_sum += float(self._ball_speed)
-            self._ep_safe_hole_margin_sum += max(
-                0.0, float(self._min_hole_distance - HOLE_RADIUS)
+        # Main task: dense signed path-progress shaping + goal bonus + hole
+        # penalty. progress is the (×10-scaled) arc length along the path; the
+        # step delta rewards forward motion and penalizes backward motion.
+        if curr_progress >= 0 and self._prev_progress >= 0:
+            progress_reward = (
+                (float(curr_progress) - float(self._prev_progress)) * self.dense_main_progress_scale
             )
-
-            hole_reward = -self.hole_penalty if self._min_hole_distance < HOLE_RADIUS else 0.0
-            self._in_checkpoint_prev = False
-            self._prev_checkpoint_dist = np.inf
-            return w_quiet * quiet + r_action + hole_reward
-
-        checkpoint_reward = 0.0
-        active_checkpoint = self._get_active_checkpoint_waypoint()
-        in_checkpoint = False
-
-        if active_checkpoint is not None and curr_progress >= 0:
-            checkpoint_dist = float(np.linalg.norm(ball_pos - active_checkpoint))
-            if self.prior_mode:
-                # Asymmetric shaping: reward progress toward, don't penalize moving away
-                # (avoids the "stop anywhere" local optimum).
-                if np.isfinite(self._prev_checkpoint_dist):
-                    progress_delta = self._prev_checkpoint_dist - checkpoint_dist
-                    checkpoint_reward += self.checkpoint_progress_reward_scale * max(progress_delta, 0.0)
-                # Dense distance penalty: always pay for being far → "stop at checkpoint"
-                # is strictly better than "stop anywhere else".
-                checkpoint_reward -= 0.1 * checkpoint_dist
-            in_checkpoint = checkpoint_dist < self.checkpoint_radius
-            # Wall-contact is only relevant once the ball is actually inside the
-            # checkpoint basin. Avoid the expensive wall-distance query elsewhere.
-            touching_wall = False
-            if in_checkpoint:
-                wall_contact_dist = self._min_wall_distance(ball_pos)
-                touching_wall = wall_contact_dist < (WALL_RADIUS + MARBLE_RADIUS + 0.002)
-            stable_here = (
-                in_checkpoint
-                and touching_wall
-                and self._ball_speed < self.checkpoint_speed_threshold
-                and self._min_hole_distance > (HOLE_RADIUS + self.safe_hole_margin)
-            )
-            if in_checkpoint and not self._in_checkpoint_prev and not self.prior_mode:
-                checkpoint_reward += self.checkpoint_arrival_reward
-            if stable_here:
-                self._stable_steps += 1
-                # Hold reward scaled by closeness to center (1.0 at center, ~0.5 at edge)
-                closeness = 1.0 - 0.5 * (checkpoint_dist / self.checkpoint_radius)
-                checkpoint_reward += self.checkpoint_hold_reward * closeness
-            else:
-                self._stable_steps = 0
-
-            if self._stable_steps >= self.checkpoint_hold_steps:
-                checkpoint_reward += self.checkpoint_stabilize_reward
-                self._success = True
-                if not self.prior_mode:
-                    self._max_checkpoint_reached += 1
-                    self._active_checkpoint_idx += 1
-                self._stable_steps = 0
-                in_checkpoint = False
         else:
-            self._stable_steps = 0
-
-        self._in_checkpoint_prev = in_checkpoint
-        if active_checkpoint is not None:
-            self._prev_checkpoint_dist = float(np.linalg.norm(ball_pos - active_checkpoint))
+            progress_reward = 0.0
 
         dist_to_goal = np.linalg.norm(ball_pos - self.goal_pos)
-        goal_reward = 0.0 if self.prior_mode else (GOAL_BONUS if dist_to_goal < GOAL_THRESHOLD else 0.0)
+        goal_reward = GOAL_BONUS if dist_to_goal < GOAL_THRESHOLD else 0.0
 
-        hole_reward = -self.hole_penalty if self._min_hole_distance < HOLE_RADIUS else 0.0
+        hole_distances = np.linalg.norm(self.holes - ball_pos, axis=1)
+        hole_reward = -self.hole_penalty if np.any(hole_distances < HOLE_RADIUS) else 0.0
 
-        return checkpoint_reward + goal_reward + hole_reward
-
-    def _compute_dense_reward(
-        self, ball_pos: np.ndarray, curr_progress: float, seg_idx: int,
-    ) -> float:
-        """Single-phase dense reward for the stabilize prior.
-
-            r = s_p · (prev_d − d)
-                + arrival_bonus · 1[fresh arrival]
-                − hole_penalty · 1[in_hole]
-
-        ``d`` is **path-aware** (not raw Euclidean). The straight-line metric
-        was telling the agent to dive across walls/holes when the corner
-        target sat off-polyline a few segments back. Now:
-
-        - When the ball's path projection is on a DIFFERENT segment than
-          the target's projection, ``d = |s_ball − s_target| + d_off + tail``
-          where ``s`` is raw arc length along the polyline, ``d_off`` is the
-          ball's offset from its path projection, and ``tail`` is the constant
-          Euclidean distance from the target's path projection to the actual
-          corner. This routes the gradient along the safe polyline.
-        - When the ball reaches the target's segment, switch to direct
-          Euclidean ``‖ball − target‖`` so the agent can leave the path and
-          enter the corner basin (where the safe corner lives by construction).
-
-        Arrival is still detected on Euclidean distance to the actual corner.
-        Target is FROZEN at reset (`self._prior_target`).
-        """
-        target = self._prior_target
-        target_dist = self._path_aware_dist_to_target(
-            ball_pos, curr_progress, seg_idx,
-        )
-        if not np.isfinite(self._prev_dense_target_dist):
-            progress_delta = 0.0
-        else:
-            progress_delta = float(self._prev_dense_target_dist - target_dist)
-        self._prev_dense_target_dist = target_dist
-
-        # Progress shaping is gated on `_dense_arrived`: it fires only BEFORE
-        # the first basin entry. After arrival, telescoping deltas from
-        # exit/re-entry would otherwise net to zero but make oscillation
-        # equal-reward to standing still — and drifting is easier than
-        # holding steady. Killing the signal post-arrival removes the
-        # incentive structure that was producing the oscillation observed in
-        # the rollout videos. Hole penalty + corner geometry now do the rest.
-        if not self._dense_arrived:
-            reward = PRIOR_DENSE_PROGRESS_SCALE * progress_delta
-        else:
-            reward = 0.0
-        hole_reward = -self.hole_penalty if self._min_hole_distance < HOLE_RADIUS else 0.0
-
-        # Arrival uses Euclidean distance to the actual corner (the corner
-        # lives off-path, so path-distance is wrong for the arrival check).
-        eucl_to_target = float(np.linalg.norm(ball_pos - target))
-        arrived_now = eucl_to_target < self.checkpoint_radius
-        if arrived_now and not self._dense_arrived:
-            reward += PRIOR_DENSE_ARRIVAL_BONUS
-            self._dense_arrived = True
-            self._success = True  # success = reached the safe corner once
-
-        # Stabilize term — only after arrival, only inside the basin, and
-        # quiet-gated by exp(−(speed / v_ref)²) so the agent is rewarded for
-        # parking near the corner rather than oscillating in-and-out. This
-        # is intentionally small (max ~0.2 / step) so it doesn't dominate
-        # progress shaping or the arrival bonus.
-        if self._dense_arrived and arrived_now:
-            quiet = float(
-                np.exp(-(self._ball_speed / PRIOR_DENSE_STAY_V_REF) ** 2)
-            )
-            reward += PRIOR_DENSE_STAY_BONUS * quiet
-
-            # Wall-contact + low-speed bonus: rewards the canonical "parked
-            # against a corner wall, not moving" pose. Both conditions must
-            # hold (wall contact AND ball_speed < QUIET_SPEED). This adds
-            # active learning signal for the counter-momentum control the
-            # agent needs to actually stop the ball after arrival.
-            wall_d = self._min_wall_distance(ball_pos)
-            touching_wall = wall_d < (
-                WALL_RADIUS + MARBLE_RADIUS + PRIOR_DENSE_WALL_CONTACT_MARGIN
-            )
-            low_speed = self._ball_speed < PRIOR_DENSE_QUIET_SPEED
-            if touching_wall and low_speed:
-                reward += PRIOR_DENSE_TOUCHING_WALL_BONUS
-
-        # No Phase B accumulators; keep diagnostics zeroed.
-        self._stable_steps = 0
-        self._ep_ball_speed_sum += float(self._ball_speed)
-        self._ep_safe_hole_margin_sum += max(
-            0.0, float(self._min_hole_distance - HOLE_RADIUS)
-        )
-        self._in_checkpoint_prev = False
-        self._prev_checkpoint_dist = np.inf
-        return float(reward + hole_reward)
-
-    def _path_aware_dist_to_target(
-        self, ball_pos: np.ndarray, curr_progress: float, seg_idx: int,
-    ) -> float:
-        """Distance from ball to ``self._prior_target`` along the safe polyline.
-
-        Returns:
-            ``|s_ball − s_target| + ‖ball − closest_pt‖ + ‖target − target_on_path‖``
-            when ball and target are on different polyline segments;
-            ``‖ball − target‖`` (direct Euclidean) once they share a segment.
-
-        Falls back to Euclidean if the target seg index is unset, the path
-        was not detected this step, or the dispatch is in a non-prior mode.
-        """
-        target = self._prior_target
-        target_seg = int(self._prior_target_seg_idx)
-        if (
-            target_seg < 0
-            or curr_progress < 0
-            or seg_idx < 0
-            or seg_idx == target_seg
-        ):
-            return float(np.linalg.norm(ball_pos - target))
-
-        # Project the (frozen) corner onto its waypoint segment to get
-        # the path-arc-length offset and the constant tail distance.
-        seg_start = self.waypoints[target_seg]
-        seg_end = self.waypoints[target_seg + 1]
-        seg_vec = seg_end - seg_start
-        seg_len_sq = max(float(np.dot(seg_vec, seg_vec)), 1e-10)
-        t_target = float(np.dot(target - seg_start, seg_vec)) / seg_len_sq
-        t_target = max(0.0, min(1.0, t_target))
-        target_on_path = seg_start + t_target * seg_vec
-        s_target = float(self.cum_distances[target_seg]) + t_target * float(
-            self.seg_lengths[target_seg]
-        )
-        tail_target = float(np.linalg.norm(target - target_on_path))
-
-        # `compute_path_progress` returns arc length × 10; convert back.
-        s_ball = float(curr_progress) / 10.0
-        d_path = abs(s_ball - s_target)
-        d_off = float(np.linalg.norm(ball_pos - self._closest_point))
-        return d_path + d_off + tail_target
-
-    def _compute_checkpoint_recovery_reward(
-        self,
-        ball_pos: np.ndarray,
-        action: np.ndarray | None,
-        prev_action: np.ndarray | None,
-        ball_pos_observed: np.ndarray | None,
-    ) -> float:
-        """Checkpoint-guided stabilization reward using real-transferable signals."""
-        action = np.asarray(action if action is not None else self.data.ctrl, dtype=np.float32)
-        prev_action = np.asarray(prev_action if prev_action is not None else self._prev_action, dtype=np.float32)
-
-        target = self._prior_target
-        if not np.isfinite(target).all() or np.allclose(target, 0.0):
-            target = self._first_backward_safe_corner(self._prev_progress)
-        reward_ball_pos = np.asarray(ball_pos_observed if ball_pos_observed is not None else ball_pos, dtype=np.float32)
-        target_dist = float(np.linalg.norm(reward_ball_pos - target))
-        self._target_dist_min = min(self._target_dist_min, target_dist)
-
-        quiet_reward = float(np.exp(-(self._ball_speed / self.prior_recovery_v_ref) ** 2))
-        in_quiet = self._ball_speed < self.prior_recovery_quiet_threshold_speed
-        inside_checkpoint = target_dist < self.checkpoint_radius
-
-        progress_delta = 0.0
-        if np.isfinite(self._prev_target_dist):
-            progress_delta = max(self._prev_target_dist - target_dist, 0.0)
-        r_progress = self.prior_recovery_w_progress * progress_delta
-        r_basin = self.prior_recovery_w_basin if inside_checkpoint else 0.0
-        r_quiet = self.prior_recovery_w_quiet * quiet_reward
-        r_hold = self.prior_recovery_w_hold if (inside_checkpoint and in_quiet) else 0.0
-        r_action = -self.prior_recovery_action_penalty * float(np.dot(action, action))
-        action_delta = action - prev_action
-        r_action_delta = -self.prior_recovery_action_delta_penalty * float(np.dot(action_delta, action_delta))
-        tilt = np.asarray(self.data.qpos[:2], dtype=np.float32)
-        r_tilt = -self.prior_recovery_tilt_penalty * float(np.dot(tilt, tilt))
-        r_hole = -self.hole_penalty if self._min_hole_distance < HOLE_RADIUS else 0.0
-
-        if in_quiet:
-            self._ep_quiet_steps += 1
-        if inside_checkpoint:
-            self._ep_inside_checkpoint_steps += 1
-        if inside_checkpoint and in_quiet:
-            self._stable_steps += 1
-        else:
-            self._stable_steps = 0
-        self._stable_steps_max = max(self._stable_steps_max, self._stable_steps)
-        if self._stable_steps >= self.checkpoint_hold_steps:
-            self._success = True
-
-        self._ep_ball_speed_sum += float(self._ball_speed)
-        self._ep_safe_hole_margin_sum += max(0.0, float(self._min_hole_distance - HOLE_RADIUS))
-        self._prev_target_dist = target_dist
-        self._in_checkpoint_prev = inside_checkpoint
-        self._prev_checkpoint_dist = target_dist
-
-        self._reward_terms = {
-            "reward_progress": float(r_progress),
-            "reward_basin": float(r_basin),
-            "reward_quiet": float(r_quiet),
-            "reward_hold": float(r_hold),
-            "reward_action": float(r_action),
-            "reward_action_delta": float(r_action_delta),
-            "reward_tilt": float(r_tilt),
-            "reward_hole": float(r_hole),
-        }
-
-        return (
-            self.prior_recovery_alive_reward
-            + r_progress
-            + r_basin
-            + r_quiet
-            + r_hold
-            + r_action
-            + r_action_delta
-            + r_tilt
-            + r_hole
-        )
+        return progress_reward + goal_reward + hole_reward
 
     def _check_termination(self, ball_pos: np.ndarray) -> tuple[bool, bool, dict[str, Any]]:
         """Check termination conditions."""
         info = {}
         terminated = False
         truncated = False
+
+        # Prior branch: reaching a recovered state is the only success signal.
+        if self.prior_mode and self._recovered:
+            terminated = True
+            info["termination_reason"] = "recovery"
+            info["success"] = 1.0
+            return terminated, truncated, info
 
         # Check if in hole
         hole_distances = np.linalg.norm(self.holes - ball_pos, axis=1)
@@ -2349,21 +1449,21 @@ class CyberRunnerEnv(gym.Env):
             terminated = True
             info["termination_reason"] = "hole"
 
-        # Check goal reached
-        dist_to_goal = np.linalg.norm(ball_pos - self.goal_pos)
-        if (not self.prior_mode) and dist_to_goal < GOAL_THRESHOLD:
-            terminated = True
-            info["termination_reason"] = "goal"
+        # Check goal reached (main task only)
+        if not self.prior_mode:
+            dist_to_goal = np.linalg.norm(ball_pos - self.goal_pos)
+            if dist_to_goal < GOAL_THRESHOLD:
+                terminated = True
+                info["termination_reason"] = "goal"
 
-        if self.terminate_on_checkpoint_stabilized and self._success:
-            terminated = True
-            info["termination_reason"] = (
-                "stabilized" if self.prior_mode and self.prior_task == "stabilize" else "checkpoint"
-            )
-
-        # Check timeout
+        # Check timeout. In prior_mode a timeout is a genuine failure (the ball
+        # never recovered), so we mark it terminated — not truncated — to stop
+        # SB3 bootstrapping V(s_final) into the recovery-probability target.
         if self._step_count >= self.episode_length:
-            truncated = True
+            if self.prior_mode:
+                terminated = True
+            else:
+                truncated = True
             info["termination_reason"] = "timeout"
 
         return terminated, truncated, info
@@ -2403,9 +1503,6 @@ class CyberRunnerEnv(gym.Env):
         return None
 
     def close(self):
-        if self.vision_renderer is not None:
-            self.vision_renderer.close()
-            self.vision_renderer = None
         if self.renderer is not None:
             self.renderer.close()
             self.renderer = None
@@ -2420,205 +1517,87 @@ class CyberRunnerEnv(gym.Env):
 
 
 class CyberRunner(gym.Env):
-    """Wrapper around CyberRunnerEnv matching R2-Dreamer env interface."""
+    """Wrapper around CyberRunnerEnv matching the R2-Dreamer env interface.
+
+    Vision is not supported by this (stateful) build of the environment; the
+    observation exposed to the agent is the flat 10-dim state under the
+    ``"state"`` key.
+    """
 
     def __init__(
         self, name, action_repeat=1, size=(64, 64), seed=0,
-        reward_every_n_waypoints=5, hole_penalty=5.0,
-        checkpoint_radius=0.010,
-        checkpoint_hold_steps=12,
-        checkpoint_speed_threshold=0.015,
-        checkpoint_arrival_reward=0.2,
-        checkpoint_stabilize_reward=1.0,
-        checkpoint_hold_reward=0.02,
-        safe_hole_margin=0.004,
-        checkpoint_speed_ema_alpha=0.8,
-        checkpoint_include_corridors=True,
-        prior_mode=False,
-        prior_task="checkpoint",
-        prior_spawn_source="dense_path",
-        prior_start_waypoint_window=3,
-        prior_init_ball_speed=0.0,
-        prior_init_tilt_frac=0.0,
-        prior_min_checkpoint_start_dist=0.02,
-        prior_max_checkpoint_start_dist=0.12,
-        prior_spawn_min_hole_margin=0.02,
-        prior_start_point_spacing=0.01,
-        prior_spawn_merge_radius=0.0,
-        checkpoint_progress_reward_scale=20.0,
-        terminate_on_checkpoint_stabilized=False,
-        prior_version=PRIOR_VERSION_LEGACY,
-        prior_reward_mode=None,
-        prior_obs_mode=None,
+        reward_every_n_waypoints=5, hole_penalty=5.0, layout="hard",
+        prior_mode=False, obs_n_stack=1,
     ):
-        include_vision = name == "vision"
         self._env = CyberRunnerEnv(
             render_mode="rgb_array",
             episode_length=1_000_000,
             randomize_init_pos=False,
-            include_vision=include_vision,
             reward_every_n_waypoints=reward_every_n_waypoints,
             hole_penalty=hole_penalty,
-            checkpoint_radius=checkpoint_radius,
-            checkpoint_hold_steps=checkpoint_hold_steps,
-            checkpoint_speed_threshold=checkpoint_speed_threshold,
-            checkpoint_arrival_reward=checkpoint_arrival_reward,
-            checkpoint_stabilize_reward=checkpoint_stabilize_reward,
-            checkpoint_hold_reward=checkpoint_hold_reward,
-            safe_hole_margin=safe_hole_margin,
-            checkpoint_speed_ema_alpha=checkpoint_speed_ema_alpha,
-            checkpoint_include_corridors=checkpoint_include_corridors,
+            layout=layout,
             prior_mode=prior_mode,
-            prior_task=prior_task,
-            prior_spawn_source=prior_spawn_source,
-            prior_start_waypoint_window=prior_start_waypoint_window,
-            prior_init_ball_speed=prior_init_ball_speed,
-            prior_init_tilt_frac=prior_init_tilt_frac,
-            prior_min_checkpoint_start_dist=prior_min_checkpoint_start_dist,
-            prior_max_checkpoint_start_dist=prior_max_checkpoint_start_dist,
-            prior_spawn_min_hole_margin=prior_spawn_min_hole_margin,
-            prior_start_point_spacing=prior_start_point_spacing,
-            prior_spawn_merge_radius=prior_spawn_merge_radius,
-            checkpoint_progress_reward_scale=checkpoint_progress_reward_scale,
-            terminate_on_checkpoint_stabilized=terminate_on_checkpoint_stabilized,
-            prior_version=prior_version,
-            prior_reward_mode=prior_reward_mode,
-            prior_obs_mode=prior_obs_mode,
+            obs_n_stack=obs_n_stack,
         )
         self._action_repeat = action_repeat
         self._size = size
-        self._include_vision = include_vision
         self.reward_range = [-np.inf, np.inf]
 
     @property
     def observation_space(self):
-        spaces_dict = {}
-        if self._env.prior_obs_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
-            spaces_dict["prior_state"] = gym.spaces.Box(
-                -np.inf, np.inf, (CHECKPOINT_RECOVERY_OBS_DIM,), dtype=np.float32
-            )
-        else:
-            spaces_dict.update({
-                "states": gym.spaces.Box(-np.inf, np.inf, (10,), dtype=np.float32),
-                "checkpoint": gym.spaces.Box(-np.inf, np.inf, (3,), dtype=np.float32),
-            })
-        spaces_dict.update({
-            "log_path_progress": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-            "log_checkpoint_dist": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-            "log_ball_speed": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-            "log_observed_speed": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-            "log_ball_speed_true": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-            "log_min_hole_distance": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-            "log_safe_hole_margin": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-            "log_active_checkpoint_idx": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-            "log_unlocked_checkpoint_idx": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-            "log_stable_steps": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-            "log_success": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+        return gym.spaces.Dict({
+            "state": self._env.observation_space,
+            "is_first": gym.spaces.Box(0, 1, (), dtype=bool),
+            "is_last": gym.spaces.Box(0, 1, (), dtype=bool),
+            "is_terminal": gym.spaces.Box(0, 1, (), dtype=bool),
         })
-        if self._include_vision:
-            spaces_dict["image"] = gym.spaces.Box(0, 255, self._size + (3,), dtype=np.uint8)
-        return gym.spaces.Dict(spaces_dict)
 
     @property
     def action_space(self):
-        return gym.spaces.Box(-1.0, 1.0, (2,), dtype=np.float32)
+        space = self._env.action_space
+        space.discrete = False
+        return space
+
+    def _obs(self, state, *, is_first, is_last, is_terminal):
+        return {
+            "state": np.asarray(state, dtype=np.float32),
+            "is_first": is_first,
+            "is_last": is_last,
+            "is_terminal": is_terminal,
+        }
 
     def step(self, action):
-        assert np.isfinite(action).all(), action
-        reward = 0.0
-        last_info = None
+        total_reward = 0.0
+        terminated = truncated = False
+        info: dict[str, Any] = {}
+        state = None
         for _ in range(self._action_repeat):
-            obs, rew, terminated, truncated, info = self._env.step(action)
-            reward += rew
-            last_info = info
+            state, reward, terminated, truncated, info = self._env.step(action)
+            total_reward += float(reward)
             if terminated or truncated:
                 break
-        is_last = terminated or truncated
-        out = {
-            "is_first": False,
-            "is_last": is_last,
-            "is_terminal": terminated,
-            "log_path_progress": last_info["log_path_progress"],
-            "log_checkpoint_dist": last_info["log_checkpoint_dist"],
-            "log_ball_speed": last_info["log_ball_speed"],
-            "log_observed_speed": last_info["log_observed_speed"],
-            "log_ball_speed_true": last_info["log_ball_speed_true"],
-            "log_min_hole_distance": last_info["log_min_hole_distance"],
-            "log_safe_hole_margin": last_info["log_safe_hole_margin"],
-            "log_active_checkpoint_idx": last_info["log_active_checkpoint_idx"],
-            "log_unlocked_checkpoint_idx": last_info["log_unlocked_checkpoint_idx"],
-            "log_stable_steps": last_info["log_stable_steps"],
-            "log_success": last_info["log_success"],
-        }
-        if self._env.prior_obs_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
-            out["prior_state"] = obs["prior_state"]
-        else:
-            out["states"] = obs["states"]
-            out["checkpoint"] = obs["checkpoint"]
-        if self._include_vision:
-            out["image"] = obs["image"]
-        return out, reward, is_last, {}
+        done = terminated or truncated
+        obs = self._obs(state, is_first=False, is_last=done, is_terminal=terminated)
+        return obs, total_reward, done, info
 
-    def reset(self, **kwargs):
-        obs, info = self._env.reset()
-        out = {
-            "is_first": True,
-            "is_last": False,
-            "is_terminal": False,
-            "log_path_progress": info["log_path_progress"],
-            "log_checkpoint_dist": info["log_checkpoint_dist"],
-            "log_ball_speed": info["log_ball_speed"],
-            "log_observed_speed": info["log_observed_speed"],
-            "log_ball_speed_true": info["log_ball_speed_true"],
-            "log_min_hole_distance": info["log_min_hole_distance"],
-            "log_safe_hole_margin": info["log_safe_hole_margin"],
-            "log_active_checkpoint_idx": info["log_active_checkpoint_idx"],
-            "log_unlocked_checkpoint_idx": info["log_unlocked_checkpoint_idx"],
-            "log_stable_steps": info["log_stable_steps"],
-            "log_success": info["log_success"],
-        }
-        if self._env.prior_obs_mode == PRIOR_VERSION_CHECKPOINT_RECOVERY:
-            out["prior_state"] = obs["prior_state"]
-        else:
-            out["states"] = obs["states"]
-            out["checkpoint"] = obs["checkpoint"]
-        if self._include_vision:
-            out["image"] = obs["image"]
-        return out
+    def reset(self):
+        state, info = self._env.reset()
+        obs = self._obs(state, is_first=True, is_last=False, is_terminal=False)
+        return obs
 
-    def render(self):
+    def render(self, *args, **kwargs):
         return self._env.render()
 
     def close(self):
-        self._env.close()
+        return self._env.close()
 
-
-# ============================================================================
-# TESTING
-# ============================================================================
 
 if __name__ == "__main__":
-    # Quick test
-    env = CyberRunnerEnv(render_mode="human", randomize_init_pos=True, include_vision=True)
-
+    env = CyberRunnerEnv(render_mode="human", randomize_init_pos=True)
     obs, info = env.reset()
-    print(f"States shape: {obs['states'].shape}")
-    if "image" in obs:
-        print(f"Image shape: {obs['image'].shape}")
-    print(f"Initial states: {obs['states'][:4]}")  # joints + ball pos
-    print(f"Initial progress: {info['path_progress']:.4f}")
-
-    total_reward = 0
-    for i in range(2000):
-        action = env.action_space.sample()
-        obs, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
+    for _ in range(2000):
+        obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
         env.render()
-        time.sleep(1 / 60)  # Real-time playback at 60 FPS
-
         if terminated or truncated:
-            print(f"Episode ended at step {i}: {info.get('termination_reason', 'unknown')}")
-            print(f"Total reward: {total_reward:.4f}")
-            break
-
+            obs, info = env.reset()
     env.close()
