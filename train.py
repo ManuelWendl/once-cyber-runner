@@ -166,15 +166,25 @@ def eval_and_log_video(
         print("[eval] no frames captured — skipping video (headless GL unavailable)")
         return
 
-    # wandb.Video expects (T, C, H, W)
-    frames = np.stack(all_frames).transpose(0, 3, 1, 2)
-    if run is not None:
-        try:
-            run.log({"eval/video": wandb.Video(frames, fps=fps, format="mp4")}, step=log_step)
-        except Exception as e:
-            # e.g. moviepy/ffmpeg missing — log the eval but don't crash the run.
-            print(f"[eval] video logging failed ({e}); skipping. "
-                  "Install with: pip install 'wandb[media]'")
+    # Build a GIF and log it as eval/video. No mp4: gifs are made by PIL (no
+    # moviepy encode) and we subsample to keep the upload small/fast. Frames are
+    # also left on disk in the run working dir as eval.gif.
+    max_frames = 300
+    if len(all_frames) > max_frames:
+        idx = np.linspace(0, len(all_frames) - 1, max_frames).round().astype(int)
+        all_frames = [all_frames[i] for i in idx]
+
+    gif_path = "eval.gif"
+    try:
+        from PIL import Image
+        pil = [Image.fromarray(f) for f in all_frames]
+        pil[0].save(gif_path, save_all=True, append_images=pil[1:], loop=0,
+                    duration=int(1000 / fps), optimize=True)
+        print(f"[eval] saved {gif_path} ({len(all_frames)} frames)")
+        if run is not None:
+            run.log({"eval/video": wandb.Video(gif_path)}, step=log_step)
+    except Exception as e:  # noqa: BLE001
+        print(f"[eval] gif logging failed ({e})")
 
 
 @hydra.main(config_path="configs", config_name="config", version_base=None)
@@ -195,6 +205,9 @@ def main(cfg: DictConfig):
             tags=list(wb_cfg.get("tags", [])),
             config=OmegaConf.to_container(cfg, resolve=True),
             dir=wandb_dir,
+            # "offline" logs locally (no end-of-run upload stall on a slow node);
+            # sync afterwards from a login node with `wandb sync <dir>`.
+            mode=wb_cfg.get("mode", None),
         )
 
     env = VecNormalize(

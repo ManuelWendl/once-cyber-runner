@@ -31,6 +31,8 @@ wandb:
   name: null  # auto-generated if null
   tags: []
   log_interval: 10_000  # timesteps between wandb log calls (same cadence for PPO and SAC)
+  mode: null  # null=online; set "offline" on the cluster to avoid the end-of-run
+              # upload stall, then `wandb sync $SCRATCH/wandb/offline-run-*` from a login node
 
 hydra:
   # Write all run output (working dir, saved artifacts, submitit logs) under
