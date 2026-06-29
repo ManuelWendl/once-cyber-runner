@@ -262,11 +262,14 @@ def main(cfg: DictConfig):
                 "mbpo_cyberrunner_vecnormalize.pkl",
                 "mbpo_cyberrunner_env_cfg.json",
             ])
-            eval_and_log_video(
-                run, trainer.sac, vec_env=trainer.env,
-                predict_fn=trainer.shielded_predict,
-                log_step=cfg.total_timesteps,
-            )
+            try:
+                eval_and_log_video(
+                    run, trainer.sac, vec_env=trainer.env,
+                    predict_fn=trainer.shielded_predict,
+                    log_step=cfg.total_timesteps,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[eval] step failed ({e}); model artifact already saved.")
             run.finish()
         return
     else:
@@ -283,14 +286,21 @@ def main(cfg: DictConfig):
         json.dump(OmegaConf.to_container(cfg.env, resolve=True), f, indent=2)
 
     if run is not None:
+        # Upload + COMMIT the model artifact (save_artifact waits) before eval,
+        # so nothing downstream can drop it. Then guard eval so a render/video
+        # failure can never skip run.finish() (which is what dropped artifacts
+        # on headless nodes).
         save_artifact(run, f"{algo}_{suffix}", [
             f"{algo}_{suffix}.zip",
             f"{algo}_{suffix}_vecnormalize.pkl",
             f"{algo}_{suffix}_env_cfg.json",
         ])
-        eval_and_log_video(run, model,
-                           f"{algo}_{suffix}_vecnormalize.pkl",
-                           f"{algo}_{suffix}_env_cfg.json")
+        try:
+            eval_and_log_video(run, model,
+                               f"{algo}_{suffix}_vecnormalize.pkl",
+                               f"{algo}_{suffix}_env_cfg.json")
+        except Exception as e:  # noqa: BLE001
+            print(f"[eval] step failed ({e}); model artifact already saved.")
         run.finish()
 
 
