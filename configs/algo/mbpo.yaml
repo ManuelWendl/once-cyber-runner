@@ -5,7 +5,7 @@ n_envs: 4
 learning_rate: 3e-4
 batch_size: 256
 tau: 0.005
-gamma: 1
+gamma: 0.99
 ent_coef: auto   # thermostat: holds policy at target_entropy and self-adjusts α.
                  # A fixed small value removes the entropy TARGET, so the policy
                  # collapses (entropy free-falls) and ep_rew destabilizes.
@@ -17,7 +17,7 @@ target_entropy: auto   # "auto" = -dim(A) = -2. That default over-concentrates t
 # ── World model ───────────────────────────────────────────────────────────────
 ensemble_size: 5
 num_elites: 3
-hidden_sizes: [256, 256, 256]
+hidden_sizes: [512, 512, 512]
 model_lr: 3e-4
 model_weight_decay: 0
 model_train_freq: 50          # retrain world model every N env steps
@@ -26,9 +26,9 @@ model_train_epochs: 50
 model_batch_size: 512
 
 # ── Buffers ───────────────────────────────────────────────────────────────────
-real_buffer_size: 100_000
-model_buffer_size: 200_000     # SAC's replay buffer (synthetic model rollouts + penalty transitions)
-real_ratio: 0.0                # fraction of each SAC batch drawn from real data (rest = model rollouts)
+real_buffer_size: 1_000_000
+model_buffer_size: 1_000_000     # SAC's replay buffer (synthetic model rollouts + penalty transitions)
+real_ratio: 0.1                # fraction of each SAC batch drawn from real data (rest = model rollouts)
 
 # ── Rollout schedule ──────────────────────────────────────────────────────────
 warmup_steps: 20_000           # pure random collection before model training
