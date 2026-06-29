@@ -2,11 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-
-# Headless offscreen rendering for the eval video on cluster nodes (no display).
-# Must be set before mujoco is imported (via envs.cyberrunner below).
-os.environ.setdefault("MUJOCO_GL", "egl")
-
 import numpy as np
 import hydra
 import wandb
@@ -153,31 +148,9 @@ def eval_and_log_video(
     if run is not None:
         run.log({"eval/total_reward": total_reward, "eval/ep_length": step})
 
-    # Skip the video (don't crash) if rendering produced no frames — e.g. a
-    # headless node without a usable GL backend (set MUJOCO_GL=egl or osmesa).
-    if not all_frames:
-        print("[eval] no frames captured — skipping video (headless GL unavailable)")
-        return
-
-    # Build a GIF and log it as eval/video. No mp4: gifs are made by PIL (no
-    # moviepy encode) and we subsample to keep the upload small/fast. Frames are
-    # also left on disk in the run working dir as eval.gif.
-    max_frames = 300
-    if len(all_frames) > max_frames:
-        idx = np.linspace(0, len(all_frames) - 1, max_frames).round().astype(int)
-        all_frames = [all_frames[i] for i in idx]
-
-    gif_path = "eval.gif"
-    try:
-        from PIL import Image
-        pil = [Image.fromarray(f) for f in all_frames]
-        pil[0].save(gif_path, save_all=True, append_images=pil[1:], loop=0,
-                    duration=int(1000 / fps), optimize=True)
-        print(f"[eval] saved {gif_path} ({len(all_frames)} frames)")
-        if run is not None:
-            run.log({"eval/video": wandb.Video(gif_path)})
-    except Exception as e:  # noqa: BLE001
-        print(f"[eval] gif logging failed ({e})")
+    # wandb.Video expects (T, C, H, W)
+    frames = np.stack(all_frames).transpose(0, 3, 1, 2)
+    run.log({"eval/video": wandb.Video(frames, fps=fps, format="mp4")})
 
 
 @hydra.main(config_path="configs", config_name="config", version_base=None)
@@ -198,9 +171,6 @@ def main(cfg: DictConfig):
             tags=list(wb_cfg.get("tags", [])),
             config=OmegaConf.to_container(cfg, resolve=True),
             dir=wandb_dir,
-            # "offline" logs locally (no end-of-run upload stall on a slow node);
-            # sync afterwards from a login node with `wandb sync <dir>`.
-            mode=wb_cfg.get("mode", None),
         )
 
     env = VecNormalize(
@@ -253,13 +223,10 @@ def main(cfg: DictConfig):
                 "mbpo_cyberrunner_vecnormalize.pkl",
                 "mbpo_cyberrunner_env_cfg.json",
             ])
-            try:
-                eval_and_log_video(
-                    run, trainer.sac, vec_env=trainer.env,
-                    predict_fn=trainer.shielded_predict,
-                )
-            except Exception as e:  # noqa: BLE001
-                print(f"[eval] step failed ({e}); model artifact already saved.")
+            eval_and_log_video(
+                run, trainer.sac, vec_env=trainer.env,
+                predict_fn=trainer.shielded_predict,
+            )
             run.finish()
         return
     else:
@@ -276,21 +243,14 @@ def main(cfg: DictConfig):
         json.dump(OmegaConf.to_container(cfg.env, resolve=True), f, indent=2)
 
     if run is not None:
-        # Upload + COMMIT the model artifact (save_artifact waits) before eval,
-        # so nothing downstream can drop it. Then guard eval so a render/video
-        # failure can never skip run.finish() (which is what dropped artifacts
-        # on headless nodes).
         save_artifact(run, f"{algo}_{suffix}", [
             f"{algo}_{suffix}.zip",
             f"{algo}_{suffix}_vecnormalize.pkl",
             f"{algo}_{suffix}_env_cfg.json",
         ])
-        try:
-            eval_and_log_video(run, model,
-                               f"{algo}_{suffix}_vecnormalize.pkl",
-                               f"{algo}_{suffix}_env_cfg.json")
-        except Exception as e:  # noqa: BLE001
-            print(f"[eval] step failed ({e}); model artifact already saved.")
+        eval_and_log_video(run, model,
+                           f"{algo}_{suffix}_vecnormalize.pkl",
+                           f"{algo}_{suffix}_env_cfg.json")
         run.finish()
 
 
