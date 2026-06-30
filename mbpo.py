@@ -2,9 +2,13 @@
 Model-Based Policy Optimization (MBPO).
 
 World model: probabilistic ensemble of MLPs (PyTorch).
-  - Input: (obs, action)
-  - Output: Gaussian over (delta_obs, reward)
-  - Residual prediction: next_obs = obs + delta_obs
+  - Input: (obs, action) — the full (possibly frame-stacked) observation.
+  - Output: Gaussian over the *base* obs delta (newest state + path); reward is
+    analytic.
+  - Residual prediction: base_next = base(obs) + delta. Under frame stacking the
+    full next_obs is reconstructed by sliding the window (drop oldest frame,
+    prepend the new (predicted-state, action) frame) so the stack stays
+    temporally consistent rather than freely predicting the shifted history.
 
 Policy: SB3 SAC trained on synthetic rollouts from the world model.
 
@@ -131,9 +135,14 @@ class EnsembleDynamics(nn.Module):
     Probabilistic ensemble — PyTorch port of the reference Bayesian dynamics
     model's default ``ProbabilisticEnsembleModel`` path.
 
-    Predicts ONLY ``delta_obs`` as a Gaussian (reward is supplied separately by
-    an analytic reward function, mirroring the reference's external
-    ``RewardModel``). The variance head outputs a standard deviation
+    Predicts ONLY the *base* observation delta as a Gaussian (reward is supplied
+    separately by an analytic reward function, mirroring the reference's external
+    ``RewardModel``). Under frame stacking (``n_stack > 1``) the base observation
+    is the newest dynamic state + path vectors; the older stacked frames are a
+    deterministic shift of known quantities, so they are reconstructed at
+    sampling time rather than predicted. Without stacking the base delta is the
+    whole ``delta_obs`` (original behaviour). The variance head outputs a
+    standard deviation
     soft-clamped to ``[sig_min, sig_max]`` (reference parameterization) rather
     than the learnable-logvar-bounds scheme. A held-out per-dimension
     calibration multiplier (``calib_alpha``) recalibrates the predictive std at
@@ -152,9 +161,14 @@ class EnsembleDynamics(nn.Module):
         sig_min: float = 1e-3,
         sig_max: float = 1e3,
         sampling_type: str = "TS1",
+        n_stack: int = 1,
+        frame_dim: int = 0,
+        state_dim: int = 0,
+        path_dim: int = 0,
     ) -> None:
         super().__init__()
         self.obs_dim = obs_dim
+        self.act_dim = act_dim
         self.ensemble_size = ensemble_size
         self.sig_min = float(sig_min)
         self.sig_max = float(sig_max)
@@ -162,7 +176,28 @@ class EnsembleDynamics(nn.Module):
         # TS-∞ ensemble index, set once per rollout (ignored by the other modes).
         self.sampling_idx = 0
 
-        out_dim = obs_dim * 2   # mean + std for delta_obs (reward is analytic)
+        # ── frame-stacking layout ────────────────────────────────────────────
+        # With obs_n_stack > 1 the observation is a sliding window:
+        #   [ (state, action) × n_stack  (newest first) ] ++ [ path (path_dim) ]
+        # Only the NEWEST state (state_dim) and the path (path_dim) are genuinely
+        # new at each step; the older frames are an exact shift of known
+        # quantities and the newest frame's action IS the model input. So the
+        # network predicts only the base observation (state + path =
+        # ``pred_dim`` dims) and ``sample()`` reconstructs the full stacked
+        # next_obs by shifting in the new (predicted-state, action) frame. This
+        # keeps the imagined stacks temporally consistent (correct velocity
+        # signal) instead of letting the net hallucinate the shifted history.
+        self.n_stack = int(n_stack)
+        self.frame_dim = int(frame_dim)
+        self.state_dim = int(state_dim)
+        self.path_dim = int(path_dim)
+        self.stacked = self.n_stack > 1
+        # Dimensions the network actually predicts (a delta target):
+        #   stacked  → base obs = newest state + path
+        #   unstacked → the whole obs (original behaviour)
+        self.pred_dim = (self.state_dim + self.path_dim) if self.stacked else obs_dim
+
+        out_dim = self.pred_dim * 2   # mean + std for the predicted delta
         dims = [obs_dim + act_dim] + list(hidden) + [out_dim]
         self.net = nn.ModuleList([
             EnsembleLinear(ensemble_size, dims[i], dims[i + 1])
@@ -170,7 +205,7 @@ class EnsembleDynamics(nn.Module):
         ])
         # Per-dimension calibration multiplier applied to the predicted std at
         # prediction time (opax-style recalibration; 1.0 until calibrated).
-        self.register_buffer("calib_alpha", torch.ones(obs_dim))
+        self.register_buffer("calib_alpha", torch.ones(self.pred_dim))
 
     def set_sampling_type(self, name: str) -> None:
         self.sampling.set(name)
@@ -192,11 +227,26 @@ class EnsembleDynamics(nn.Module):
         std = std.clamp(self.sig_min, self.sig_max)
         return mean, std
 
-    def nll_loss(self, obs: torch.Tensor, act: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _base_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        """Extract the base observation (newest state + path) from a (possibly
+        stacked) observation, along the last dim. Identity when unstacked."""
+        if not self.stacked:
+            return obs
+        state = obs[..., : self.state_dim]
+        path = obs[..., obs.shape[-1] - self.path_dim:]
+        return torch.cat([state, path], dim=-1)
+
+    def delta_target(self, obs: torch.Tensor, next_obs: torch.Tensor) -> torch.Tensor:
+        """Residual target the network is trained to predict: the base-obs delta
+        (newest state + path) when stacked, else the full obs delta."""
+        return self._base_obs(next_obs) - self._base_obs(obs)
+
+    def nll_loss(self, obs: torch.Tensor, act: torch.Tensor, next_obs: torch.Tensor) -> torch.Tensor:
         """Gaussian NLL (std parameterization) summed over output dims, averaged
         over batch and ensemble. Matches the reference ``gaussian_log_likelihood``
         (constant term dropped)."""
         mean, std = self._forward(obs, act)
+        target = self.delta_target(obs, next_obs)
         tgt = target.unsqueeze(0).expand_as(mean)
         nll = (torch.log(std) + 0.5 * ((tgt - mean) / std).pow(2)).sum(-1).mean()
         return nll
@@ -240,11 +290,35 @@ class EnsembleDynamics(nn.Module):
         else:
             raise ValueError(f"unknown sampling type {name!r}")
 
-        delta = out.cpu().numpy()
-        return obs + delta, unc.cpu().numpy()
+        # ``out`` is the predicted base-obs delta (B, pred_dim).
+        base_next = self._base_obs(obs_t) + out          # (B, pred_dim)
+        next_obs = self._reconstruct_next_obs(obs_t, act_t, base_next)
+        return next_obs.cpu().numpy(), unc.cpu().numpy()
+
+    def _reconstruct_next_obs(
+        self, obs: torch.Tensor, act: torch.Tensor, base_next: torch.Tensor
+    ) -> torch.Tensor:
+        """Build the full next observation from the predicted base obs.
+
+        Unstacked: the base obs IS the full obs. Stacked: slide the window —
+        drop the oldest frame, prepend the new ``(predicted_state, action)``
+        frame, and append the freshly predicted path vectors. This guarantees
+        the historical frames in the imagined stack are the exact (known) shift
+        of the current stack, so the velocity the policy reads off consecutive
+        frames stays physically consistent."""
+        if not self.stacked:
+            return base_next
+        new_state = base_next[..., : self.state_dim]            # (B, state_dim)
+        new_path = base_next[..., self.state_dim:]              # (B, path_dim)
+        new_frame = torch.cat([new_state, act], dim=-1)         # (B, frame_dim)
+        n_frames = self.n_stack * self.frame_dim
+        frames = obs[..., :n_frames]                            # (B, n_stack*frame_dim)
+        # Keep the newest (n_stack-1) frames; the oldest is dropped.
+        kept = frames[..., : (self.n_stack - 1) * self.frame_dim]
+        return torch.cat([new_frame, kept, new_path], dim=-1)
 
     @torch.no_grad()
-    def update_calibration(self, obs: torch.Tensor, act: torch.Tensor, target: torch.Tensor) -> float:
+    def update_calibration(self, obs: torch.Tensor, act: torch.Tensor, next_obs: torch.Tensor) -> float:
         """Recalibrate the predictive std on a held-out batch (PyTorch
         equivalent of the reference ``calculate_calibration_alpha``).
 
@@ -252,6 +326,7 @@ class EnsembleDynamics(nn.Module):
         Gaussian has unit-variance standardized residuals — alpha[d]² = E[((y−μ)/σ)²].
         Returns a scalar calibration-error proxy: |E[z²/alpha²] − 1|."""
         mean, std = self._forward(obs, act)
+        target = self.delta_target(obs, next_obs)
         tgt = target.unsqueeze(0).expand_as(mean)
         z2 = ((tgt - mean) / std).pow(2)           # (E, B, D)
         alpha = z2.mean(dim=(0, 1)).clamp_min(1e-8).sqrt()   # (D,)
@@ -352,6 +427,15 @@ class MBPOTrainer:
         obs_dim = int(np.prod(env.observation_space.shape))
         act_dim = int(np.prod(env.action_space.shape))
 
+        # Frame-stacking layout (read from the raw env). When n_stack > 1 the
+        # dynamics net predicts only the base obs (newest state + path) and
+        # reconstructs the rest of the stack by shifting; see EnsembleDynamics.
+        raw_env = env.venv.envs[0].unwrapped
+        n_stack = int(getattr(raw_env, "obs_n_stack", 1))
+        state_dim = int(getattr(raw_env, "_stack_obs_dim", 0))
+        path_dim = int(getattr(raw_env, "_path_dim", 0))
+        frame_dim = state_dim + act_dim   # (state, action) per stacked frame
+
         self.dynamics = EnsembleDynamics(
             obs_dim=obs_dim,
             act_dim=act_dim,
@@ -360,13 +444,17 @@ class MBPOTrainer:
             sig_min=float(ac.get("sig_min", 1e-3)),
             sig_max=float(ac.get("sig_max", 1e3)),
             sampling_type=ac.get("sampling_type", "TS1"),
+            n_stack=n_stack,
+            frame_dim=frame_dim,
+            state_dim=state_dim,
+            path_dim=path_dim,
         ).to(device)
 
         # Analytic reward function — the closed-form maze reward, replacing the
         # old joint reward head (mirrors the reference's separate RewardModel).
         # Pull the raw CyberRunnerEnv out from under the VecNormalize wrapper so
         # we can read its path/hole geometry; un-normalization uses the wrapper.
-        raw_env = env.venv.envs[0].unwrapped
+        # (``raw_env`` was resolved above to read the frame-stacking layout.)
         self.reward_model = AnalyticCyberRunnerReward(env, raw_env)
 
         self.model_opt = Adam(
@@ -459,9 +547,9 @@ class MBPOTrainer:
         train_losses = []
         for _ in range(ac.model_train_epochs):
             b = self.real_buffer.sample(min(ac.model_batch_size, self.real_buffer.size()))
-            # Target is delta_obs only — reward is supplied analytically.
-            tgt = b.next_observations - b.observations
-            loss = self.dynamics.nll_loss(b.observations, b.actions, tgt)
+            # Target (base-obs delta) is derived from next_obs inside the model;
+            # reward is supplied analytically.
+            loss = self.dynamics.nll_loss(b.observations, b.actions, b.next_observations)
             self.model_opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.dynamics.parameters(), 1.0)
@@ -469,10 +557,9 @@ class MBPOTrainer:
             train_losses.append(loss.item())
         # Recalibrate predictive std on a held-out validation batch.
         b = self.real_buffer.sample(min(2048, self.real_buffer.size()))
-        tgt = b.next_observations - b.observations
-        self._calib_err = self.dynamics.update_calibration(b.observations, b.actions, tgt)
+        self._calib_err = self.dynamics.update_calibration(b.observations, b.actions, b.next_observations)
         with torch.no_grad():
-            val_loss = self.dynamics.nll_loss(b.observations, b.actions, tgt).item()
+            val_loss = self.dynamics.nll_loss(b.observations, b.actions, b.next_observations).item()
         self.dynamics.eval()
         return float(np.mean(train_losses)), val_loss
 
