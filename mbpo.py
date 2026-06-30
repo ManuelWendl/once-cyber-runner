@@ -406,6 +406,23 @@ class AnalyticCyberRunnerReward:
             out[i] = dense + goal + hole
         return out
 
+    def terminal(self, next_obs: np.ndarray) -> np.ndarray:
+        """Vectorized absorbing-state mask (B,) for imagined transitions.
+
+        Mirrors ``CyberRunnerEnv._check_termination`` (main task): the ball
+        entering a hole (failure) or reaching the goal (success) is terminal.
+        Timeout truncation is intentionally NOT a terminal here — it shouldn't
+        zero the bootstrap, and imagined rollouts are far shorter than the
+        episode length anyway. Restoring these terminals makes hole states
+        absorbing in imagination (Q = −hole_penalty, no bootstrap), matching the
+        real MDP, instead of being treated as survivable recurring costs."""
+        ball = self._ball_pos(next_obs)
+        in_hole = (np.linalg.norm(
+            self.holes[None] - ball[:, None], axis=2
+        ) < self._HOLE_RADIUS).any(axis=1)
+        at_goal = np.linalg.norm(ball - self.goal_pos, axis=1) < self._GOAL_THRESHOLD
+        return (in_hole | at_goal).astype(bool)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MBPO trainer
@@ -580,7 +597,11 @@ class MBPOTrainer:
         # other sampling modes).
         self.dynamics.set_sampling_idx(int(np.random.randint(self.dynamics.ensemble_size)))
 
-        all_obs, all_nobs, all_act, all_rew = [], [], [], []
+        all_obs, all_nobs, all_act, all_rew, all_done = [], [], [], [], []
+        # Branches that hit an absorbing state (hole/goal) stop being rolled
+        # forward — so a single rollout can't keep stamping penalties past a
+        # terminal, and longer rollouts stay on the real MDP's support.
+        alive = np.ones(len(obs), dtype=bool)
         for _ in range(length):
             act, _ = self.sac.predict(obs, deterministic=False)
             nobs, unc = self.dynamics.sample(obs, act)
@@ -590,19 +611,27 @@ class MBPOTrainer:
             self._unc_mean = float(unc.mean())
             nobs = np.clip(nobs, -10.0, 10.0)
             rew = np.clip(rew, -10.0, 10.0)   # guard against model exploitation
+            # Analytic terminals (hole = failure, goal = success), mirroring the
+            # real env. Absorbing states get a zero-bootstrap target, so the
+            # critic stops treating holes as survivable recurring costs.
+            done = self.reward_model.terminal(nobs)
 
-            all_obs.append(obs)
-            all_nobs.append(nobs)
-            all_act.append(act)
-            all_rew.append(rew)
+            m = alive   # only store transitions for still-alive branches
+            all_obs.append(obs[m])
+            all_nobs.append(nobs[m])
+            all_act.append(act[m])
+            all_rew.append(rew[m])
+            all_done.append(done[m])
+
+            alive = alive & ~done
+            if not alive.any():
+                break
             obs = nobs
 
-        # No terminals in imagination — the model never predicts an absorbing
-        # state, so there is no zero-value terminal for the policy to exploit
-        # when Q dips negative.
         self._batch_add_to_sac(
             np.concatenate(all_obs), np.concatenate(all_nobs),
             np.concatenate(all_act), np.concatenate(all_rew),
+            np.concatenate(all_done),
         )
 
     def _batch_add_to_sac(self, obs: np.ndarray, nobs: np.ndarray,
