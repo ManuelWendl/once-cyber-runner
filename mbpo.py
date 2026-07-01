@@ -376,6 +376,13 @@ class AnalyticCyberRunnerReward:
         self.goal_pos = raw_env.goal_pos
         self.scale = float(raw_env.dense_main_progress_scale)
         self.hole_penalty = float(raw_env.hole_penalty)
+        # Frame-stacking layout, so ``init_prev_progress`` can scan the stacked
+        # history for the most recent on-path ball position (the env's sticky
+        # ``_prev_progress`` can reach back through off-path excursions).
+        self.n_stack = int(getattr(raw_env, "obs_n_stack", 1))
+        # Ball xy sits at offset [2:4] within each stacked (state, action) frame,
+        # and at [2:4] of the plain base obs when unstacked.
+        self.frame_dim = int(getattr(raw_env, "_frame_dim", 0)) if self.n_stack > 1 else 0
 
     def _ball_pos(self, obs_norm: np.ndarray) -> np.ndarray:
         """Un-normalize a batch of normalized obs and return raw ball xy (B, 2)."""
@@ -389,22 +396,68 @@ class AnalyticCyberRunnerReward:
         )
         return float(p)
 
-    def reward(self, obs: np.ndarray, action: np.ndarray, next_obs: np.ndarray) -> np.ndarray:
-        """Vectorized over the batch; returns raw reward (B,)."""
-        ball_prev = self._ball_pos(obs)
-        ball_next = self._ball_pos(next_obs)
-        n = ball_next.shape[0]
-        out = np.zeros(n, dtype=np.float32)
+    def _progress_batch(self, ball: np.ndarray) -> np.ndarray:
+        """Per-sample path progress for a batch of ball positions (B, 2) → (B,).
+        Negative where the ball is off-path (path not detected)."""
+        n = ball.shape[0]
+        out = np.empty(n, dtype=np.float32)
         for i in range(n):
-            pp = self._progress_of(ball_prev[i])
-            pn = self._progress_of(ball_next[i])
-            dense = (pn - pp) * self.scale if (pn >= 0 and pp >= 0) else 0.0
-            goal = self._GOAL_BONUS if np.linalg.norm(ball_next[i] - self.goal_pos) < self._GOAL_THRESHOLD else 0.0
-            hole = -self.hole_penalty if np.any(
-                np.linalg.norm(self.holes - ball_next[i], axis=1) < self._HOLE_RADIUS
-            ) else 0.0
-            out[i] = dense + goal + hole
+            out[i] = self._progress_of(ball[i])
         return out
+
+    def init_prev_progress(self, obs: np.ndarray) -> np.ndarray:
+        """Initial sticky ``prev_progress`` (B,) at the start of a rollout.
+
+        The env's ``_prev_progress`` holds the LAST on-path progress and only
+        updates when the ball is on-path, so after an off-path excursion it
+        reaches back to before the excursion. We reproduce that by scanning the
+        stacked frames newest-first and taking the first on-path progress. If no
+        frame in the window is on-path we return -1 (off-path); the sticky rule
+        then withholds dense reward until the ball rejoins the path, matching the
+        env's ``prev_progress >= 0`` gate."""
+        raw = np.asarray(
+            self._vecnorm.unnormalize_obs(np.asarray(obs, dtype=np.float32))
+        )
+        n = raw.shape[0]
+        out = np.full(n, -1.0, dtype=np.float32)
+        for i in range(n):
+            for k in range(self.n_stack):
+                off = k * self.frame_dim   # 0 for the (unstacked) base obs
+                ball = raw[i, off + 2: off + 4]
+                p = self._progress_of(ball)
+                if p >= 0:
+                    out[i] = p
+                    break
+        return out
+
+    def reward(self, prev_progress: np.ndarray, next_obs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Stateful reward for one imagined step, mirroring
+        ``CyberRunnerEnv._compute_reward`` + its sticky ``_prev_progress`` update.
+
+        Given the carried sticky ``prev_progress`` (B,) and the predicted
+        ``next_obs``, returns ``(reward, new_prev_progress)`` where:
+          - dense = (progress(next) - prev_progress) * scale, gated on BOTH being
+            on-path (exactly the env's ``curr>=0 and prev>=0`` condition),
+          - goal / hole bonuses as before, and
+          - new_prev_progress is ``prev_progress`` updated to progress(next) only
+            when next is on-path (the env's sticky update)."""
+        ball_next = self._ball_pos(next_obs)
+        pn = self._progress_batch(ball_next)
+        on_path = pn >= 0
+        valid = on_path & (prev_progress >= 0)
+        dense = np.where(valid, (pn - prev_progress) * self.scale, 0.0)
+        goal = np.where(
+            np.linalg.norm(ball_next - self.goal_pos, axis=1) < self._GOAL_THRESHOLD,
+            self._GOAL_BONUS, 0.0,
+        )
+        hole = np.where(
+            (np.linalg.norm(self.holes[None] - ball_next[:, None], axis=2)
+             < self._HOLE_RADIUS).any(axis=1),
+            -self.hole_penalty, 0.0,
+        )
+        rew = (dense + goal + hole).astype(np.float32)
+        new_prev = np.where(on_path, pn, prev_progress).astype(np.float32)
+        return rew, new_prev
 
     def terminal(self, next_obs: np.ndarray) -> np.ndarray:
         """Vectorized absorbing-state mask (B,) for imagined transitions.
@@ -602,19 +655,26 @@ class MBPOTrainer:
         # forward — so a single rollout can't keep stamping penalties past a
         # terminal, and longer rollouts stay on the real MDP's support.
         alive = np.ones(len(obs), dtype=bool)
+        # Sticky path progress carried across the rollout, replicating the env's
+        # stateful ``_prev_progress`` (holds the last on-path value, only updates
+        # when on-path). Initialised from the stacked history of the start state.
+        prev_prog = self.reward_model.init_prev_progress(obs)
         for _ in range(length):
             act, _ = self.sac.predict(obs, deterministic=False)
             nobs, unc = self.dynamics.sample(obs, act)
             # Reward from the analytic model (raw scale), not the dynamics net.
-            rew = self.reward_model.reward(obs, act, nobs)
+            # Returns the reward and the updated sticky progress for next step.
+            rew, prev_prog = self.reward_model.reward(prev_prog, nobs)
             rew = rew + self.optimism * unc   # optimism / UCB exploration bonus
             self._unc_mean = float(unc.mean())
+            # Analytic terminals (hole = failure, goal = success), mirroring the
+            # real env. Computed on the same (pre-clip) nobs the reward used, so
+            # the hole/goal detection can't disagree with the reward's terms.
+            # Absorbing states get a zero-bootstrap target, so the critic stops
+            # treating holes as survivable recurring costs.
+            done = self.reward_model.terminal(nobs)
             nobs = np.clip(nobs, -10.0, 10.0)
             rew = np.clip(rew, -10.0, 10.0)   # guard against model exploitation
-            # Analytic terminals (hole = failure, goal = success), mirroring the
-            # real env. Absorbing states get a zero-bootstrap target, so the
-            # critic stops treating holes as survivable recurring costs.
-            done = self.reward_model.terminal(nobs)
 
             m = alive   # only store transitions for still-alive branches
             all_obs.append(obs[m])

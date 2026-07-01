@@ -36,13 +36,13 @@ sampling_type: TS1             # rollout sampling: mean | TS1 | TSInf | DS
 # ── Buffers ───────────────────────────────────────────────────────────────────
 real_buffer_size: 1_000_000
 model_buffer_size: 1_000_000     # SAC's replay buffer (synthetic model rollouts + penalty transitions)
-real_ratio: 0.1                # fraction of each SAC batch drawn from real data (rest = model rollouts)
+real_ratio: 0.25                # fraction of each SAC batch drawn from real data (rest = model rollouts)
 
 # ── Rollout schedule ──────────────────────────────────────────────────────────
 warmup_steps: 20_000           # pure random collection before model training
 rollout_batch_size: 400        # initial states per rollout call
 min_rollout_length: 1
-max_rollout_length: 1
+max_rollout_length: 5
 rollout_schedule_steps: 200_000  # steps over which length grows min→max
 
 # ── Exploration ───────────────────────────────────────────────────────────────
