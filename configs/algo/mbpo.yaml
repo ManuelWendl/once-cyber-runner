@@ -9,7 +9,7 @@ gamma: 0.99
 ent_coef: auto   # thermostat: holds policy at target_entropy and self-adjusts α.
                  # A fixed small value removes the entropy TARGET, so the policy
                  # collapses (entropy free-falls) and ep_rew destabilizes.
-target_entropy: 0.0    # was "auto" (=-dim(A)=-2): an unreachable target made the
+target_entropy: auto    # was "auto" (=-dim(A)=-2): an unreachable target made the
                        # auto entropy coef α run away to ~900 (run dry-cherry-211),
                        # so the -α·logπ term dominated the soft-Q backup and Q
                        # diverged to large negatives. 0.0 targets logπ≈0, which is
