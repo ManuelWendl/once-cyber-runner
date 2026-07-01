@@ -60,4 +60,4 @@ optimism: 0.0                  # rollout reward += optimism * ‖σ‖₂ (model
                                # ‖σ‖₂) so the bonus is a sensible fraction of the reward.
 
 # ── Policy update ─────────────────────────────────────────────────────────────
-utd_ratio: 1                   # SAC gradient steps per env step (after warmup)
+utd_ratio: 10                   # SAC gradient steps per env step (after warmup)
