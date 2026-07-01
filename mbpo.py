@@ -558,6 +558,14 @@ class MBPOTrainer:
         self._unc_mean = float("nan")
         self._calib_err = float("nan")
 
+        # Cumulative, absolute episode-outcome counters over real (executed)
+        # transitions — the baseline safety/performance metric. holes_total is a
+        # monotonic count of marble-into-hole failures (NOT a ratio); goals_total
+        # counts real goal reaches. Both are read from the env's
+        # info["termination_reason"] on terminal steps and logged to W&B.
+        self._holes_total = 0
+        self._goals_total = 0
+
         # Uncertainty-based rollout truncation (MOPO/M2AC-style). A branch stops
         # being rolled forward once its predictive uncertainty ‖σ‖₂ exceeds this
         # threshold, so imagined rollouts self-limit to the model's reliable
@@ -793,6 +801,13 @@ class MBPOTrainer:
                 if ep_info is not None:
                     ep_rewards.append(float(ep_info["r"]))
                     ep_lengths.append(int(ep_info["l"]))
+                # Cumulative absolute outcome counts on real terminal steps.
+                if bool(done[i]):
+                    reason = infos[i].get("termination_reason")
+                    if reason == "hole":
+                        self._holes_total += 1
+                    elif reason == "goal":
+                        self._goals_total += 1
 
             obs = nobs
             step += n_envs
@@ -846,6 +861,11 @@ class MBPOTrainer:
                     parts.append(f"ep_len={ep_len:.0f}")
                     log["train/ep_rew"] = ep_rew
                     log["train/ep_len"] = ep_len
+                # Cumulative absolute outcome counts (monotonic, not ratios).
+                log["train/holes_total"] = self._holes_total
+                log["train/goals_total"] = self._goals_total
+                parts.append(f"holes_total={self._holes_total}")
+                parts.append(f"goals_total={self._goals_total}")
                 if actor_losses:
                     al = np.mean(actor_losses[-100:])
                     cl = np.mean(critic_losses[-100:])
