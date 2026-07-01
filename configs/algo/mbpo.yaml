@@ -42,7 +42,7 @@ real_ratio: 0.25                # fraction of each SAC batch drawn from real dat
 warmup_steps: 20_000           # pure random collection before model training
 rollout_batch_size: 400        # initial states per rollout call
 min_rollout_length: 1
-max_rollout_length: 5
+max_rollout_length: 1
 rollout_schedule_steps: 200_000  # steps over which length grows min→max
 rollout_unc_threshold: 0.5     # truncate an imagined branch once its predictive
                                # uncertainty ‖σ‖₂ exceeds this, so rollouts stay in
