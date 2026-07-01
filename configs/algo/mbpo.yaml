@@ -44,6 +44,14 @@ rollout_batch_size: 400        # initial states per rollout call
 min_rollout_length: 1
 max_rollout_length: 5
 rollout_schedule_steps: 200_000  # steps over which length grows min→max
+rollout_unc_threshold: 0.5     # truncate an imagined branch once its predictive
+                               # uncertainty ‖σ‖₂ exceeds this, so rollouts stay in
+                               # the model's reliable region instead of compounding
+                               # error off-distribution (which blew up the SAC critic
+                               # in run earthy-shape-214 at rollout_len=5). On-dist
+                               # model_unc ≈ 0.3, drift spikes >1.0, so ~0.5 passes
+                               # normal steps and cuts drift. null disables. Watch
+                               # train/rollout_len_eff vs rollout_len to tune.
 
 # ── Exploration ───────────────────────────────────────────────────────────────
 optimism: 0.0                  # rollout reward += optimism * ‖σ‖₂ (model prediction

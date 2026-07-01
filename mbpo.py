@@ -558,6 +558,17 @@ class MBPOTrainer:
         self._unc_mean = float("nan")
         self._calib_err = float("nan")
 
+        # Uncertainty-based rollout truncation (MOPO/M2AC-style). A branch stops
+        # being rolled forward once its predictive uncertainty ‖σ‖₂ exceeds this
+        # threshold, so imagined rollouts self-limit to the model's reliable
+        # region instead of compounding error off-distribution (which destroys
+        # the SAC critic — see run earthy-shape-214). None/inf disables it (rely
+        # only on max_rollout_length). Tune against train/model_unc: set it a bit
+        # above the on-distribution mean so normal steps pass but drift is cut.
+        thr = ac.get("rollout_unc_threshold", None)
+        self.rollout_unc_threshold = float("inf") if thr is None else float(thr)
+        self._rollout_len_eff = float("nan")   # realized mean rollout length
+
         # SAC operates on synthetic rollouts stored in its replay buffer
         self.sac = SAC(
             "MlpPolicy", env, verbose=0, device=device,
@@ -655,6 +666,9 @@ class MBPOTrainer:
         # forward — so a single rollout can't keep stamping penalties past a
         # terminal, and longer rollouts stay on the real MDP's support.
         alive = np.ones(len(obs), dtype=bool)
+        n_start = len(obs)
+        stored_per_branch = np.zeros(n_start, dtype=np.int64)
+        unc_means: list[float] = []
         # Sticky path progress carried across the rollout, replicating the env's
         # stateful ``_prev_progress`` (holds the last on-path value, only updates
         # when on-path). Initialised from the stacked history of the start state.
@@ -666,7 +680,7 @@ class MBPOTrainer:
             # Returns the reward and the updated sticky progress for next step.
             rew, prev_prog = self.reward_model.reward(prev_prog, nobs)
             rew = rew + self.optimism * unc   # optimism / UCB exploration bonus
-            self._unc_mean = float(unc.mean())
+            unc_means.append(float(unc.mean()))
             # Analytic terminals (hole = failure, goal = success), mirroring the
             # real env. Computed on the same (pre-clip) nobs the reward used, so
             # the hole/goal detection can't disagree with the reward's terms.
@@ -676,17 +690,28 @@ class MBPOTrainer:
             nobs = np.clip(nobs, -10.0, 10.0)
             rew = np.clip(rew, -10.0, 10.0)   # guard against model exploitation
 
-            m = alive   # only store transitions for still-alive branches
+            # Only keep transitions the model is confident about: an alive branch
+            # whose predictive uncertainty is within threshold. High-uncertainty
+            # (off-distribution) predictions are dropped, not stored, so they
+            # never become bootstrap targets.
+            reliable = unc <= self.rollout_unc_threshold
+            m = alive & reliable
             all_obs.append(obs[m])
             all_nobs.append(nobs[m])
             all_act.append(act[m])
             all_rew.append(rew[m])
             all_done.append(done[m])
+            stored_per_branch[m] += 1
 
-            alive = alive & ~done
+            # Stop rolling a branch if it terminated, went off-distribution, or
+            # was already dead.
+            alive = alive & reliable & ~done
             if not alive.any():
                 break
             obs = nobs
+
+        self._unc_mean = float(np.mean(unc_means)) if unc_means else float("nan")
+        self._rollout_len_eff = float(stored_per_branch.mean())
 
         self._batch_add_to_sac(
             np.concatenate(all_obs), np.concatenate(all_nobs),
@@ -847,6 +872,12 @@ class MBPOTrainer:
                 log["train/model_buffer"] = self.sac.replay_buffer.size()
                 log["train/real_ratio"] = self.real_ratio
                 log["train/rollout_len"] = self._rollout_length(step)
+                # Realized mean rollout length after uncertainty/terminal
+                # truncation — if this is far below rollout_len, the model is
+                # bailing out early (drift / off-distribution).
+                if not np.isnan(self._rollout_len_eff):
+                    log["train/rollout_len_eff"] = self._rollout_len_eff
+                    parts.append(f"rollout_len_eff={self._rollout_len_eff:.2f}")
                 # ── reward diagnostic ─────────────────────────────────────
                 # Q ≈ r̄/(1−γ), so the sign of Q tracks the sign of the mean
                 # stored (model-buffer) reward.
