@@ -558,6 +558,18 @@ class MBPOTrainer:
         self._unc_mean = float("nan")
         self._calib_err = float("nan")
 
+        # Reward conditioning. Pure SAC trains on VecNormalize-normalized rewards
+        # (÷ running return-std ≈ 40, clipped to ±10); MBPO stores raw rewards, so
+        # SAC would MSE-regress onto a std≈13 channel with ±644 outliers (spurious
+        # Δprogress spikes) — measured to wreck the critic. We instead apply a
+        # FIXED scale + clip to EVERY stored reward (real and analytic model), so
+        # both halves of a mixed batch share one well-conditioned ~unit scale
+        # regardless of real_ratio (VecNormalize reward-norm can't be reused here
+        # because analytic model rewards never pass through it). reward_scale≈the
+        # measured VecNormalize divisor; reward_clip matches its clip_reward.
+        self.reward_scale = float(ac.get("reward_scale", 1.0))
+        self.reward_clip = float(ac.get("reward_clip", 10.0))
+
         # Uncertainty-based rollout truncation (MOPO/M2AC-style). A branch stops
         # being rolled forward once its predictive uncertainty ‖σ‖₂ exceeds this
         # threshold, so imagined rollouts self-limit to the model's reliable
@@ -617,6 +629,12 @@ class MBPOTrainer:
 
     # Backwards-compatible alias (the safety shield has been removed).
     shielded_predict = predict
+
+    def _condition_reward(self, r: np.ndarray) -> np.ndarray:
+        """Scale + clip a reward to the well-conditioned range SAC trains on
+        (mirrors VecNormalize's ÷return-std then clip). Applied identically to
+        real and analytic-model rewards so a mixed batch is single-scale."""
+        return np.clip(np.asarray(r) / self.reward_scale, -self.reward_clip, self.reward_clip)
 
     # ── world model training ──────────────────────────────────────────────
 
@@ -680,6 +698,7 @@ class MBPOTrainer:
             # Returns the reward and the updated sticky progress for next step.
             rew, prev_prog = self.reward_model.reward(prev_prog, nobs)
             rew = rew + self.optimism * unc   # optimism / UCB exploration bonus
+            rew = self._condition_reward(rew)  # same scale+clip as stored real rewards
             unc_means.append(float(unc.mean()))
             # Analytic terminals (hole = failure, goal = success), mirroring the
             # real env. Computed on the same (pre-clip) nobs the reward used, so
@@ -782,10 +801,21 @@ class MBPOTrainer:
             for i in range(n_envs):
                 terminal = bool(done[i]) and not infos[i].get("TimeLimit.truncated", False)
                 t = np.array([terminal])
+                # On episode end the VecEnv auto-resets, so nobs[i] is the RESET
+                # obs; the true final obs is in infos[i]["terminal_observation"]
+                # (already VecNormalize-normalized). Substitute it so the stored
+                # next_obs is correct — matters for timeout bootstrapping (SB3
+                # does this substitution in _store_transition; we replicate it).
+                next_o = nobs[i:i+1]
+                if bool(done[i]) and "terminal_observation" in infos[i]:
+                    next_o = np.asarray(infos[i]["terminal_observation"], dtype=np.float32)[None]
+                # Condition the reward (scale+clip) to the range SAC trains on,
+                # matching the analytic-model rewards stored during rollouts.
+                r_cond = self._condition_reward(rew[i:i+1])
                 # Real buffer always gets the executed action (clean ground truth)
                 self.real_buffer.add(
-                    obs[i:i+1], nobs[i:i+1], act[i:i+1],
-                    rew[i:i+1], t, [infos[i]],
+                    obs[i:i+1], next_o, act[i:i+1],
+                    r_cond, t, [infos[i]],
                 )
                 ep_info = infos[i].get("episode")
                 if ep_info is not None:
@@ -795,19 +825,31 @@ class MBPOTrainer:
             obs = nobs
             step += n_envs
 
-            if step == ac.warmup_steps:
+            # ``step`` advances by n_envs, so exact ``step % freq == 0`` tests
+            # rarely align (they fire at lcm(n_envs, freq)). Use a boundary-
+            # crossing test so cadence matches the configured freq for any n_envs.
+            def _crossed(freq: int) -> bool:
+                return (step // freq) > ((step - n_envs) // freq)
+
+            if step >= ac.warmup_steps and (step - n_envs) < ac.warmup_steps:
                 print(f"[MBPO] Warmup done ({step} steps). Starting model training + SAC updates.", flush=True)
 
-            if step % ac.model_train_freq == 0 and step >= ac.warmup_steps:
+            if step >= ac.warmup_steps and _crossed(ac.model_train_freq):
                 train_nll, val_nll = self._train_dynamics()
                 if not np.isnan(train_nll):
                     model_train_nlls.append(train_nll)
                     model_val_nlls.append(val_nll)
 
-            if step >= ac.warmup_steps and step % ac.rollout_freq == 0:
+            if step >= ac.warmup_steps and _crossed(ac.rollout_freq):
                 self._generate_rollouts(self._rollout_length(step))
 
-            if step >= ac.warmup_steps and self.sac.replay_buffer.size() >= ac.batch_size:
+            # Gate SAC updates on whichever buffer actually feeds the batch: at
+            # real_ratio=1 the model buffer stays empty, so gating on it alone
+            # would block all training. MixedReplayBuffer.sample falls back to
+            # whichever source is non-empty.
+            if step >= ac.warmup_steps and max(
+                self.real_buffer.size(), self.sac.replay_buffer.size()
+            ) >= ac.batch_size:
                 for _ in range(ac.utd_ratio):
                     self.sac.train(gradient_steps=1, batch_size=ac.batch_size)
                     logger = self.sac.logger
@@ -822,7 +864,9 @@ class MBPOTrainer:
                         if ec is not None:
                             ent_coefs.append(float(ec))
 
-            if step >= ac.warmup_steps and step % 2_000 == 0 and self.sac.replay_buffer.size() >= ac.batch_size:
+            if step >= ac.warmup_steps and _crossed(2_000) and max(
+                self.real_buffer.size(), self.sac.replay_buffer.size()
+            ) >= ac.batch_size:
                 with torch.no_grad():
                     b = self.sac.replay_buffer.sample(512)
                     obs_t = b.observations.to(self.device)
@@ -834,7 +878,7 @@ class MBPOTrainer:
                     # when reward is small, dominates Q. Track it to confirm.
                     policy_entropies.append(float((-logp_t).mean()))
 
-            if step % 2_000 == 0:
+            if _crossed(2_000):
                 parts = [f"[MBPO] {step:>8}/{total_timesteps}"]
                 log = {"train/step": step}
                 if ep_rewards:

@@ -33,13 +33,23 @@ sig_min: 1e-3                  # min aleatoric std (reference sig_min clamp)
 sig_max: 1e3                   # max aleatoric std (reference sig_max clamp)
 sampling_type: TS1             # rollout sampling: mean | TS1 | TSInf | DS
 
+# ── Reward conditioning ───────────────────────────────────────────────────────
+# MBPO trains SAC on RAW rewards (env.norm_reward is off so real+analytic-model
+# rewards stay on one scale). Raw rewards here have std≈13 with ±644 outliers
+# (spurious Δprogress spikes), which wrecks the critic — pure SAC only works
+# because VecNormalize divides rewards by ≈40 (running return-std) and clips ±10.
+# We replicate that with a FIXED scale+clip applied to every stored reward.
+reward_scale: 40.0             # ≈ measured VecNormalize divisor sqrt(ret_rms.var)
+reward_clip: 10.0              # matches VecNormalize clip_reward
+
 # ── Buffers ───────────────────────────────────────────────────────────────────
 real_buffer_size: 1_000_000
 model_buffer_size: 1_000_000     # SAC's replay buffer (synthetic model rollouts + penalty transitions)
 real_ratio: 1                # fraction of each SAC batch drawn from real data (rest = model rollouts)
 
 # ── Rollout schedule ──────────────────────────────────────────────────────────
-warmup_steps: 20_000           # pure random collection before model training
+warmup_steps: 10_048           # pure random collection before model training
+                               # (multiple of n_envs=64; matches SAC learning_starts≈10k)
 rollout_batch_size: 400        # initial states per rollout call
 min_rollout_length: 1
 max_rollout_length: 3
