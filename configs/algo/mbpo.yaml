@@ -9,15 +9,12 @@ gamma: 0.99
 ent_coef: auto   # thermostat: holds policy at target_entropy and self-adjusts α.
                  # A fixed small value removes the entropy TARGET, so the policy
                  # collapses (entropy free-falls) and ep_rew destabilizes.
-target_entropy: auto    # was "auto" (=-dim(A)=-2): an unreachable target made the
-                       # auto entropy coef α run away to ~900 (run dry-cherry-211),
-                       # so the -α·logπ term dominated the soft-Q backup and Q
-                       # diverged to large negatives. 0.0 targets logπ≈0, which is
-                       # reachable, so α stabilises and stops dragging Q. Original:
-                       # "auto" = -dim(A) = -2. That default over-concentrates the
-                       # policy (logπ≈+2), which drags the soft-Q negative and flips
-                       # the survive-vs-terminate incentive. Set ~0.0 to keep the
-                       # policy mildly stochastic and Q positive. "auto" or a float.
+target_entropy: 0.0     # NOT auto(=-2). At -2 the policy over-concentrates early,
+                       # α decays to ~0.001 (entropy regularisation effectively OFF),
+                       # and the twin-critic can no longer hold back overestimation →
+                       # Q ran away to 280 with critic_loss→3.6e5 (~130k onward).
+                       # target_entropy=0 keeps the policy mildly stochastic so α
+                       # stays alive (~0.05-0.2) and keeps regularising the critic.
 
 # ── World model ───────────────────────────────────────────────────────────────
 ensemble_size: 5
@@ -39,7 +36,10 @@ sampling_type: TS1             # rollout sampling: mean | TS1 | TSInf | DS
 # (spurious Δprogress spikes), which wrecks the critic — pure SAC only works
 # because VecNormalize divides rewards by ≈40 (running return-std) and clips ±10.
 # We replicate that with a FIXED scale+clip applied to every stored reward.
-reward_scale: 40.0             # ≈ measured VecNormalize divisor sqrt(ret_rms.var)
+reward_scale: 25.0             # ≈ VecNormalize divisor sqrt(ret_rms.var) measured
+                               # AFTER the Δprogress clip removed the ±640 spikes
+                               # (was 38 with the artifact → 23 without; 25 ≈ that,
+                               # allowing for the divisor growing as the policy improves)
 reward_clip: 10.0              # matches VecNormalize clip_reward
 
 # ── Buffers ───────────────────────────────────────────────────────────────────

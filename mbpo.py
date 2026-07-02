@@ -355,6 +355,7 @@ class AnalyticCyberRunnerReward:
     def __init__(self, vecnorm, raw_env) -> None:
         from envs.cyberrunner import (
             compute_path_progress, GOAL_BONUS, GOAL_THRESHOLD, HOLE_RADIUS,
+            PROGRESS_DELTA_CLIP,
         )
         if getattr(raw_env, "prior_mode", False):
             raise NotImplementedError(
@@ -367,6 +368,7 @@ class AnalyticCyberRunnerReward:
         self._GOAL_BONUS = float(GOAL_BONUS)
         self._GOAL_THRESHOLD = float(GOAL_THRESHOLD)
         self._HOLE_RADIUS = float(HOLE_RADIUS)
+        self._PROGRESS_DELTA_CLIP = float(PROGRESS_DELTA_CLIP)
         self.waypoints = raw_env.waypoints
         self.seg_lengths = raw_env.seg_lengths
         self.cum_distances = raw_env.cum_distances
@@ -445,7 +447,11 @@ class AnalyticCyberRunnerReward:
         pn = self._progress_batch(ball_next)
         on_path = pn >= 0
         valid = on_path & (prev_progress >= 0)
-        dense = np.where(valid, (pn - prev_progress) * self.scale, 0.0)
+        # Clip Δprogress to reject spurious segment-detection jumps (matches the
+        # env's PROGRESS_DELTA_CLIP), so imagined dense rewards stay on the same
+        # bounded scale as the real ones.
+        dprog = np.clip(pn - prev_progress, -self._PROGRESS_DELTA_CLIP, self._PROGRESS_DELTA_CLIP)
+        dense = np.where(valid, dprog * self.scale, 0.0)
         goal = np.where(
             np.linalg.norm(ball_next - self.goal_pos, axis=1) < self._GOAL_THRESHOLD,
             self._GOAL_BONUS, 0.0,
