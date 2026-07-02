@@ -1,5 +1,5 @@
 name: mbpo
-n_envs: 4
+n_envs: 64
 
 # ── SAC hyperparams ───────────────────────────────────────────────────────────
 learning_rate: 3e-4
@@ -9,7 +9,7 @@ gamma: 0.99
 ent_coef: auto   # thermostat: holds policy at target_entropy and self-adjusts α.
                  # A fixed small value removes the entropy TARGET, so the policy
                  # collapses (entropy free-falls) and ep_rew destabilizes.
-target_entropy: 0    # was "auto" (=-dim(A)=-2): an unreachable target made the
+target_entropy: auto    # was "auto" (=-dim(A)=-2): an unreachable target made the
                        # auto entropy coef α run away to ~900 (run dry-cherry-211),
                        # so the -α·logπ term dominated the soft-Q backup and Q
                        # diverged to large negatives. 0.0 targets logπ≈0, which is
@@ -36,7 +36,7 @@ sampling_type: TS1             # rollout sampling: mean | TS1 | TSInf | DS
 # ── Buffers ───────────────────────────────────────────────────────────────────
 real_buffer_size: 1_000_000
 model_buffer_size: 1_000_000     # SAC's replay buffer (synthetic model rollouts + penalty transitions)
-real_ratio: 0.5                # fraction of each SAC batch drawn from real data (rest = model rollouts)
+real_ratio: 1                # fraction of each SAC batch drawn from real data (rest = model rollouts)
 
 # ── Rollout schedule ──────────────────────────────────────────────────────────
 warmup_steps: 20_000           # pure random collection before model training
@@ -60,4 +60,4 @@ optimism: 0.0                  # rollout reward += optimism * ‖σ‖₂ (model
                                # ‖σ‖₂) so the bonus is a sensible fraction of the reward.
 
 # ── Policy update ─────────────────────────────────────────────────────────────
-utd_ratio: 20                   # SAC gradient steps per env step (after warmup)
+utd_ratio: 1                   # SAC gradient steps per env step (after warmup)

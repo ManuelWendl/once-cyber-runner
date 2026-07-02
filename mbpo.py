@@ -687,8 +687,6 @@ class MBPOTrainer:
             # Absorbing states get a zero-bootstrap target, so the critic stops
             # treating holes as survivable recurring costs.
             done = self.reward_model.terminal(nobs)
-            nobs = np.clip(nobs, -10.0, 10.0)
-            rew = np.clip(rew, -10.0, 10.0)   # guard against model exploitation
 
             # Only keep transitions the model is confident about: an alive branch
             # whose predictive uncertainty is within threshold. High-uncertainty
