@@ -345,11 +345,12 @@ class AnalyticCyberRunnerReward:
     learned net.
 
     It mirrors ``CyberRunnerEnv._compute_reward`` (main task): dense signed
-    path-progress shaping + goal bonus + hole penalty. The dynamics model and
-    rollouts live in VecNormalize's NORMALIZED observation space, so the reward
-    first un-normalizes obs to recover raw board ball positions (dims [2:4]),
-    then evaluates the same progress/goal/hole terms the env uses, returning the
-    same RAW reward the env stores (norm_reward is disabled for MBPO).
+    path-progress shaping + goal bonus + hole penalty. Rollouts run in
+    VecNormalize's NORMALIZED observation space, so the reward first un-normalizes
+    obs to recover raw board ball positions (dims [2:4]), then evaluates the same
+    progress/goal/hole terms the env uses, returning the same RAW reward the env
+    produces. Imagined transitions are stored raw and normalized at sample time by
+    VecNormalize, exactly like the real ones.
     """
 
     def __init__(self, vecnorm, raw_env) -> None:
@@ -564,17 +565,8 @@ class MBPOTrainer:
         self._unc_mean = float("nan")
         self._calib_err = float("nan")
 
-        # Reward conditioning. Pure SAC trains on VecNormalize-normalized rewards
-        # (÷ running return-std ≈ 40, clipped to ±10); MBPO stores raw rewards, so
-        # SAC would MSE-regress onto a std≈13 channel with ±644 outliers (spurious
-        # Δprogress spikes) — measured to wreck the critic. We instead apply a
-        # FIXED scale + clip to EVERY stored reward (real and analytic model), so
-        # both halves of a mixed batch share one well-conditioned ~unit scale
-        # regardless of real_ratio (VecNormalize reward-norm can't be reused here
-        # because analytic model rewards never pass through it). reward_scale≈the
-        # measured VecNormalize divisor; reward_clip matches its clip_reward.
-        self.reward_scale = float(ac.get("reward_scale", 1.0))
-        self.reward_clip = float(ac.get("reward_clip", 10.0))
+        # (Reward conditioning removed: rewards are stored RAW and normalized at
+        # sample time by VecNormalize via _vec_normalize_env — see below.)
 
         # Uncertainty-based rollout truncation (MOPO/M2AC-style). A branch stops
         # being rolled forward once its predictive uncertainty ‖σ‖₂ exceeds this
@@ -615,16 +607,17 @@ class MBPOTrainer:
         )
         # SAC.train() requires _logger; silence it — MBPO has its own logging
         self.sac.set_logger(configure_logger(folder=None, format_strings=[]))
-        # We manage all observations in already-normalized space (VecNormalize output).
-        # Nulling this prevents SB3 from double-normalizing obs during predict() and train().
-        self.sac._vec_normalize_env = None
-        # SB3 stores raw rewards and renormalizes at sample time using current reward_rms.
-        # We store already-normalized rewards and sample them as-is (_vec_normalize_env=None),
-        # so reward_rms drift over training would make early stored rewards inconsistent with
-        # later ones (same raw reward → smaller normalized value as reward_rms.var grows).
-        # Disabling norm_reward makes stored rewards raw and consistent across the buffer lifetime.
-        if hasattr(env, "norm_reward"):
-            env.norm_reward = False
+        # RAW-storage architecture (mirrors pure SAC exactly). Both buffers store
+        # UN-normalized obs and reward; SB3 normalizes obs AND reward at SAMPLE
+        # time via _vec_normalize_env (ReplayBuffer._get_samples). This is
+        # byte-for-byte the pure-SAC pipeline, so at real_ratio=1 the SAC policy
+        # sees identical data. It also gives adaptive reward normalization for
+        # free (÷ running return-std, clip ±10) applied uniformly to the real and
+        # model halves — replacing the old fixed reward_scale/clip conditioning.
+        self.sac._vec_normalize_env = env
+        # Keep VecNormalize's reward normalization ON (as pure SAC has it): stats
+        # (ret_rms) update from the real env stream during learn(); model rewards
+        # are stored raw and normalized with the same stats at sample time.
 
         self._ac = ac
 
@@ -636,12 +629,6 @@ class MBPOTrainer:
     # Backwards-compatible alias (the safety shield has been removed).
     shielded_predict = predict
 
-    def _condition_reward(self, r: np.ndarray) -> np.ndarray:
-        """Scale + clip a reward to the well-conditioned range SAC trains on
-        (mirrors VecNormalize's ÷return-std then clip). Applied identically to
-        real and analytic-model rewards so a mixed batch is single-scale."""
-        return np.clip(np.asarray(r) / self.reward_scale, -self.reward_clip, self.reward_clip)
-
     # ── world model training ──────────────────────────────────────────────
 
     def _train_dynamics(self) -> tuple[float, float]:
@@ -651,7 +638,9 @@ class MBPOTrainer:
         self.dynamics.train()
         train_losses = []
         for _ in range(ac.model_train_epochs):
-            b = self.real_buffer.sample(min(ac.model_batch_size, self.real_buffer.size()))
+            # real_buffer stores RAW obs; pass env so obs/next_obs come back
+            # NORMALIZED — the dynamics model operates in VecNormalize space.
+            b = self.real_buffer.sample(min(ac.model_batch_size, self.real_buffer.size()), env=self.env)
             # Target (base-obs delta) is derived from next_obs inside the model;
             # reward is supplied analytically.
             loss = self.dynamics.nll_loss(b.observations, b.actions, b.next_observations)
@@ -661,7 +650,7 @@ class MBPOTrainer:
             self.model_opt.step()
             train_losses.append(loss.item())
         # Recalibrate predictive std on a held-out validation batch.
-        b = self.real_buffer.sample(min(2048, self.real_buffer.size()))
+        b = self.real_buffer.sample(min(2048, self.real_buffer.size()), env=self.env)
         self._calib_err = self.dynamics.update_calibration(b.observations, b.actions, b.next_observations)
         with torch.no_grad():
             val_loss = self.dynamics.nll_loss(b.observations, b.actions, b.next_observations).item()
@@ -678,8 +667,12 @@ class MBPOTrainer:
 
     def _generate_rollouts(self, length: int) -> None:
         ac = self._ac
-        b = self.real_buffer.sample(ac.rollout_batch_size)
-        obs = b.observations.cpu().numpy()   # already in normalized obs space
+        # real_buffer stores RAW; pass env so start states come back NORMALIZED —
+        # the dynamics model, policy, and analytic reward all operate in
+        # VecNormalize space during the rollout. Outputs are un-normalized to raw
+        # before storage so the SAC buffer holds raw (normalized again at sample).
+        b = self.real_buffer.sample(ac.rollout_batch_size, env=self.env)
+        obs = b.observations.cpu().numpy()   # normalized obs space
 
         # TS-∞: fix one ensemble member for the whole rollout (no-op for the
         # other sampling modes).
@@ -704,7 +697,6 @@ class MBPOTrainer:
             # Returns the reward and the updated sticky progress for next step.
             rew, prev_prog = self.reward_model.reward(prev_prog, nobs)
             rew = rew + self.optimism * unc   # optimism / UCB exploration bonus
-            rew = self._condition_reward(rew)  # same scale+clip as stored real rewards
             unc_means.append(float(unc.mean()))
             # Analytic terminals (hole = failure, goal = success), mirroring the
             # real env. Computed on the same (pre-clip) nobs the reward used, so
@@ -736,8 +728,14 @@ class MBPOTrainer:
         self._unc_mean = float(np.mean(unc_means)) if unc_means else float("nan")
         self._rollout_len_eff = float(stored_per_branch.mean())
 
+        # The rollout ran in normalized space; un-normalize obs/next_obs to RAW so
+        # the SAC buffer holds raw (VecNormalize re-normalizes at sample time,
+        # keeping model transitions on the same footing as real ones). Rewards
+        # are analytic raw already.
+        obs_raw = self.env.unnormalize_obs(np.concatenate(all_obs))
+        nobs_raw = self.env.unnormalize_obs(np.concatenate(all_nobs))
         self._batch_add_to_sac(
-            np.concatenate(all_obs), np.concatenate(all_nobs),
+            obs_raw, nobs_raw,
             np.concatenate(all_act), np.concatenate(all_rew),
             np.concatenate(all_done),
         )
@@ -779,7 +777,8 @@ class MBPOTrainer:
 
     def learn(self, total_timesteps: int, wandb_run=None) -> None:
         ac = self._ac
-        obs = self.env.reset()
+        obs = self.env.reset()                    # normalized obs (fed to the policy)
+        obs_raw = self.env.get_original_obs()      # raw obs (stored in the buffer)
         n_envs = self.env.num_envs
         step = 0
 
@@ -801,27 +800,29 @@ class MBPOTrainer:
                 act, _ = self.sac.predict(obs, deterministic=False)
 
             nobs, rew, done, infos = self.env.step(act)
+            # RAW views for buffer storage (SB3 stores raw, normalizes at sample).
+            nobs_raw = self.env.get_original_obs()
+            rew_raw = self.env.get_original_reward()
 
             # Store each parallel env's transition. Real executed transitions go
             # to real_buffer only — they reach SAC via the real_ratio sampler.
             for i in range(n_envs):
                 terminal = bool(done[i]) and not infos[i].get("TimeLimit.truncated", False)
                 t = np.array([terminal])
-                # On episode end the VecEnv auto-resets, so nobs[i] is the RESET
-                # obs; the true final obs is in infos[i]["terminal_observation"]
-                # (already VecNormalize-normalized). Substitute it so the stored
-                # next_obs is correct — matters for timeout bootstrapping (SB3
-                # does this substitution in _store_transition; we replicate it).
-                next_o = nobs[i:i+1]
+                # On episode end the VecEnv auto-resets, so nobs_raw[i] is the
+                # RESET obs; the true final obs is in infos[i]["terminal_observation"]
+                # (which VecNormalize stored NORMALIZED — un-normalize it back to
+                # raw). Substitute it so the stored next_obs is correct (matters
+                # for timeout bootstrapping; SB3 does the same in _store_transition).
+                next_o = nobs_raw[i:i+1]
                 if bool(done[i]) and "terminal_observation" in infos[i]:
-                    next_o = np.asarray(infos[i]["terminal_observation"], dtype=np.float32)[None]
-                # Condition the reward (scale+clip) to the range SAC trains on,
-                # matching the analytic-model rewards stored during rollouts.
-                r_cond = self._condition_reward(rew[i:i+1])
-                # Real buffer always gets the executed action (clean ground truth)
+                    term_norm = np.asarray(infos[i]["terminal_observation"], dtype=np.float32)[None]
+                    next_o = self.env.unnormalize_obs(term_norm)
+                # Store RAW obs + RAW reward; VecNormalize normalizes both at
+                # sample time (self.sac._vec_normalize_env = env).
                 self.real_buffer.add(
-                    obs[i:i+1], next_o, act[i:i+1],
-                    r_cond, t, [infos[i]],
+                    obs_raw[i:i+1], next_o, act[i:i+1],
+                    rew_raw[i:i+1], t, [infos[i]],
                 )
                 ep_info = infos[i].get("episode")
                 if ep_info is not None:
@@ -829,6 +830,7 @@ class MBPOTrainer:
                     ep_lengths.append(int(ep_info["l"]))
 
             obs = nobs
+            obs_raw = nobs_raw
             step += n_envs
 
             # ``step`` advances by n_envs, so exact ``step % freq == 0`` tests
@@ -874,7 +876,8 @@ class MBPOTrainer:
                 self.real_buffer.size(), self.sac.replay_buffer.size()
             ) >= ac.batch_size:
                 with torch.no_grad():
-                    b = self.sac.replay_buffer.sample(512)
+                    # env → normalized obs (buffer stores raw), matching training.
+                    b = self.sac.replay_buffer.sample(512, env=self.env)
                     obs_t = b.observations.to(self.device)
                     act_t, logp_t = self.sac.actor.action_log_prob(obs_t)
                     qs = torch.cat(self.sac.critic(obs_t, act_t), dim=1)
