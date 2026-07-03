@@ -1,5 +1,5 @@
 name: mbpo
-n_envs: 64
+n_envs: 1
 
 # ── SAC hyperparams ───────────────────────────────────────────────────────────
 learning_rate: 3e-4
@@ -35,7 +35,7 @@ sampling_type: TS1             # rollout sampling: mean | TS1 | TSInf | DS
 # ── Buffers ───────────────────────────────────────────────────────────────────
 real_buffer_size: 1_000_000
 model_buffer_size: 1_000_000     # SAC's replay buffer (synthetic model rollouts + penalty transitions)
-real_ratio: 1                # fraction of each SAC batch drawn from real data (rest = model rollouts)
+real_ratio: 0.1                # fraction of each SAC batch drawn from real data (rest = model rollouts)
 
 # ── Rollout schedule ──────────────────────────────────────────────────────────
 warmup_steps: 10_048           # pure random collection before model training
