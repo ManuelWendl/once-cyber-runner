@@ -891,12 +891,20 @@ class MBPOTrainer:
                 parts = [f"[MBPO] {step:>8}/{total_timesteps}"]
                 log = {"train/step": step}
                 if ep_rewards:
-                    ep_rew = ep_rewards[-1]
-                    ep_len = ep_lengths[-1]
-                    parts.append(f"ep_rew={ep_rew:.3f}")
-                    parts.append(f"ep_len={ep_len:.0f}")
-                    log["train/ep_rew"] = ep_rew
-                    log["train/ep_len"] = ep_len
+                    # Smoothed 100-episode rolling mean, matching pure SAC's
+                    # WandbCallback (train/ep_rew_mean). A single episode's return
+                    # is very noisy under randomize_init_pos, so the last-episode
+                    # value alone is not comparable to SAC's smoothed curve.
+                    if len(ep_rewards) >= 10:
+                        ep_rew_mean = float(np.mean(ep_rewards[-100:]))
+                        ep_len_mean = float(np.mean(ep_lengths[-100:]))
+                        log["train/ep_rew_mean"] = ep_rew_mean
+                        log["train/ep_len_mean"] = ep_len_mean
+                        parts.append(f"ep_rew_mean={ep_rew_mean:.3f}")
+                        parts.append(f"ep_len_mean={ep_len_mean:.0f}")
+                    # Keep the last-episode values too (raw, unsmoothed).
+                    log["train/ep_rew"] = ep_rewards[-1]
+                    log["train/ep_len"] = ep_lengths[-1]
                 if actor_losses:
                     al = np.mean(actor_losses[-100:])
                     cl = np.mean(critic_losses[-100:])
