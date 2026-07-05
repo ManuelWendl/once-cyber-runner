@@ -1,5 +1,5 @@
 name: mbpo
-n_envs: 1
+n_envs: 64
 
 # ── SAC hyperparams ───────────────────────────────────────────────────────────
 learning_rate: 3e-4
@@ -60,4 +60,4 @@ optimism: 0.0                  # rollout reward += optimism * ‖σ‖₂ (model
                                # ‖σ‖₂) so the bonus is a sensible fraction of the reward.
 
 # ── Policy update ─────────────────────────────────────────────────────────────
-utd_ratio: 10                   # SAC gradient steps per env step (after warmup)
+utd_ratio: 64                   # SAC gradient steps per env step (after warmup)
