@@ -53,6 +53,13 @@ JOINT_ANGLE_NOISE = 0.25 * np.pi / 180  # 0.25 degrees
 PROGRESS_SCALE = 1.0
 GOAL_BONUS = 10.0
 GOAL_THRESHOLD = 0.004  # 4mm
+# Max plausible one-step change in path progress. The closest-segment detection
+# occasionally FLIPS to a distant part of the path, producing spurious
+# Δprogress up to ~6.4 (→ ±640 dense reward) — physically impossible in one
+# 60Hz step (legitimate motion tops out ~0.68). Those spikes dominate the
+# reward variance and destabilise value learning, so the dense progress term is
+# computed on a Δprogress clipped to ±this bound.
+PROGRESS_DELTA_CLIP = 1.0
 
 
 # ============================================================================
@@ -1415,9 +1422,13 @@ class CyberRunnerEnv(gym.Env):
         # penalty. progress is the (×10-scaled) arc length along the path; the
         # step delta rewards forward motion and penalizes backward motion.
         if curr_progress >= 0 and self._prev_progress >= 0:
-            progress_reward = (
-                (float(curr_progress) - float(self._prev_progress)) * self.dense_main_progress_scale
+            # Clip Δprogress to reject spurious closest-segment detection jumps
+            # (see PROGRESS_DELTA_CLIP) before scaling into the dense reward.
+            dprog = np.clip(
+                float(curr_progress) - float(self._prev_progress),
+                -PROGRESS_DELTA_CLIP, PROGRESS_DELTA_CLIP,
             )
+            progress_reward = dprog * self.dense_main_progress_scale
         else:
             progress_reward = 0.0
 

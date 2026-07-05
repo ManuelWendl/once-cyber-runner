@@ -223,8 +223,16 @@ def main(cfg: DictConfig):
                 "mbpo_cyberrunner_vecnormalize.pkl",
                 "mbpo_cyberrunner_env_cfg.json",
             ])
+            # Build a fresh single-env eval (own_env path) from the just-saved
+            # VecNormalize + env cfg, so eval starts at waypoints[0]
+            # (randomize_init_pos is forced False there) and logs raw rewards —
+            # matching the SAC/PPO eval. Reusing trainer.env would inherit the
+            # training env's randomize_init_pos=True (random start) and
+            # norm_reward=True (normalized-scale eval reward).
             eval_and_log_video(
-                run, trainer.sac, vec_env=trainer.env,
+                run, trainer.sac,
+                vecnorm_path="mbpo_cyberrunner_vecnormalize.pkl",
+                env_cfg_path="mbpo_cyberrunner_env_cfg.json",
                 predict_fn=trainer.shielded_predict,
             )
             run.finish()

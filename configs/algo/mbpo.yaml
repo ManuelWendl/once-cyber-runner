@@ -1,47 +1,63 @@
 name: mbpo
-n_envs: 4
+n_envs: 64
 
 # ── SAC hyperparams ───────────────────────────────────────────────────────────
 learning_rate: 3e-4
 batch_size: 256
 tau: 0.005
-gamma: 1
+gamma: 0.99
 ent_coef: auto   # thermostat: holds policy at target_entropy and self-adjusts α.
                  # A fixed small value removes the entropy TARGET, so the policy
                  # collapses (entropy free-falls) and ep_rew destabilizes.
-target_entropy: auto   # "auto" = -dim(A) = -2. That default over-concentrates the
-                       # policy (logπ≈+2), which drags the soft-Q negative and flips
-                       # the survive-vs-terminate incentive. Set ~0.0 to keep the
-                       # policy mildly stochastic and Q positive. "auto" or a float.
+target_entropy: auto    # SAC-parity setting (=-dim(A)=-2, same as sac.yaml). With
+                       # the RAW-storage + VecNormalize-at-sample architecture the
+                       # reward is now adaptively normalized exactly like pure SAC,
+                       # so auto should be stable (the earlier α-collapse→Q-runaway
+                       # was driven by the ±640 reward artifact + fixed non-adaptive
+                       # scaling, both now removed). If it destabilises with model
+                       # data (real_ratio<1), fall back to 0.0 (keeps α alive).
 
 # ── World model ───────────────────────────────────────────────────────────────
 ensemble_size: 5
-num_elites: 3
-hidden_sizes: [256, 256, 256]
+num_elites: 3                  # (unused) elites replaced by std calibration
+hidden_sizes: [256, 256]
 model_lr: 3e-4
 model_weight_decay: 0
-model_train_freq: 50          # retrain world model every N env steps
+model_train_freq: 2000         # retrain world model every N env steps
 rollout_freq: 250              # regenerate synthetic rollouts every N env steps
 model_train_epochs: 50
 model_batch_size: 512
+sig_min: 1e-3                  # min aleatoric std (reference sig_min clamp)
+sig_max: 1e3                   # max aleatoric std (reference sig_max clamp)
+sampling_type: TS1             # rollout sampling: mean | TS1 | TSInf | DS
+
 
 # ── Buffers ───────────────────────────────────────────────────────────────────
-real_buffer_size: 100_000
-model_buffer_size: 200_000     # SAC's replay buffer (synthetic model rollouts + penalty transitions)
-real_ratio: 0.0                # fraction of each SAC batch drawn from real data (rest = model rollouts)
+real_buffer_size: 1_000_000
+model_buffer_size: 1_000_000     # SAC's replay buffer (synthetic model rollouts + penalty transitions)
+real_ratio: 0.1                # fraction of each SAC batch drawn from real data (rest = model rollouts)
 
 # ── Rollout schedule ──────────────────────────────────────────────────────────
-warmup_steps: 20_000           # pure random collection before model training
+warmup_steps: 10_048           # pure random collection before model training
+                               # (multiple of n_envs=64; matches SAC learning_starts≈10k)
 rollout_batch_size: 400        # initial states per rollout call
 min_rollout_length: 1
-max_rollout_length: 1
-rollout_schedule_steps: 200_000  # steps over which length grows min→max
+max_rollout_length: 3
+rollout_schedule_steps: 1_000_000  # steps over which length grows min→max
+rollout_unc_threshold: 0.5     # truncate an imagined branch once its predictive
+                               # uncertainty ‖σ‖₂ exceeds this, so rollouts stay in
+                               # the model's reliable region instead of compounding
+                               # error off-distribution (which blew up the SAC critic
+                               # in run earthy-shape-214 at rollout_len=5). On-dist
+                               # model_unc ≈ 0.3, drift spikes >1.0, so ~0.5 passes
+                               # normal steps and cuts drift. null disables. Watch
+                               # train/rollout_len_eff vs rollout_len to tune.
 
 # ── Exploration ───────────────────────────────────────────────────────────────
-optimism: 0.1                  # rollout reward += optimism * ‖σ‖₂ (model prediction
+optimism: 0.0                  # rollout reward += optimism * ‖σ‖₂ (model prediction
                                # uncertainty). Optimism in the face of uncertainty;
                                # 0.0 disables. Tune against train/model_unc (the mean
                                # ‖σ‖₂) so the bonus is a sensible fraction of the reward.
 
 # ── Policy update ─────────────────────────────────────────────────────────────
-utd_ratio: 1                   # SAC gradient steps per env step (after warmup)
+utd_ratio: 64                   # SAC gradient steps per env step (after warmup)
