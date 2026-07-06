@@ -94,15 +94,55 @@ class MixedReplayBuffer(ReplayBuffer):
 class EnsembleLinear(nn.Module):
     """Single batched linear layer for E parallel models."""
 
-    def __init__(self, E: int, in_dim: int, out_dim: int) -> None:
+    def __init__(self, E: int, in_dim: int, out_dim: int, identity_init: bool = False) -> None:
         super().__init__()
         self.W = nn.Parameter(torch.empty(E, in_dim, out_dim))
         self.b = nn.Parameter(torch.zeros(E, 1, out_dim))
+        # Default init: per-member truncated normal (keeps ensemble members diverse).
         nn.init.trunc_normal_(self.W, std=in_dim ** -0.5)
+        # Identity prior: square weight matrices are the identity PLUS the trunc-normal
+        # noise above (mean = I, so each member is a near-identity residual map, but
+        # members still differ — preserving epistemic diversity). Non-square layers
+        # keep the plain trunc-normal init. The decay target μ (see
+        # ``EnsembleDynamics.identity_prior_mu``) remains the pure identity.
+        if identity_init and in_dim == out_dim:
+            with torch.no_grad():
+                self.W.add_(torch.eye(in_dim).unsqueeze(0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (E, B, in_dim) → (E, B, out_dim)
         return x @ self.W + self.b
+
+
+class IdentityPriorAdamW(Adam):
+    """Adam with decoupled (AdamW-style) weight decay pulling each weight matrix
+    toward a per-parameter prior mean ``mu`` instead of toward zero.
+
+    PyTorch port of the reference's ``add_identity_decayed_weights``: square weight
+    matrices are pulled to the identity (μ = I), non-square weight matrices toward
+    0 (μ = 0), and biases are left untouched (not in ``mu``). The decay is applied
+    directly to the parameter, bypassing Adam's first/second moment estimators —
+    exactly the decoupled AdamW update ``θ ← θ - lr·wd·(θ - μ)``.
+    """
+
+    def __init__(self, params, lr, mu, weight_decay, **kw):
+        super().__init__(params, lr=lr, weight_decay=0.0, **kw)
+        # dict: Parameter -> prior-mean tensor. Params absent from mu are not decayed.
+        self._id_mu = mu
+        self._id_wd = float(weight_decay)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        if self._id_wd > 0:
+            for group in self.param_groups:
+                lr = group["lr"]
+                for p in group["params"]:
+                    mu = self._id_mu.get(p)
+                    if mu is None:
+                        continue
+                    # Decoupled decay toward μ: θ ← θ - lr·wd·(θ - μ).
+                    p.add_(p - mu, alpha=-lr * self._id_wd)
+        return super().step(closure)
 
 
 class SamplingType:
@@ -165,8 +205,10 @@ class EnsembleDynamics(nn.Module):
         frame_dim: int = 0,
         state_dim: int = 0,
         path_dim: int = 0,
+        identity_prior: bool = False,
     ) -> None:
         super().__init__()
+        self.identity_prior = bool(identity_prior)
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.ensemble_size = ensemble_size
@@ -200,7 +242,7 @@ class EnsembleDynamics(nn.Module):
         out_dim = self.pred_dim * 2   # mean + std for the predicted delta
         dims = [obs_dim + act_dim] + list(hidden) + [out_dim]
         self.net = nn.ModuleList([
-            EnsembleLinear(ensemble_size, dims[i], dims[i + 1])
+            EnsembleLinear(ensemble_size, dims[i], dims[i + 1], identity_init=self.identity_prior)
             for i in range(len(dims) - 1)
         ])
         # Per-dimension calibration multiplier applied to the predicted std at
@@ -212,6 +254,22 @@ class EnsembleDynamics(nn.Module):
 
     def set_sampling_idx(self, idx: int) -> None:
         self.sampling_idx = int(idx) % self.ensemble_size
+
+    def identity_prior_mu(self) -> dict:
+        """Prior-mean pytree for the identity prior (reference ``make_identity_mu``),
+        as a dict mapping each *weight* Parameter to its μ: identity for square
+        ensemble weight stacks (E, d, d), zeros for non-square ones. Biases are
+        omitted (not decayed). Consumed by ``IdentityPriorAdamW``."""
+        mu = {}
+        for layer in self.net:
+            W = layer.W                    # (E, in, out)
+            E, in_dim, out_dim = W.shape
+            if in_dim == out_dim:
+                eye = torch.eye(in_dim, device=W.device, dtype=W.dtype)
+                mu[W] = eye.unsqueeze(0).expand(E, in_dim, out_dim).clone()
+            else:
+                mu[W] = torch.zeros_like(W)
+        return mu
 
     def _forward(self, obs: torch.Tensor, act: torch.Tensor):
         """obs/act: (B, d) → mean, std each (E, B, obs_dim).
@@ -525,6 +583,7 @@ class MBPOTrainer:
             frame_dim=frame_dim,
             state_dim=state_dim,
             path_dim=path_dim,
+            identity_prior=bool(ac.get("identity_prior", False)),
         ).to(device)
 
         # Analytic reward function — the closed-form maze reward, replacing the
@@ -534,11 +593,22 @@ class MBPOTrainer:
         # (``raw_env`` was resolved above to read the frame-stacking layout.)
         self.reward_model = AnalyticCyberRunnerReward(env, raw_env)
 
-        self.model_opt = Adam(
-            self.dynamics.parameters(),
-            lr=ac.model_lr,
-            weight_decay=ac.model_weight_decay,
-        )
+        if self.dynamics.identity_prior:
+            # Decoupled (AdamW-style) identity prior: square weight matrices decay
+            # toward I, non-square toward 0, biases untouched — the prior bypasses
+            # Adam's moment estimators (reference add_identity_decayed_weights).
+            self.model_opt = IdentityPriorAdamW(
+                self.dynamics.parameters(),
+                lr=ac.model_lr,
+                mu=self.dynamics.identity_prior_mu(),
+                weight_decay=float(ac.get("identity_weight_decay", 1e-4)),
+            )
+        else:
+            self.model_opt = Adam(
+                self.dynamics.parameters(),
+                lr=ac.model_lr,
+                weight_decay=ac.model_weight_decay,
+            )
 
         # Real experience buffer (separate from SAC's model buffer). Feeds both
         # dynamics training and the real fraction of each SAC batch.
