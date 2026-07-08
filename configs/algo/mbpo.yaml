@@ -20,14 +20,14 @@ target_entropy: auto    # SAC-parity setting (=-dim(A)=-2, same as sac.yaml). Wi
 # ── World model ───────────────────────────────────────────────────────────────
 ensemble_size: 5
 num_elites: 3                  # (unused) elites replaced by std calibration
-hidden_sizes: [1024, 1024, 1024]
+hidden_sizes: [1024, 1024, 1024, 1024]
 model_lr: 3e-4
 model_weight_decay: 0
-identity_prior: false           # world-model identity prior: square weight matrices
+identity_prior: true           # world-model identity prior: square weight matrices
                                 # init to I and decay back toward I (non-square toward 0)
                                 # via decoupled AdamW-style weight decay. Encodes a
                                 # "next state ≈ current state" residual prior.
-identity_weight_decay: 1e-2     # decay coefficient used when identity_prior=true
+identity_weight_decay: 1e-3     # decay coefficient used when identity_prior=true
                                 # (overrides model_weight_decay for the world model)
 model_train_freq: 2000         # retrain world model every N env steps
 rollout_freq: 250              # regenerate synthetic rollouts every N env steps
