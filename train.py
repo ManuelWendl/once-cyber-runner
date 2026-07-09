@@ -173,6 +173,28 @@ def main(cfg: DictConfig):
             dir=wandb_dir,
         )
 
+    algo = cfg.algo.name.lower()
+
+    if algo == "dreamer":
+        # Dreamer bypasses the SB3 VecNormalize stack entirely: it builds its
+        # own parallel envs and normalizes inputs internally (symlog).
+        from dreamer.trainer import DreamerTrainer
+
+        trainer = DreamerTrainer(cfg, device=cfg.device, seed=cfg.seed)
+        trainer.learn(cfg.total_timesteps, wandb_run=run)
+        trainer.save("dreamer_cyberrunner")
+        with open("dreamer_cyberrunner_env_cfg.json", "w") as f:
+            json.dump(OmegaConf.to_container(cfg.env, resolve=True), f, indent=2)
+        if run is not None:
+            save_artifact(run, "dreamer_cyberrunner", [
+                "dreamer_cyberrunner.pt",
+                "dreamer_cyberrunner_env_cfg.json",
+            ])
+            trainer.eval_and_log_video(run)
+            run.finish()
+        trainer.close()
+        return
+
     env = VecNormalize(
         make_vec_env(make_env(cfg), n_envs=cfg.algo.n_envs, seed=cfg.seed),
         norm_obs=True,
@@ -180,7 +202,6 @@ def main(cfg: DictConfig):
         gamma=cfg.algo.gamma,
     )
 
-    algo = cfg.algo.name.lower()
     if algo == "ppo":
         model = PPO(
             "MlpPolicy", env, verbose=1, device=cfg.device,

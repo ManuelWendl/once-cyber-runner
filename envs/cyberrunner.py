@@ -1512,61 +1512,68 @@ class CyberRunnerEnv(gym.Env):
 
 
 # ============================================================================
-# R2-DREAMER WRAPPER
+# DREAMER WRAPPER
 # ============================================================================
 
 
 class CyberRunner(gym.Env):
-    """Wrapper around CyberRunnerEnv matching the R2-Dreamer env interface.
+    """Wrapper around CyberRunnerEnv matching the Dreamer env interface.
 
-    Vision is not supported by this (stateful) build of the environment; the
-    observation exposed to the agent is the flat 10-dim state under the
-    ``"state"`` key.
+    Old-gym API (``reset() -> obs``, ``step() -> (obs, reward, done, info)``)
+    with dict observations, consumed by ``dreamer.parallel.ParallelEnv``. The
+    flat state observation is exposed under the ``"states"`` key; ``log_hole``
+    / ``log_goal`` flag the corresponding terminations so the trainer can
+    accumulate hole/goal totals.
     """
 
     def __init__(
-        self, name, action_repeat=1, size=(64, 64), seed=0,
-        reward_every_n_waypoints=5, hole_penalty=5.0, layout="hard",
-        prior_mode=False, obs_n_stack=1,
+        self, seed=0, action_repeat=1, episode_length=2000,
+        randomize_init_pos=True, reward_every_n_waypoints=3,
+        hole_penalty=5.0, dense_main_progress_scale=100.0,
+        layout="hard", obs_n_stack=1,
     ):
         self._env = CyberRunnerEnv(
             render_mode="rgb_array",
-            episode_length=1_000_000,
-            randomize_init_pos=False,
+            episode_length=episode_length,
+            randomize_init_pos=randomize_init_pos,
             reward_every_n_waypoints=reward_every_n_waypoints,
             hole_penalty=hole_penalty,
+            dense_main_progress_scale=dense_main_progress_scale,
             layout=layout,
-            prior_mode=prior_mode,
             obs_n_stack=obs_n_stack,
         )
-        self._action_repeat = action_repeat
-        self._size = size
+        self._action_repeat = int(action_repeat)
+        self._seed = int(seed)
+        self._first_reset = True
         self.reward_range = [-np.inf, np.inf]
 
     @property
     def observation_space(self):
         return gym.spaces.Dict({
-            "state": self._env.observation_space,
-            "is_first": gym.spaces.Box(0, 1, (), dtype=bool),
-            "is_last": gym.spaces.Box(0, 1, (), dtype=bool),
-            "is_terminal": gym.spaces.Box(0, 1, (), dtype=bool),
+            "states": self._env.observation_space,
+            "log_hole": gym.spaces.Box(0.0, 1.0, (1,), dtype=np.float32),
+            "log_goal": gym.spaces.Box(0.0, 1.0, (1,), dtype=np.float32),
         })
 
     @property
     def action_space(self):
-        space = self._env.action_space
-        space.discrete = False
-        return space
+        # NOTE: return the plain Box. Dreamer treats any action space that
+        # *has* a ``discrete`` attribute as discrete (hasattr check), so the
+        # attribute must not be set at all for continuous control.
+        return self._env.action_space
 
-    def _obs(self, state, *, is_first, is_last, is_terminal):
+    def _obs(self, state, *, is_first, is_last, is_terminal, hole=0.0, goal=0.0):
         return {
-            "state": np.asarray(state, dtype=np.float32),
+            "states": np.asarray(state, dtype=np.float32),
+            "log_hole": np.float32(hole),
+            "log_goal": np.float32(goal),
             "is_first": is_first,
             "is_last": is_last,
             "is_terminal": is_terminal,
         }
 
     def step(self, action):
+        assert np.isfinite(action).all(), action
         total_reward = 0.0
         terminated = truncated = False
         info: dict[str, Any] = {}
@@ -1577,13 +1584,21 @@ class CyberRunner(gym.Env):
             if terminated or truncated:
                 break
         done = terminated or truncated
-        obs = self._obs(state, is_first=False, is_last=done, is_terminal=terminated)
-        return obs, total_reward, done, info
+        reason = info.get("termination_reason")
+        obs = self._obs(
+            state, is_first=False, is_last=done, is_terminal=terminated,
+            hole=float(terminated and reason == "hole"),
+            goal=float(terminated and reason == "goal"),
+        )
+        return obs, total_reward, done, {}
 
     def reset(self):
-        state, info = self._env.reset()
-        obs = self._obs(state, is_first=True, is_last=False, is_terminal=False)
-        return obs
+        if self._first_reset:
+            state, _ = self._env.reset(seed=self._seed)
+            self._first_reset = False
+        else:
+            state, _ = self._env.reset()
+        return self._obs(state, is_first=True, is_last=False, is_terminal=False)
 
     def render(self, *args, **kwargs):
         return self._env.render()

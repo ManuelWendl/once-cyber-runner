@@ -166,3 +166,9 @@ CLAUDE.md
 # Vendored upstream repos. cyberrunner_ppo is now an owned snapshot (we modify
 # it in place); other vendors stay local-only.
 .vendor/maxinforl_torch/
+
+# Dreamer local run artifacts (checkpoints land in the Hydra run dir on cluster)
+latest.pt
+dreamer_cyberrunner.pt
+dreamer_cyberrunner_env_cfg.json
+cyberrunner_runs/

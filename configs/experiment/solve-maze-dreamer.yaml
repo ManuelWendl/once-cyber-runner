@@ -1,0 +1,20 @@
+# @package _global_
+# DreamerV3 maze solving — paper-style setup (arXiv 2312.09906):
+# pure path-progress dense reward (scale 1, no hole penalty), single-frame
+# observations (the RSSM recovers velocities — no frame stacking), mirror
+# data augmentation on by default (algo.mirror_augment).
+# Run: python train.py +experiment=solve-maze-dreamer
+
+defaults:
+  - override /algo: dreamer
+
+total_timesteps: 1_000_000
+
+env:
+  obs_n_stack: 1                  # no frame stacking — RSSM handles velocity
+  episode_length: 2000
+  randomize_init_pos: true
+  reward_every_n_waypoints: 3
+  hole_penalty: 0.0               # paper reward: progress only, hole ends episode
+  dense_main_progress_scale: 1.0  # r = l(k+1) - l(k), unscaled
+  layout: hard

@@ -1,0 +1,192 @@
+# DreamerV3 (PyTorch port, plain — no OPAX/exploration bonuses) with the
+# CyberRunner mirror-symmetry replay augmentation (arXiv 2312.09906 §III-C).
+# Model preset: size50M (deter 4096, hidden/units 512, discrete 32).
+name: dreamer
+
+env_num: 16                  # parallel env processes (dreamer/parallel.py)
+action_repeat: 1
+mirror_augment: true         # insert each transition 4x (identity + 3 mirrors);
+                             # effective real-step buffer capacity is max_size/4
+batch_size: 16
+batch_length: 64
+train_ratio: 512             # replayed data steps per env step
+pretrain: 0
+update_log_every: 2000       # env steps between W&B log calls
+save_every: 100_000          # env steps between latest.pt checkpoints
+
+buffer:
+  batch_size: ${algo.batch_size}
+  batch_length: ${algo.batch_length}
+  max_size: 5e5
+  device: ${device}
+  storage_device: cpu
+
+model:
+  # ── size50M preset ─────────────────────────────────────────────────────────
+  deter: 4096
+  hidden: 512
+  discrete: 32
+  units: 512
+  act: SiLU
+  norm: true
+  depth: 32                  # CNN depth (unused in state-only mode)
+
+  # ── training ───────────────────────────────────────────────────────────────
+  act_entropy: 3e-4
+  kl_free: 1.0
+  imag_horizon: 15
+  horizon: 333
+  lamb: 0.95
+  compile: true
+  log_grads: false
+  device: ${device}
+  rep_loss: dreamer          # decoder reconstruction (only variant in this port)
+
+  lr: 4e-5
+  agc: 0.3
+  pmin: 1e-3
+  eps: 1e-20
+  beta1: 0.9
+  beta2: 0.999
+  warmup: 1000
+  slow_target_update: 1
+  slow_target_fraction: 0.02
+
+  loss_scales:
+    recon: 1.0
+    rew: 1.0
+    con: 1.0
+    dyn: 1.0
+    rep: 0.1
+    policy: 1.0
+    value: 1.0
+    repval: 0.3
+
+  rssm:
+    stoch: 32
+    deter: ${algo.model.deter}
+    hidden: ${algo.model.hidden}
+    discrete: ${algo.model.discrete}
+    img_layers: 2
+    obs_layers: 1
+    dyn_layers: 1
+    blocks: 8
+    act: ${algo.model.act}
+    norm: ${algo.model.norm}
+    unimix_ratio: 0.01
+    initial: learned
+    device: ${device}
+
+  encoder:
+    mlp_keys: 'states'
+    cnn_keys: '$^'           # regex matching nothing — state-only, no CNN
+    mlp:
+      shape: null
+      layers: 3
+      units: ${algo.model.units}
+      act: ${algo.model.act}
+      norm: ${algo.model.norm}
+      device: ${device}
+      outscale: null
+      symlog_inputs: true
+      name: mlp_encoder
+    cnn:
+      act: ${algo.model.act}
+      norm: ${algo.model.norm}
+      kernel_size: 5
+      minres: 4
+      depth: ${algo.model.depth}
+      mults: [2, 3, 4, 4]
+
+  decoder:
+    mlp_keys: 'states'
+    cnn_keys: '$^'
+    mlp_dist:
+      name: symlog_mse
+    cnn_dist:
+      name: mse
+    mlp:
+      shape: null
+      layers: 3
+      units: ${algo.model.units}
+      act: ${algo.model.act}
+      norm: ${algo.model.norm}
+      dist:
+        name: identity
+      device: ${device}
+      outscale: 1.0
+      symlog_inputs: false
+      name: mlp_decoder
+    cnn:
+      depth: ${algo.model.depth}
+      units: ${algo.model.units}
+      bspace: 8
+      mults: [2, 3, 4, 4]
+      act: ${algo.model.act}
+      norm: ${algo.model.norm}
+      kernel_size: 5
+      minres: 4
+      outscale: 1.0
+
+  reward:
+    shape: [255]
+    layers: 1
+    units: ${algo.model.units}
+    act: ${algo.model.act}
+    norm: ${algo.model.norm}
+    dist:
+      name: symexp_twohot
+      bin_num: 255
+    outscale: 0.0
+    device: ${device}
+    symlog_inputs: false
+    name: reward
+
+  cont:
+    shape: [1]
+    layers: 1
+    units: ${algo.model.units}
+    act: ${algo.model.act}
+    norm: ${algo.model.norm}
+    dist:
+      name: binary
+    outscale: 1.0
+    device: ${device}
+    symlog_inputs: false
+    name: cont
+
+  actor:
+    shape: null
+    layers: 3
+    units: ${algo.model.units}
+    act: ${algo.model.act}
+    norm: ${algo.model.norm}
+    device: ${device}
+    dist:
+      cont:
+        name: bounded_normal
+        min_std: 0.1
+        max_std: 1.0
+      disc:
+        name: onehot
+        unimix_ratio: 0.01
+      multi_disc:
+        name: multi_onehot
+        unimix_ratio: 0.01
+    outscale: 0.01
+    symlog_inputs: false
+    name: actor
+
+  critic:
+    shape: [255]
+    layers: 3
+    units: ${algo.model.units}
+    act: ${algo.model.act}
+    norm: ${algo.model.norm}
+    device: ${device}
+    dist:
+      name: symexp_twohot
+      bin_num: 255
+    outscale: 0.0
+    symlog_inputs: false
+    name: value
