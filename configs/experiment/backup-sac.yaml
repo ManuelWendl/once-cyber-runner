@@ -7,7 +7,7 @@
 defaults:
   - override /algo: sac_backup
 
-total_timesteps: 1_000_000
+total_timesteps: 2_000_000
 
 env:
   episode_length: 100
