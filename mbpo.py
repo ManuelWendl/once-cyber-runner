@@ -20,16 +20,21 @@ Training loop:
 """
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
-from stable_baselines3 import SAC
+from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.logger import configure as configure_logger
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
 from stable_baselines3.common.utils import set_random_seed
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from omegaconf import DictConfig
 
 
@@ -689,15 +694,143 @@ class MBPOTrainer:
         # (ret_rms) update from the real env stream during learn(); model rewards
         # are stored raw and normalized with the same stats at sample time.
 
+        # ── Safety shield: recovery/backup policy ─────────────────────────────
+        # Loads a trained recovery policy + its OWN VecNormalize. At each step the
+        # learning policy's proposed action is judged by the backup Q-function
+        # (recoverability); if below threshold the recovery policy acts instead.
+        self._rollout_shield_rate = float("nan")   # last rollout's mean trigger rate
+        self._load_backup(ac, cfg, device)
+
         self._ac = ac
 
+    # ── safety shield (backup / recovery policy) ──────────────────────────────
+
+    def _load_backup(self, ac, cfg, device) -> None:
+        """Load the recovery/backup policy and ITS normalizer for the safety shield.
+
+        Source priority: a wandb run id (downloads the model artifact — policy
+        ``.zip`` + VecNormalize ``.pkl`` + env cfg), else local paths. Both the
+        policy AND its VecNormalize are loaded: the shield renormalizes behavioral
+        obs into the backup's own obs space before querying its Q-function
+        (``_to_backup_obs``). ``backup_wandb_id: null`` disables the shield.
+        """
+        self.backup_policy = None
+        self.backup_vecnorm = None
+        self.safety_threshold = float(ac.get("safety_threshold", 0.3))
+
+        bp_path = ac.get("backup_policy_path", None)
+        bv_path = ac.get("backup_vecnorm_path", None)
+        b_env_cfg_path = None
+
+        wandb_id = ac.get("backup_wandb_id", None)
+        if wandb_id:
+            import wandb as wb
+            project = ac.get("backup_wandb_project", "cyberrunner")
+            api = wb.Api()
+            run = api.run(f"{project}/{wandb_id}")
+            artifact = next((a for a in run.logged_artifacts() if a.type == "model"), None)
+            if artifact is None:
+                raise RuntimeError(
+                    f"[MBPO] No model artifact found for wandb run {project}/{wandb_id}"
+                )
+            root = Path(artifact.download())
+            bp_path = str(next(root.glob("*.zip")))
+            bv_path = str(next(root.glob("*.pkl")))
+            cfgs = list(root.glob("*_env_cfg.json")) or list(root.glob("*.json"))
+            b_env_cfg_path = str(cfgs[0]) if cfgs else None
+            print(f"[MBPO] Downloaded backup artifact from {project}/{wandb_id}: {bp_path}", flush=True)
+
+        if not (bp_path and bv_path and os.path.exists(bp_path) and os.path.exists(bv_path)):
+            print("[MBPO] No backup policy configured — safety shield DISABLED.", flush=True)
+            return
+
+        # PPO backups expose V(s); SAC backups expose Q(s,a). Infer from filename.
+        model_cls = PPO if "ppo" in os.path.basename(bp_path).lower() else SAC
+        self.backup_policy = model_cls.load(bp_path, device=device)
+
+        # The dummy env only has to reproduce the backup normalizer's obs/action
+        # shape, which is fixed by obs_n_stack + layout. Prefer the backup's OWN
+        # saved env cfg; fall back to the learner's env config (schema drift-safe).
+        from envs.cyberrunner import CyberRunnerEnv
+        ecfg = {}
+        if b_env_cfg_path and os.path.exists(b_env_cfg_path):
+            with open(b_env_cfg_path) as f:
+                ecfg = json.load(f)
+        obs_n_stack = int(ecfg.get("obs_n_stack", cfg.env.get("obs_n_stack", 1)))
+        layout = ecfg.get("layout", cfg.env.get("layout", "hard"))
+        dummy = DummyVecEnv([lambda: CyberRunnerEnv(obs_n_stack=obs_n_stack, layout=layout)])
+        self.backup_vecnorm = VecNormalize.load(bv_path, dummy)
+        self.backup_vecnorm.training = False
+        self.backup_vecnorm.norm_reward = False
+        print(
+            f"[MBPO] Safety shield loaded ({model_cls.__name__}): {bp_path}  "
+            f"threshold={self.safety_threshold}",
+            flush=True,
+        )
+
+    def _to_backup_obs(self, obs_norm: np.ndarray) -> np.ndarray:
+        """Convert behavioral-normalized obs → backup-normalized obs.
+
+        The learner and backup share the identical obs layout (same frame stacking
+        + path vectors), so this is a pure re-normalization: de-normalize with the
+        behavioral VecNormalize stats to physical units, then re-normalize with the
+        backup's own stats (and its obs clip)."""
+        rms = self.env.obs_rms
+        raw = obs_norm * np.sqrt(rms.var + self.env.epsilon) + rms.mean
+        b = self.backup_vecnorm
+        return np.clip(
+            (raw - b.obs_rms.mean) / np.sqrt(b.obs_rms.var + b.epsilon),
+            -b.clip_obs, b.clip_obs,
+        ).astype(np.float32)
+
+    def _recovery_values(self, backup_obs: np.ndarray, act: np.ndarray) -> np.ndarray:
+        """Recoverability of ``act`` in the given (backup-normalized) states, (B,).
+
+        SAC backup: min(Q1,Q2)(s, a) — the recovery critic's value of taking the
+        *proposed* action. PPO backup: V(s) (action-independent)."""
+        obs_t = torch.as_tensor(backup_obs, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            if isinstance(self.backup_policy, PPO):
+                values = self.backup_policy.policy.predict_values(obs_t)
+            else:
+                act_t = torch.as_tensor(act, dtype=torch.float32, device=self.device)
+                qs = self.backup_policy.policy.critic(obs_t, act_t)
+                values = torch.min(qs[0], qs[1])
+        return values.cpu().numpy().flatten()
+
+    def _shield(self, obs_norm: np.ndarray, act: np.ndarray):
+        """Apply the safety shield to a batch of proposed actions.
+
+        Returns ``(act_exec, unsafe, values)``. Where the backup deems the proposed
+        action unrecoverable (recoverability < ``safety_threshold``), the executed
+        action is overwritten with the recovery policy's action. ``act`` itself is
+        never mutated (a copy is returned when any override happens). If no backup
+        is loaded the shield is a no-op."""
+        if self.backup_policy is None:
+            return act, np.zeros(len(act), dtype=bool), None
+        backup_obs = self._to_backup_obs(obs_norm)
+        values = self._recovery_values(backup_obs, act)      # recoverability of a_learned
+        unsafe = values < self.safety_threshold
+        act_exec = act
+        if unsafe.any():
+            act_exec = act.copy()
+            backup_act, _ = self.backup_policy.predict(backup_obs[unsafe], deterministic=True)
+            act_exec[unsafe] = backup_act
+        return act_exec, unsafe, values
+
     def predict(self, obs: np.ndarray, prev_obs: np.ndarray | None = None, deterministic: bool = True):
-        """Plain SAC predict. ``prev_obs`` is accepted and ignored so existing
-        eval callers passing ``(obs, prev_obs)`` keep working."""
+        """Plain (unshielded) SAC predict. ``prev_obs`` is accepted and ignored so
+        existing eval callers passing ``(obs, prev_obs)`` keep working."""
         return self.sac.predict(obs, deterministic=deterministic)
 
-    # Backwards-compatible alias (the safety shield has been removed).
-    shielded_predict = predict
+    def shielded_predict(self, obs: np.ndarray, prev_obs: np.ndarray | None = None, deterministic: bool = True):
+        """SAC predict with the safety shield applied — the executed action (backup
+        where the learning action is unrecoverable). This is the deployment/eval
+        behavior and mirrors the real-env shielding in ``learn()``. ``prev_obs`` is
+        accepted and ignored. No-op when no backup policy is loaded."""
+        act, state = self.sac.predict(obs, deterministic=deterministic)
+        act, _, _ = self._shield(np.asarray(obs, dtype=np.float32), act)
+        return act, state
 
     # ── world model training ──────────────────────────────────────────────
 
@@ -760,9 +893,18 @@ class MBPOTrainer:
         # stateful ``_prev_progress`` (holds the last on-path value, only updates
         # when on-path). Initialised from the stacked history of the start state.
         prev_prog = self.reward_model.init_prev_progress(obs)
+        shield_rates: list[float] = []
         for _ in range(length):
-            act, _ = self.sac.predict(obs, deterministic=False)
-            nobs, unc = self.dynamics.sample(obs, act)
+            act, _ = self.sac.predict(obs, deterministic=False)   # a_learned
+            # Safety shield: overwrite the executed action with the recovery
+            # policy's where a_learned is judged unrecoverable. The dynamics and
+            # reward are queried with the EXECUTED action, but the stored action
+            # (below) is a_learned — action overwriting on the planning MDP:
+            #   transition = (s, a_learned, s'(s, a_exec), r(s, a_exec)).
+            act_exec, unsafe, _ = self._shield(obs, act)
+            if unsafe is not None:
+                shield_rates.append(float(unsafe.mean()))
+            nobs, unc = self.dynamics.sample(obs, act_exec)
             # Reward from the analytic model (raw scale), not the dynamics net.
             # Returns the reward and the updated sticky progress for next step.
             rew, prev_prog = self.reward_model.reward(prev_prog, nobs)
@@ -797,6 +939,7 @@ class MBPOTrainer:
 
         self._unc_mean = float(np.mean(unc_means)) if unc_means else float("nan")
         self._rollout_len_eff = float(stored_per_branch.mean())
+        self._rollout_shield_rate = float(np.mean(shield_rates)) if shield_rates else float("nan")
 
         # The rollout ran in normalized space; un-normalize obs/next_obs to RAW so
         # the SAC buffer holds raw (VecNormalize re-normalizes at sample time,
@@ -861,15 +1004,23 @@ class MBPOTrainer:
         ent_coefs: list[float] = []
         model_train_nlls: list[float] = []
         model_val_nlls: list[float] = []
+        backup_triggers: list[float] = []   # per-step real-env shield trigger rate
 
         while step < total_timesteps:
             # Random exploration during warmup, SAC policy afterwards
             if step < ac.warmup_steps:
                 act = np.stack([self.env.action_space.sample() for _ in range(n_envs)])
+                act_exec = act
             else:
-                act, _ = self.sac.predict(obs, deterministic=False)
+                act, _ = self.sac.predict(obs, deterministic=False)   # a_learned
+                # Safety shield: play the recovery policy where the learning action
+                # is judged unrecoverable. The EXECUTED action drives the real env
+                # (and is stored for world-model learning below).
+                act_exec, unsafe, _ = self._shield(obs, act)
+                if unsafe is not None and unsafe.size:
+                    backup_triggers.append(float(unsafe.mean()))
 
-            nobs, rew, done, infos = self.env.step(act)
+            nobs, rew, done, infos = self.env.step(act_exec)
             # RAW views for buffer storage (SB3 stores raw, normalizes at sample).
             nobs_raw = self.env.get_original_obs()
             rew_raw = self.env.get_original_reward()
@@ -889,9 +1040,11 @@ class MBPOTrainer:
                     term_norm = np.asarray(infos[i]["terminal_observation"], dtype=np.float32)[None]
                     next_o = self.env.unnormalize_obs(term_norm)
                 # Store RAW obs + RAW reward; VecNormalize normalizes both at
-                # sample time (self.sac._vec_normalize_env = env).
+                # sample time (self.sac._vec_normalize_env = env). The stored action
+                # is the EXECUTED one (backup where the shield intervened) so the
+                # world model learns the true dynamics s' = f(s, a_exec).
                 self.real_buffer.add(
-                    obs_raw[i:i+1], next_o, act[i:i+1],
+                    obs_raw[i:i+1], next_o, act_exec[i:i+1],
                     rew_raw[i:i+1], t, [infos[i]],
                 )
                 ep_info = infos[i].get("episode")
@@ -1000,6 +1153,15 @@ class MBPOTrainer:
                 log["train/real_buffer"] = self.real_buffer.size()
                 log["train/model_buffer"] = self.sac.replay_buffer.size()
                 log["train/real_ratio"] = self.real_ratio
+                # ── safety shield trigger rates ───────────────────────────
+                if self.backup_policy is not None:
+                    if backup_triggers:
+                        sr = float(np.mean(backup_triggers[-2000:]))
+                        log["shield/real_trigger_rate"] = sr
+                        parts.append(f"shield_real={sr:.3f}")
+                    if not np.isnan(self._rollout_shield_rate):
+                        log["shield/rollout_trigger_rate"] = self._rollout_shield_rate
+                        parts.append(f"shield_roll={self._rollout_shield_rate:.3f}")
                 log["train/rollout_len"] = self._rollout_length(step)
                 # Realized mean rollout length after uncertainty/terminal
                 # truncation — if this is far below rollout_len, the model is

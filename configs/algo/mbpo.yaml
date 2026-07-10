@@ -67,3 +67,19 @@ optimism: 0.0                  # rollout reward += optimism * ‖σ‖₂ (model
 
 # ── Policy update ─────────────────────────────────────────────────────────────
 utd_ratio: 75                   # SAC gradient steps per env step (after warmup)
+
+# ── Safety shield (backup / recovery policy) ──────────────────────────────────
+# "Ergodic rollout" shield. Off by default (backup_wandb_id: null). When a backup
+# is loaded, at each step the learning policy's proposed action a_learned is judged
+# by the backup's recoverability value: SAC backup → min(Q1,Q2)(s, a_learned);
+# PPO backup → V(s). If it is < safety_threshold the recovery policy acts instead.
+#   • World-model (real) buffer stores the EXECUTED action  → learns s'=f(s, a_exec)
+#   • Planning (SAC) rollouts store (s, a_learned, s'(s, a_exec), r(s, a_exec))
+#     — action overwriting on the planning MDP.
+# The backup's OWN VecNormalize is loaded and used to renormalize obs before the
+# Q-query (the learner and backup share the same obs layout, different stats).
+backup_wandb_id: null           # wandb run id of a trained recovery policy (null = shield off)
+backup_wandb_project: cyberrunner
+backup_policy_path: null        # local fallback (.zip) if no wandb id is given
+backup_vecnorm_path: null       # local fallback (VecNormalize .pkl)
+safety_threshold: 0.3           # recoverability below this ⇒ play the recovery policy

@@ -16,6 +16,10 @@ python train_simple.py algo=ppo algo.learning_rate=3e-4 total_timesteps=500000
 python train_simple.py algo=sac env.hole_penalty=10.0
 ```
 
+# Train Backup SAC multirun on Euler
+```bash
+python train.py -m +experiment=backup-sac seed="range(0,5)"
+```
 
 # Structure:
 ```
