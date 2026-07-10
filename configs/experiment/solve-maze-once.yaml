@@ -1,0 +1,30 @@
+# @package _global_
+# Shielded MBPO — the "ergodic rollout" scheme. Model-based maze solving guarded
+# by a trained recovery/backup policy. At each step the backup policy's Q-function
+# judges the learning policy's proposed action a_learned: if the recoverability
+# min(Q1,Q2)(s, a_learned) < safety_threshold the recovery policy acts instead.
+#   • World-model buffer  ← EXECUTED action  (learns true dynamics s'=f(s, a_exec))
+#   • Planning (SAC) MDP   ← (s, a_learned, s'(s, a_exec), r(s, a_exec))
+#     i.e. action overwriting: the critic learns the consequence of *proposing*
+#     a_learned while the state/reward follow the executed (possibly backup) action.
+# The backup's own VecNormalize is downloaded with it and used to renormalize obs
+# before the Q-query.
+# Run: python train.py +experiment=solve-maze-once
+
+defaults:
+  - override /algo: mbpo
+
+total_timesteps: 2_000_000
+
+env:
+  reward_every_n_waypoints: 3
+  hole_penalty: 5.0
+  episode_length: 2000
+
+algo:
+  # ── Safety shield / recovery policy ─────────────────────────────────────────
+  backup_wandb_id: ioaszezj        # trained recovery (backup-sac) policy on wandb
+  backup_wandb_project: cyberrunner
+  backup_policy_path: null         # local fallback (.zip) if backup_wandb_id is null
+  backup_vecnorm_path: null        # local fallback (VecNormalize .pkl)
+  safety_threshold: 0.3            # recoverability below this ⇒ fall back to recovery policy
