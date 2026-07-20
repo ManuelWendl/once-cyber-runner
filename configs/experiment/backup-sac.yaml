@@ -15,7 +15,7 @@ env:
   prior_mode: true
   recovery_speed_threshold: 0.01
   recovery_hole_margin_factor: 1.5
-  prior_init_max_speed: 0.4
+  prior_init_max_speed: 0.3
   # unused in prior_mode but required by schema:
   reward_every_n_waypoints: 3
   hole_penalty: 5.0
