@@ -23,8 +23,8 @@ env:
 
 algo:
   # ── Safety shield / recovery policy ─────────────────────────────────────────
-  backup_wandb_id: ioaszezj        # trained recovery (backup-sac) policy on wandb
+  backup_wandb_id: 4zzqveas        # trained recovery (backup-sac) policy on wandb
   backup_wandb_project: cyberrunner
   backup_policy_path: null         # local fallback (.zip) if backup_wandb_id is null
   backup_vecnorm_path: null        # local fallback (VecNormalize .pkl)
-  safety_threshold: 0.3            # recoverability below this ⇒ fall back to recovery policy
+  safety_threshold: 0.75           # recoverability below this ⇒ fall back to recovery policy
