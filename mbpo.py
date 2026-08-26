@@ -3,8 +3,8 @@ Model-Based Policy Optimization (MBPO).
 
 World model: probabilistic ensemble of MLPs (PyTorch).
   - Input: (obs, action) — the full (possibly frame-stacked) observation.
-  - Output: Gaussian over the *base* obs delta (newest state + path); reward is
-    analytic.
+  - Output: Gaussian over the *base* obs delta (newest state + path) and reward,
+    plus a terminal classifier.
   - Residual prediction: base_next = base(obs) + delta. Under frame stacking the
     full next_obs is reconstructed by sliding the window (drop oldest frame,
     prepend the new (predicted-state, action) frame) so the stack stays
@@ -180,9 +180,10 @@ class EnsembleDynamics(nn.Module):
     Probabilistic ensemble — PyTorch port of the reference Bayesian dynamics
     model's default ``ProbabilisticEnsembleModel`` path.
 
-    Predicts ONLY the *base* observation delta as a Gaussian (reward is supplied
-    separately by an analytic reward function, mirroring the reference's external
-    ``RewardModel``). Under frame stacking (``n_stack > 1``) the base observation
+    Predicts the *base* observation delta and reward as Gaussians, plus an
+    absorbing-terminal logit. Learning reward/termination from real outcomes
+    avoids evaluating them from biased/noisy observed ball coordinates. Under
+    frame stacking (``n_stack > 1``) the base observation
     is the newest dynamic state + path vectors; the older stacked frames are a
     deterministic shift of known quantities, so they are reconstructed at
     sampling time rather than predicted. Without stacking the base delta is the
@@ -203,6 +204,7 @@ class EnsembleDynamics(nn.Module):
         act_dim: int,
         hidden: tuple[int, ...],
         ensemble_size: int,
+        num_elites: int | None = None,
         sig_min: float = 1e-3,
         sig_max: float = 1e3,
         sampling_type: str = "TS1",
@@ -217,6 +219,7 @@ class EnsembleDynamics(nn.Module):
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.ensemble_size = ensemble_size
+        self.num_elites = min(ensemble_size, int(num_elites or ensemble_size))
         self.sig_min = float(sig_min)
         self.sig_max = float(sig_max)
         self.sampling = SamplingType(sampling_type)
@@ -244,7 +247,8 @@ class EnsembleDynamics(nn.Module):
         #   unstacked → the whole obs (original behaviour)
         self.pred_dim = (self.state_dim + self.path_dim) if self.stacked else obs_dim
 
-        out_dim = self.pred_dim * 2   # mean + std for the predicted delta
+        # state delta mean/std, scalar reward mean/std, terminal logit
+        out_dim = self.pred_dim * 2 + 3
         dims = [obs_dim + act_dim] + list(hidden) + [out_dim]
         self.net = nn.ModuleList([
             EnsembleLinear(ensemble_size, dims[i], dims[i + 1], identity_init=self.identity_prior)
@@ -253,6 +257,7 @@ class EnsembleDynamics(nn.Module):
         # Per-dimension calibration multiplier applied to the predicted std at
         # prediction time (opax-style recalibration; 1.0 until calibrated).
         self.register_buffer("calib_alpha", torch.ones(self.pred_dim))
+        self.register_buffer("elite_indices", torch.arange(self.num_elites, dtype=torch.long))
 
     def set_sampling_type(self, name: str) -> None:
         self.sampling.set(name)
@@ -281,14 +286,25 @@ class EnsembleDynamics(nn.Module):
 
         The std head is soft-clamped to ``[sig_min, sig_max]`` (reference's
         sig_min/sig_max aleatoric-std bounds)."""
-        x = torch.cat([obs, act], -1).unsqueeze(0).expand(self.ensemble_size, -1, -1)
+        x = torch.cat([obs, act], -1)
+        if x.ndim == 2:
+            x = x.unsqueeze(0).expand(self.ensemble_size, -1, -1)
+        elif x.ndim != 3 or x.shape[0] != self.ensemble_size:
+            raise ValueError(
+                f"expected (B,D) or ({self.ensemble_size},B,D), got {tuple(x.shape)}"
+            )
         for layer in self.net[:-1]:
             x = F.silu(layer(x))
         x = self.net[-1](x)
-        mean, raw_std = x.chunk(2, -1)
+        mean = x[..., :self.pred_dim]
+        raw_std = x[..., self.pred_dim:2 * self.pred_dim]
+        reward_mean = x[..., 2 * self.pred_dim]
+        reward_raw_std = x[..., 2 * self.pred_dim + 1]
+        terminal_logit = x[..., 2 * self.pred_dim + 2]
         std = F.softplus(raw_std) + self.sig_min
         std = std.clamp(self.sig_min, self.sig_max)
-        return mean, std
+        reward_std = (F.softplus(reward_raw_std) + self.sig_min).clamp(self.sig_min, self.sig_max)
+        return mean, std, reward_mean, reward_std, terminal_logit
 
     def _base_obs(self, obs: torch.Tensor) -> torch.Tensor:
         """Extract the base observation (newest state + path) from a (possibly
@@ -304,59 +320,100 @@ class EnsembleDynamics(nn.Module):
         (newest state + path) when stacked, else the full obs delta."""
         return self._base_obs(next_obs) - self._base_obs(obs)
 
-    def nll_loss(self, obs: torch.Tensor, act: torch.Tensor, next_obs: torch.Tensor) -> torch.Tensor:
+    def loss_per_member(
+        self, obs: torch.Tensor, act: torch.Tensor, next_obs: torch.Tensor,
+        reward: torch.Tensor, terminal: torch.Tensor,
+    ) -> torch.Tensor:
         """Gaussian NLL (std parameterization) summed over output dims, averaged
         over batch and ensemble. Matches the reference ``gaussian_log_likelihood``
         (constant term dropped)."""
-        mean, std = self._forward(obs, act)
+        mean, std, reward_mean, reward_std, terminal_logit = self._forward(obs, act)
         target = self.delta_target(obs, next_obs)
-        tgt = target.unsqueeze(0).expand_as(mean)
-        nll = (torch.log(std) + 0.5 * ((tgt - mean) / std).pow(2)).sum(-1).mean()
-        return nll
+        tgt = target.unsqueeze(0).expand_as(mean) if target.ndim == 2 else target
+        reward = reward.squeeze(-1)
+        terminal = terminal.squeeze(-1)
+        if reward.ndim == 1:
+            reward = reward.unsqueeze(0).expand_as(reward_mean)
+            terminal = terminal.unsqueeze(0).expand_as(terminal_logit)
+        state_nll = (torch.log(std) + 0.5 * ((tgt - mean) / std).pow(2)).sum(-1)
+        reward_nll = torch.log(reward_std) + 0.5 * ((reward - reward_mean) / reward_std).pow(2)
+        # Upweight rare absorbing transitions without allowing a handful of them
+        # to dominate a bootstrap member.
+        pos = terminal.sum(dim=1, keepdim=True)
+        neg = terminal.shape[1] - pos
+        pos_weight = (neg / pos.clamp_min(1.0)).clamp(1.0, 20.0)
+        terminal_bce = F.binary_cross_entropy_with_logits(
+            terminal_logit, terminal, reduction="none",
+        ) * torch.where(terminal > 0.5, pos_weight, torch.ones_like(terminal))
+        return (state_nll + reward_nll + terminal_bce).mean(dim=1)
+
+    def nll_loss(self, obs, act, next_obs, reward, terminal) -> torch.Tensor:
+        return self.loss_per_member(obs, act, next_obs, reward, terminal).mean()
 
     @torch.no_grad()
-    def sample(self, obs: np.ndarray, act: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def sample(
+        self, obs: np.ndarray, act: np.ndarray,
+        history_act: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         One-step prediction for a batch using the configured ``SamplingType``.
 
         Returns: next_obs (B, obs_dim), uncertainty (B,)
-            uncertainty = ‖σ_tot‖₂ — the L2 norm of the DS total predictive std
-            combining ALEATORIC (mean of per-member variances) and EPISTEMIC
-            (variance of per-member means) uncertainty — used as the optimism /
-            exploration bonus on the analytic rollout reward.
+            uncertainty = L2 norm of epistemic ensemble disagreement. Aleatoric
+            observation noise is sampled but must not be mistaken for model
+            ignorance when truncating rollouts.
         """
         dev = next(self.parameters()).device
         obs_t = torch.from_numpy(obs).float().to(dev)
         act_t = torch.from_numpy(act).float().to(dev)
-        mean, std = self._forward(obs_t, act_t)    # (E, B, D)
+        mean, std, reward_mean, reward_std, terminal_logit = self._forward(obs_t, act_t)
         std = std * self.calib_alpha               # recalibrated aleatoric std
+        elite = self.elite_indices.to(mean.device)
+        mean, std = mean[elite], std[elite]
+        reward_mean, reward_std = reward_mean[elite], reward_std[elite]
+        terminal_logit = terminal_logit[elite]
         E = mean.shape[0]
 
         # DS moments (used for the optimism bonus regardless of sampling mode).
         al_var = std.pow(2).mean(0)                # (B, D) aleatoric
-        ep_var = mean.var(0)                       # (B, D) epistemic
+        ep_var = mean.var(0, correction=0)         # (B, D) epistemic
         tot_std = (al_var + ep_var).sqrt()         # (B, D)
-        unc = tot_std.norm(dim=1)                  # (B,) ‖σ_tot‖₂
+        unc = ep_var.sqrt().norm(dim=1)            # (B,) epistemic disagreement
 
         name = self.sampling.name
         if name == "mean":
             m = mean.mean(0)
             out = m + al_var.sqrt() * torch.randn_like(m)
+            rew = reward_mean.mean(0)
+            terminal_prob = terminal_logit.sigmoid().mean(0)
         elif name == "TS1":
-            idx = int(torch.randint(0, E, (1,)).item())
-            out = mean[idx] + std[idx] * torch.randn_like(mean[idx])
+            # Independent member per particle; one member for the whole batch
+            # makes hundreds of rollouts spuriously correlated.
+            idx = torch.randint(0, E, (mean.shape[1],), device=mean.device)
+            col = torch.arange(mean.shape[1], device=mean.device)
+            out = mean[idx, col] + std[idx, col] * torch.randn_like(mean[0])
+            rew = reward_mean[idx, col]
+            terminal_prob = terminal_logit[idx, col].sigmoid()
         elif name == "TSInf":
             idx = int(self.sampling_idx) % E
             out = mean[idx] + std[idx] * torch.randn_like(mean[idx])
+            rew = reward_mean[idx]
+            terminal_prob = terminal_logit[idx].sigmoid()
         elif name == "DS":
             out = mean.mean(0) + tot_std * torch.randn_like(tot_std)
+            rew = reward_mean.mean(0)
+            terminal_prob = terminal_logit.sigmoid().mean(0)
         else:
             raise ValueError(f"unknown sampling type {name!r}")
 
         # ``out`` is the predicted base-obs delta (B, pred_dim).
         base_next = self._base_obs(obs_t) + out          # (B, pred_dim)
-        next_obs = self._reconstruct_next_obs(obs_t, act_t, base_next)
-        return next_obs.cpu().numpy(), unc.cpu().numpy()
+        hist_act_t = act_t if history_act is None else torch.from_numpy(history_act).float().to(dev)
+        next_obs = self._reconstruct_next_obs(obs_t, hist_act_t, base_next)
+        return (
+            next_obs.cpu().numpy(), rew.cpu().numpy().astype(np.float32),
+            (terminal_prob >= 0.5).cpu().numpy(), unc.cpu().numpy(),
+        )
 
     def _reconstruct_next_obs(
         self, obs: torch.Tensor, act: torch.Tensor, base_next: torch.Tensor
@@ -388,18 +445,27 @@ class EnsembleDynamics(nn.Module):
         Sets a per-dimension multiplier ``alpha`` so that the recalibrated
         Gaussian has unit-variance standardized residuals — alpha[d]² = E[((y−μ)/σ)²].
         Returns a scalar calibration-error proxy: |E[z²/alpha²] − 1|."""
-        mean, std = self._forward(obs, act)
+        mean, std, _, _, _ = self._forward(obs, act)
         target = self.delta_target(obs, next_obs)
         tgt = target.unsqueeze(0).expand_as(mean)
         z2 = ((tgt - mean) / std).pow(2)           # (E, B, D)
         alpha = z2.mean(dim=(0, 1)).clamp_min(1e-8).sqrt()   # (D,)
-        self.calib_alpha = alpha
+        self.calib_alpha.copy_(alpha)
         scaled = z2 / alpha.pow(2)
         return float((scaled.mean() - 1.0).abs())
 
+    @torch.no_grad()
+    def calibration_error(self, obs: torch.Tensor, act: torch.Tensor, next_obs: torch.Tensor) -> float:
+        """Evaluate calibration on data not used to fit ``calib_alpha``."""
+        mean, std, _, _, _ = self._forward(obs, act)
+        target = self.delta_target(obs, next_obs).unsqueeze(0).expand_as(mean)
+        z2 = ((target - mean) / (std * self.calib_alpha)).pow(2)
+        return float((z2.mean() - 1.0).abs())
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Analytic reward model (closed-form, replaces a learned reward head)
+# Legacy analytic reward helper (kept for offline diagnostics; training uses the
+# supervised ensemble reward/terminal heads above)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AnalyticCyberRunnerReward:
@@ -581,6 +647,7 @@ class MBPOTrainer:
             act_dim=act_dim,
             hidden=tuple(ac.hidden_sizes),
             ensemble_size=ac.ensemble_size,
+            num_elites=ac.get("num_elites", ac.ensemble_size),
             sig_min=float(ac.get("sig_min", 1e-3)),
             sig_max=float(ac.get("sig_max", 1e3)),
             sampling_type=ac.get("sampling_type", "TS1"),
@@ -590,13 +657,6 @@ class MBPOTrainer:
             path_dim=path_dim,
             identity_prior=bool(ac.get("identity_prior", False)),
         ).to(device)
-
-        # Analytic reward function — the closed-form maze reward, replacing the
-        # old joint reward head (mirrors the reference's separate RewardModel).
-        # Pull the raw CyberRunnerEnv out from under the VecNormalize wrapper so
-        # we can read its path/hole geometry; un-normalization uses the wrapper.
-        # (``raw_env`` was resolved above to read the frame-stacking layout.)
-        self.reward_model = AnalyticCyberRunnerReward(env, raw_env)
 
         if self.dynamics.identity_prior:
             # Decoupled (AdamW-style) identity prior: square weight matrices decay
@@ -615,9 +675,19 @@ class MBPOTrainer:
                 weight_decay=ac.model_weight_decay,
             )
 
-        # Real experience buffer (separate from SAC's model buffer). Feeds both
-        # dynamics training and the real fraction of each SAC batch.
+        # Executed-action real experience used to train the dynamics model.
         self.real_buffer = ReplayBuffer(
+            buffer_size=ac.real_buffer_size,
+            observation_space=env.observation_space,
+            action_space=env.action_space,
+            device=device,
+            n_envs=1,
+            handle_timeout_termination=True,
+        )
+        # Same real outcomes, but keyed by the learner's PROPOSED action for SAC.
+        # The dynamics buffer above must use executed actions; conflating these
+        # two views makes real and imagined samples describe different MDPs.
+        self.policy_real_buffer = ReplayBuffer(
             buffer_size=ac.real_buffer_size,
             observation_space=env.observation_space,
             action_space=env.action_space,
@@ -631,14 +701,16 @@ class MBPOTrainer:
         # mix where real transitions were written into the SAC buffer directly.
         self.real_ratio = float(ac.get("real_ratio", 0.1))
 
-        # Optimism / exploration bonus: rollout reward += optimism * ‖σ‖₂, where
-        # ‖σ‖₂ is the world model's predicted standard deviation. Rewards visiting
+        # Optimism / exploration bonus: rollout reward += optimism * ‖σ_ep‖₂,
+        # where σ_ep is ensemble disagreement. Rewards visiting
         # state-actions the model is uncertain about (optimism in the face of
         # uncertainty). 0.0 disables it. _unc_mean tracks the last rollout's mean
         # ‖σ‖₂ for tuning the coefficient against the reward scale.
         self.optimism = float(ac.get("optimism", 0.0))
         self._unc_mean = float("nan")
         self._calib_err = float("nan")
+        self._reward_val_rmse = float("nan")
+        self._terminal_val_bce = float("nan")
 
         # (Reward conditioning removed: rewards are stored RAW and normalized at
         # sample time by VecNormalize via _vec_normalize_env — see below.)
@@ -677,7 +749,7 @@ class MBPOTrainer:
             n_envs=1,
             optimize_memory_usage=False,
             handle_timeout_termination=True,
-            real_buffer=self.real_buffer,
+            real_buffer=self.policy_real_buffer,
             real_ratio=self.real_ratio,
         )
         # SAC.train() requires _logger; silence it — MBPO has its own logging
@@ -838,25 +910,74 @@ class MBPOTrainer:
         ac = self._ac
         if self.real_buffer.size() < ac.batch_size:
             return float("nan"), float("nan")
+
+        # Freeze a genuine held-out split for this model-training phase. Each
+        # ensemble member below receives an independent bootstrap sample from
+        # the remaining data; sharing one minibatch collapses epistemic diversity.
+        n = self.real_buffer.size()
+        raw_obs = self.real_buffer.observations[:n, 0]
+        raw_next = self.real_buffer.next_observations[:n, 0]
+        obs_all = torch.as_tensor(self.env.normalize_obs(raw_obs.copy()), device=self.device)
+        next_all = torch.as_tensor(self.env.normalize_obs(raw_next.copy()), device=self.device)
+        act_all = torch.as_tensor(self.real_buffer.actions[:n, 0], device=self.device)
+        rew_all = torch.as_tensor(self.real_buffer.rewards[:n], device=self.device)
+        terminal_np = self.real_buffer.dones[:n].copy()
+        if hasattr(self.real_buffer, "timeouts"):
+            terminal_np *= 1.0 - self.real_buffer.timeouts[:n]
+        terminal_all = torch.as_tensor(terminal_np, device=self.device)
+
+        perm = torch.randperm(n, device=self.device)
+        n_val = max(2, min(2048, n // 10))
+        val_idx, train_idx = perm[:n_val], perm[n_val:]
         self.dynamics.train()
         train_losses = []
         for _ in range(ac.model_train_epochs):
-            # real_buffer stores RAW obs; pass env so obs/next_obs come back
-            # NORMALIZED — the dynamics model operates in VecNormalize space.
-            b = self.real_buffer.sample(min(ac.model_batch_size, self.real_buffer.size()), env=self.env)
-            # Target (base-obs delta) is derived from next_obs inside the model;
-            # reward is supplied analytically.
-            loss = self.dynamics.nll_loss(b.observations, b.actions, b.next_observations)
+            batch_size = min(int(ac.model_batch_size), len(train_idx))
+            boot = torch.randint(
+                0, len(train_idx),
+                (self.dynamics.ensemble_size, batch_size), device=self.device,
+            )
+            idx = train_idx[boot]
+            loss = self.dynamics.nll_loss(
+                obs_all[idx], act_all[idx], next_all[idx], rew_all[idx], terminal_all[idx]
+            )
             self.model_opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.dynamics.parameters(), 1.0)
             self.model_opt.step()
             train_losses.append(loss.item())
-        # Recalibrate predictive std on a held-out validation batch.
-        b = self.real_buffer.sample(min(2048, self.real_buffer.size()), env=self.env)
-        self._calib_err = self.dynamics.update_calibration(b.observations, b.actions, b.next_observations)
+
+        # Rank members on held-out data and only sample the best models. Split
+        # validation again so fitting alpha and reporting its error use different
+        # transitions (the old same-batch diagnostic was zero by construction).
         with torch.no_grad():
-            val_loss = self.dynamics.nll_loss(b.observations, b.actions, b.next_observations).item()
+            member_val = self.dynamics.loss_per_member(
+                obs_all[val_idx], act_all[val_idx], next_all[val_idx],
+                rew_all[val_idx], terminal_all[val_idx],
+            )
+            elites = torch.argsort(member_val)[:self.dynamics.num_elites]
+            self.dynamics.elite_indices.copy_(elites)
+            val_loss = float(member_val[elites].mean())
+            _, _, reward_mean, _, terminal_logit = self.dynamics._forward(
+                obs_all[val_idx], act_all[val_idx]
+            )
+            reward_pred = reward_mean[elites].mean(dim=0)
+            terminal_pred = terminal_logit[elites].mean(dim=0)
+            reward_target = rew_all[val_idx].squeeze(-1)
+            terminal_target = terminal_all[val_idx].squeeze(-1)
+            self._reward_val_rmse = float(
+                torch.mean((reward_pred - reward_target).pow(2)).sqrt()
+            )
+            self._terminal_val_bce = float(F.binary_cross_entropy_with_logits(
+                terminal_pred, terminal_target
+            ))
+        split = max(1, len(val_idx) // 2)
+        cal_idx = val_idx[:split]
+        eval_idx = val_idx[split:] if split < len(val_idx) else val_idx[:split]
+        self.dynamics.update_calibration(obs_all[cal_idx], act_all[cal_idx], next_all[cal_idx])
+        self._calib_err = self.dynamics.calibration_error(
+            obs_all[eval_idx], act_all[eval_idx], next_all[eval_idx]
+        )
         self.dynamics.eval()
         return float(np.mean(train_losses)), val_loss
 
@@ -868,10 +989,24 @@ class MBPOTrainer:
         length = ac.min_rollout_length + t * (ac.max_rollout_length - ac.min_rollout_length)
         return int(min(length, ac.max_rollout_length))
 
+    def _normalize_history_action(self, act: np.ndarray) -> np.ndarray:
+        """Normalize actions before inserting them into normalized obs stacks.
+
+        SAC actions themselves are always raw [-1, 1], but historical actions
+        are observation dimensions and therefore pass through VecNormalize.
+        """
+        if not self.dynamics.stacked:
+            return act
+        sl = slice(self.dynamics.state_dim, self.dynamics.frame_dim)
+        mean = np.asarray(self.env.obs_rms.mean[sl], dtype=np.float32)
+        var = np.asarray(self.env.obs_rms.var[sl], dtype=np.float32)
+        normalized = (act - mean) / np.sqrt(var + self.env.epsilon)
+        return np.clip(normalized, -self.env.clip_obs, self.env.clip_obs).astype(np.float32)
+
     def _generate_rollouts(self, length: int) -> None:
         ac = self._ac
         # real_buffer stores RAW; pass env so start states come back NORMALIZED —
-        # the dynamics model, policy, and analytic reward all operate in
+        # the dynamics model and policy operate in
         # VecNormalize space during the rollout. Outputs are un-normalized to raw
         # before storage so the SAC buffer holds raw (normalized again at sample).
         b = self.real_buffer.sample(ac.rollout_batch_size, env=self.env)
@@ -879,7 +1014,7 @@ class MBPOTrainer:
 
         # TS-∞: fix one ensemble member for the whole rollout (no-op for the
         # other sampling modes).
-        self.dynamics.set_sampling_idx(int(np.random.randint(self.dynamics.ensemble_size)))
+        self.dynamics.set_sampling_idx(int(np.random.randint(len(self.dynamics.elite_indices))))
 
         all_obs, all_nobs, all_act, all_rew, all_done = [], [], [], [], []
         # Branches that hit an absorbing state (hole/goal) stop being rolled
@@ -889,10 +1024,6 @@ class MBPOTrainer:
         n_start = len(obs)
         stored_per_branch = np.zeros(n_start, dtype=np.int64)
         unc_means: list[float] = []
-        # Sticky path progress carried across the rollout, replicating the env's
-        # stateful ``_prev_progress`` (holds the last on-path value, only updates
-        # when on-path). Initialised from the stacked history of the start state.
-        prev_prog = self.reward_model.init_prev_progress(obs)
         shield_rates: list[float] = []
         for _ in range(length):
             act, _ = self.sac.predict(obs, deterministic=False)   # a_learned
@@ -904,18 +1035,13 @@ class MBPOTrainer:
             act_exec, unsafe, _ = self._shield(obs, act)
             if unsafe is not None:
                 shield_rates.append(float(unsafe.mean()))
-            nobs, unc = self.dynamics.sample(obs, act_exec)
-            # Reward from the analytic model (raw scale), not the dynamics net.
-            # Returns the reward and the updated sticky progress for next step.
-            rew, prev_prog = self.reward_model.reward(prev_prog, nobs)
+            # The action passed to physics/model input is raw, while the copy
+            # inserted into the normalized observation history must itself be
+            # normalized using the corresponding VecNormalize dimensions.
+            hist_act = self._normalize_history_action(act_exec)
+            nobs, rew, done, unc = self.dynamics.sample(obs, act_exec, hist_act)
             rew = rew + self.optimism * unc   # optimism / UCB exploration bonus
             unc_means.append(float(unc.mean()))
-            # Analytic terminals (hole = failure, goal = success), mirroring the
-            # real env. Computed on the same (pre-clip) nobs the reward used, so
-            # the hole/goal detection can't disagree with the reward's terms.
-            # Absorbing states get a zero-bootstrap target, so the critic stops
-            # treating holes as survivable recurring costs.
-            done = self.reward_model.terminal(nobs)
 
             # Only keep transitions the model is confident about: an alive branch
             # whose predictive uncertainty is within threshold. High-uncertainty
@@ -944,7 +1070,7 @@ class MBPOTrainer:
         # The rollout ran in normalized space; un-normalize obs/next_obs to RAW so
         # the SAC buffer holds raw (VecNormalize re-normalizes at sample time,
         # keeping model transitions on the same footing as real ones). Rewards
-        # are analytic raw already.
+        # are model predictions on the raw environment-reward scale.
         obs_raw = self.env.unnormalize_obs(np.concatenate(all_obs))
         nobs_raw = self.env.unnormalize_obs(np.concatenate(all_nobs))
         self._batch_add_to_sac(
@@ -1010,7 +1136,12 @@ class MBPOTrainer:
             # Random exploration during warmup, SAC policy afterwards
             if step < ac.warmup_steps:
                 act = np.stack([self.env.action_space.sample() for _ in range(n_envs)])
-                act_exec = act
+                # Warmup proposals are random, but must obey the same safety
+                # shield as learned-policy actions. The real buffer still stores
+                # the action that was actually executed.
+                act_exec, unsafe, _ = self._shield(obs, act)
+                if unsafe is not None and unsafe.size:
+                    backup_triggers.append(float(unsafe.mean()))
             else:
                 act, _ = self.sac.predict(obs, deterministic=False)   # a_learned
                 # Safety shield: play the recovery policy where the learning action
@@ -1025,8 +1156,8 @@ class MBPOTrainer:
             nobs_raw = self.env.get_original_obs()
             rew_raw = self.env.get_original_reward()
 
-            # Store each parallel env's transition. Real executed transitions go
-            # to real_buffer only — they reach SAC via the real_ratio sampler.
+            # Store each parallel env transition in two action-consistent views:
+            # executed action for dynamics, proposed action for shielded SAC.
             for i in range(n_envs):
                 terminal = bool(done[i]) and not infos[i].get("TimeLimit.truncated", False)
                 t = np.array([terminal])
@@ -1045,6 +1176,12 @@ class MBPOTrainer:
                 # world model learns the true dynamics s' = f(s, a_exec).
                 self.real_buffer.add(
                     obs_raw[i:i+1], next_o, act_exec[i:i+1],
+                    rew_raw[i:i+1], t, [infos[i]],
+                )
+                # Policy view of the identical outcome: key it by the action SAC
+                # proposed, matching synthetic action-overwriting transitions.
+                self.policy_real_buffer.add(
+                    obs_raw[i:i+1], next_o, act[i:i+1],
                     rew_raw[i:i+1], t, [infos[i]],
                 )
                 ep_info = infos[i].get("episode")
@@ -1114,13 +1251,11 @@ class MBPOTrainer:
                 parts = [f"[MBPO] {step:>8}/{total_timesteps}"]
                 log = {"train/step": step}
                 if ep_rewards:
-                    # Smoothed 100-episode rolling mean, matching pure SAC's
-                    # WandbCallback (train/ep_rew_mean). A single episode's return
-                    # is very noisy under randomize_init_pos, so the last-episode
-                    # value alone is not comparable to SAC's smoothed curve.
+                    # Smoothed 10-episode rolling mean. A single episode's return
+                    # is very noisy under randomize_init_pos.
                     if len(ep_rewards) >= 10:
-                        ep_rew_mean = float(np.mean(ep_rewards[-100:]))
-                        ep_len_mean = float(np.mean(ep_lengths[-100:]))
+                        ep_rew_mean = float(np.mean(ep_rewards[-10:]))
+                        ep_len_mean = float(np.mean(ep_lengths[-10:]))
                         log["train/ep_rew_mean"] = ep_rew_mean
                         log["train/ep_len_mean"] = ep_len_mean
                         parts.append(f"ep_rew_mean={ep_rew_mean:.3f}")
@@ -1191,6 +1326,12 @@ class MBPOTrainer:
                 if not np.isnan(self._calib_err):
                     log["model/calib_err"] = self._calib_err
                     parts.append(f"calib_err={self._calib_err:.3f}")
+                if not np.isnan(self._reward_val_rmse):
+                    log["model/reward_val_rmse"] = self._reward_val_rmse
+                    parts.append(f"reward_rmse={self._reward_val_rmse:.3f}")
+                if not np.isnan(self._terminal_val_bce):
+                    log["model/terminal_val_bce"] = self._terminal_val_bce
+                    parts.append(f"terminal_bce={self._terminal_val_bce:.3f}")
                 parts.append(f"real={self.real_buffer.size()}")
                 parts.append(f"model={self.sac.replay_buffer.size()}")
                 parts.append(f"rollout_len={self._rollout_length(step)}")

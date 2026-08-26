@@ -60,6 +60,7 @@ def make_env(cfg):
             prior_mode=cfg.env.get("prior_mode", False),
             recovery_speed_threshold=cfg.env.get("recovery_speed_threshold", 0.03),
             recovery_hole_margin_factor=cfg.env.get("recovery_hole_margin_factor", 3.0),
+            recovery_progress_tolerance=cfg.env.get("recovery_progress_tolerance", 0.05),
             prior_init_max_speed=cfg.env.get("prior_init_max_speed", 0.2),
         )
     return _init
@@ -97,6 +98,7 @@ def eval_and_log_video(
                 prior_mode=ec.get("prior_mode", False),
                 recovery_speed_threshold=ec.get("recovery_speed_threshold", 0.03),
                 recovery_hole_margin_factor=ec.get("recovery_hole_margin_factor", 3.0),
+                recovery_progress_tolerance=ec.get("recovery_progress_tolerance", 0.05),
                 prior_init_max_speed=ec.get("prior_init_max_speed", 0.2),
                 reward_every_n_waypoints=ec.get("reward_every_n_waypoints", 3),
                 hole_penalty=ec.get("hole_penalty", 5.0),

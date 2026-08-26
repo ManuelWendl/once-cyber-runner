@@ -19,7 +19,7 @@ target_entropy: auto    # SAC-parity setting (=-dim(A)=-2, same as sac.yaml). Wi
 
 # ── World model ───────────────────────────────────────────────────────────────
 ensemble_size: 5
-num_elites: 3                  # (unused) elites replaced by std calibration
+num_elites: 3                  # best held-out ensemble members used for rollouts
 hidden_sizes: [1024, 1024, 1024]
 model_lr: 3e-4
 model_weight_decay: 0
@@ -31,7 +31,7 @@ identity_weight_decay: 5e-4     # decay coefficient used when identity_prior=tru
                                 # (overrides model_weight_decay for the world model)
 model_train_freq: 2000         # retrain world model every N env steps
 rollout_freq: 250              # regenerate synthetic rollouts every N env steps
-model_train_epochs: 50
+model_train_epochs: 50         # independent bootstrap minibatch per ensemble member
 model_batch_size: 512
 sig_min: 1e-3                  # min aleatoric std (reference sig_min clamp)
 sig_max: 1e3                   # max aleatoric std (reference sig_max clamp)
@@ -40,28 +40,30 @@ sampling_type: TS1             # rollout sampling: mean | TS1 | TSInf | DS
 
 # ── Buffers ───────────────────────────────────────────────────────────────────
 real_buffer_size: 1_000_000
-model_buffer_size: 1_000_000     # SAC's replay buffer (synthetic model rollouts + penalty transitions)
-real_ratio: 0.1                # fraction of each SAC batch drawn from real data (rest = model rollouts)
+model_buffer_size: 200_000       # rolling window of recent synthetic rollouts; with the
+                                 # settings below this retains about five model fits at
+                                 # rollout length 1 and becomes fresher as length grows
+real_ratio: 0.1                  # equal real/model policy batch while model quality settles
 
 # ── Rollout schedule ──────────────────────────────────────────────────────────
 warmup_steps: 10_048           # pure random collection before model training
                                # (multiple of n_envs=64; matches SAC learning_starts≈10k)
-rollout_batch_size: 400        # initial states per rollout call
+rollout_batch_size: 5_000      # enough synthetic diversity for the high SAC update rate
 min_rollout_length: 1
 max_rollout_length: 3
 rollout_schedule_steps: 1_000_000  # steps over which length grows min→max
-rollout_unc_threshold: 0.5     # truncate an imagined branch once its predictive
-                               # uncertainty ‖σ‖₂ exceeds this, so rollouts stay in
+rollout_unc_threshold: 0.5     # truncate an imagined branch once epistemic ensemble
+                               # disagreement ‖σ_epistemic‖₂ exceeds this, so rollouts stay in
                                # the model's reliable region instead of compounding
-                               # error off-distribution (which blew up the SAC critic
-                               # in run earthy-shape-214 at rollout_len=5). On-dist
-                               # model_unc ≈ 0.3, drift spikes >1.0, so ~0.5 passes
-                               # normal steps and cuts drift. null disables. Watch
+                               # error off-distribution. Because this now measures
+                               # epistemic-only uncertainty, retune it from logged
+                               # model_unc rather than using older total-std values.
+                               # null disables. Watch
                                # train/rollout_len_eff vs rollout_len to tune.
 
 # ── Exploration ───────────────────────────────────────────────────────────────
-optimism: 0.0                  # rollout reward += optimism * ‖σ‖₂ (model prediction
-                               # uncertainty). Optimism in the face of uncertainty;
+optimism: 0.0                  # rollout reward += optimism * ‖σ_epistemic‖₂.
+                               # Optimism in the face of model uncertainty;
                                # 0.0 disables. Tune against train/model_unc (the mean
                                # ‖σ‖₂) so the bonus is a sensible fraction of the reward.
 
@@ -73,8 +75,9 @@ utd_ratio: 75                   # SAC gradient steps per env step (after warmup)
 # is loaded, at each step the learning policy's proposed action a_learned is judged
 # by the backup's recoverability value: SAC backup → min(Q1,Q2)(s, a_learned);
 # PPO backup → V(s). If it is < safety_threshold the recovery policy acts instead.
-#   • World-model (real) buffer stores the EXECUTED action  → learns s'=f(s, a_exec)
-#   • Planning (SAC) rollouts store (s, a_learned, s'(s, a_exec), r(s, a_exec))
+#   • World-model buffer stores the EXECUTED action → learns s'=f(s, a_exec)
+#   • SAC's real and model views store the PROPOSED action with the executed
+#     outcome: (s, a_learned, s'(s, a_exec), r(s, a_exec))
 #     — action overwriting on the planning MDP.
 # The backup's OWN VecNormalize is loaded and used to renormalize obs before the
 # Q-query (the learner and backup share the same obs layout, different stats).

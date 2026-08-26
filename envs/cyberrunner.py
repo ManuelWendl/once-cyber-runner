@@ -1090,15 +1090,22 @@ class CyberRunnerEnv(gym.Env):
         bonus + hole penalty.
         Prior branch (``prior_mode=True``): the recovery/stabilization task —
         the ball is reset to a random hole-safe state and the policy is
-        rewarded for bringing it to a slow, hole-safe (recovered) state.
+        rewarded for bringing it to a slow, hole-safe, not-further-along-the-
+        path (recovered) state.
 
     Prior branch (``prior_mode=True``):
         - Random resetting: marble spawns at a random hole-safe position with a
           random velocity (and flat board), so the policy sees the kind of
-          fast-moving states it must recover from.
+          fast-moving states it must recover from. The path progress at that
+          spawn point is recorded as the recovery baseline.
         - Terminations: reaching a recovered state (success), falling into a
           hole (failure), and timeout are all terminal (terminated=True) so the
           value function is not bootstrapped past the episode boundary.
+        - Recovery requires progress <= the spawn baseline (+ a small
+          tolerance): the backup may stabilize in place or drift backward, but
+          may never claim recovery by coasting further toward the goal — that
+          would let the shield "launder" forward progress through an
+          unrelated recovery reward.
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
@@ -1111,10 +1118,11 @@ class CyberRunnerEnv(gym.Env):
         reward_every_n_waypoints: int = 3,
         hole_penalty: float = 5.0,
         dense_main_progress_scale: float = 100.0,
-        layout: str = "hard",
+        layout: str = "easy",
         prior_mode: bool = False,
         recovery_speed_threshold: float = 0.03,
         recovery_hole_margin_factor: float = 3.0,
+        recovery_progress_tolerance: float = 0.05,
         prior_init_max_speed: float = 0.2,
         obs_n_stack: int = 1,
     ):
@@ -1137,6 +1145,10 @@ class CyberRunnerEnv(gym.Env):
         self.prior_mode = bool(prior_mode)
         self.recovery_speed_threshold = float(recovery_speed_threshold)
         self.recovery_hole_margin_factor = float(recovery_hole_margin_factor)
+        # Tolerance (in the same ×10 arc-length units as path_progress) on top
+        # of the spawn-time progress baseline, absorbing raycast/projection
+        # jitter so a stationary ball isn't spuriously denied recovery.
+        self.recovery_progress_tolerance = float(recovery_progress_tolerance)
         self.prior_init_max_speed = float(prior_init_max_speed)
 
         # Load maze layout
@@ -1200,17 +1212,36 @@ class CyberRunnerEnv(gym.Env):
         self._ball_speed = 0.0
         self._min_hole_distance = np.inf
         self._recovered = False
+        self._recovery_start_progress = 0.0
 
     # ── helpers ────────────────────────────────────────────────────────────
 
     def _compute_min_hole_distance(self, ball_pos: np.ndarray) -> float:
         return float(np.linalg.norm(self.holes - ball_pos, axis=1).min())
 
-    def _check_recovery(self) -> bool:
-        """True when the ball is slow and safely away from every hole."""
+    def _check_recovery(self, curr_progress: float) -> bool:
+        """True when the ball is slow, safely away from every hole, and has
+        not advanced past its path progress at the start of this recovery
+        episode (within ``recovery_progress_tolerance``). Without this, the
+        backup could "recover" by coasting forward along the path — the
+        shield would then be exploitable to make unsafe forward progress
+        under the cover of a recovery reward.
+
+        If the handoff point itself had no path reading (occluded spawn),
+        "ahead" is undefined there, so the progress condition is skipped for
+        that episode and recovery falls back to hole/speed only — otherwise a
+        path reading is required at the current step too, since progress that
+        can't be verified as non-advancing must not count as recovered."""
         hole_safe = self._min_hole_distance > HOLE_RADIUS + self.recovery_hole_margin_factor * MARBLE_RADIUS
         speed_ok = self._ball_speed < self.recovery_speed_threshold
-        return hole_safe and speed_ok
+        if self._recovery_start_progress < 0:
+            progress_ok = True
+        else:
+            progress_ok = (
+                curr_progress >= 0
+                and curr_progress <= self._recovery_start_progress + self.recovery_progress_tolerance
+            )
+        return hole_safe and speed_ok and progress_ok
 
     def _sample_safe_position(self) -> np.ndarray:
         """Uniformly sample a board position that is hole-safe for spawning."""
@@ -1289,6 +1320,10 @@ class CyberRunnerEnv(gym.Env):
             ball_pos, self.waypoints, self.seg_lengths, self.cum_distances, self.walls_h, self.walls_v, self.holes
         )
         self._path_detected = self._prev_progress >= 0
+        if self.prior_mode:
+            # Baseline for the "no forward progress" recovery condition — the
+            # path progress at the handoff point this episode starts from.
+            self._recovery_start_progress = self._prev_progress
 
         # Initialise the frame stack: fill it with the first base observation
         # and zero actions (no action has been taken yet).
@@ -1335,7 +1370,11 @@ class CyberRunnerEnv(gym.Env):
         # Check termination
         terminated, truncated, info = self._check_termination(ball_pos)
 
-        # Update state
+        # Keep the last valid path progress while detection is temporarily lost.
+        # Resetting it to the off-path sentinel (-1) lets an agent move forward
+        # while detected, move backward while undetected for free, and repeat.
+        # The sticky value makes the backward displacement count when the path
+        # becomes visible again and closes that reward-ratcheting exploit.
         if curr_progress >= 0:
             self._prev_progress = curr_progress
 
@@ -1413,7 +1452,7 @@ class CyberRunnerEnv(gym.Env):
             # Recovery task: binary reward — 1.0 the moment the ball reaches a
             # slow, hole-safe state. With gamma=1.0, V(s) then estimates the
             # probability of recovering within the episode.
-            if self._check_recovery():
+            if self._check_recovery(curr_progress):
                 self._recovered = True
                 return 1.0
             return 0.0
