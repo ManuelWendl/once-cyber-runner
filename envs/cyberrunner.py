@@ -52,7 +52,11 @@ JOINT_ANGLE_NOISE = 0.25 * np.pi / 180  # 0.25 degrees
 # Reward parameters
 PROGRESS_SCALE = 1.0
 GOAL_BONUS = 10.0
-GOAL_THRESHOLD = 0.004  # 4mm
+# Goal-center tolerance. The old 4 mm threshold was smaller than the 6.3 mm
+# marble itself, so videos showed the marble visibly entering the goal and
+# rolling back out without termination. Match the maze's 7.5 mm target/hole
+# radius so visual entry and numerical success agree.
+GOAL_THRESHOLD = HOLE_RADIUS
 # Max plausible one-step change in path progress. The closest-segment detection
 # occasionally FLIPS to a distant part of the path, producing spurious
 # Δprogress up to ~6.4 (→ ±640 dense reward) — physically impossible in one

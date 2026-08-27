@@ -22,8 +22,8 @@ env:
   episode_length: 2000
   continuing_task: true
   virtual_episode_length: 2000
-  randomize_init_pos: true
-  random_init_start_probability: 0.5
+  randomize_init_pos: false
+  random_init_start_probability: 1.0
 
 algo:
   warmup_policy: waypoint_pd
@@ -36,5 +36,5 @@ algo:
   backup_wandb_project: cyberrunner
   backup_policy_path: null         # local fallback (.zip) if backup_wandb_id is null
   backup_vecnorm_path: null        # local fallback (VecNormalize .pkl)
-  safety_threshold: 0.85           # measured safe/permissive balance; >=0.90 stalls recovery
+  safety_threshold: 0.9           # measured safe/permissive balance; >=0.90 stalls recovery
   optimism: 0.5                    # avoid rewarding model error as if it were task progress
