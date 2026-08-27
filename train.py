@@ -25,9 +25,13 @@ class WandbCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         for info in self.locals.get("infos", []):
-            if "episode" in info:
-                self._ep_rewards.append(float(info["episode"]["r"]))
-                self._ep_lengths.append(float(info["episode"]["l"]))
+            # Continuing tasks expose fixed-length reporting windows without
+            # changing the MDP's done flag.  Prefer those windows and fall back
+            # to Monitor's physical episode (hole/goal/timeout) statistics.
+            ep_info = info.get("virtual_episode", info.get("episode"))
+            if ep_info is not None:
+                self._ep_rewards.append(float(ep_info["r"]))
+                self._ep_lengths.append(float(ep_info["l"]))
         return True
 
     def _on_rollout_end(self) -> None:
@@ -37,8 +41,8 @@ class WandbCallback(BaseCallback):
 
         log = {}
         if len(self._ep_rewards) >= 10:
-            log["train/ep_rew_mean"] = np.mean(self._ep_rewards[-100:])
-            log["train/ep_len_mean"] = np.mean(self._ep_lengths[-100:])
+            log["train/ep_rew_mean"] = np.mean(self._ep_rewards[-10:])
+            log["train/ep_len_mean"] = np.mean(self._ep_lengths[-10:])
         if hasattr(self.model, "logger") and hasattr(self.model.logger, "name_to_value"):
             for k, v in self.model.logger.name_to_value.items():
                 if v is not None:
@@ -55,6 +59,7 @@ def make_env(cfg):
             dense_main_progress_scale=cfg.env.get("dense_main_progress_scale", 100.0),
             episode_length=cfg.env.episode_length,
             randomize_init_pos=cfg.env.randomize_init_pos,
+            random_init_start_probability=cfg.env.get("random_init_start_probability", 0.0),
             layout=cfg.env.get("layout", "hard"),
             obs_n_stack=cfg.env.get("obs_n_stack", 1),
             prior_mode=cfg.env.get("prior_mode", False),
@@ -62,6 +67,8 @@ def make_env(cfg):
             recovery_hole_margin_factor=cfg.env.get("recovery_hole_margin_factor", 3.0),
             recovery_progress_tolerance=cfg.env.get("recovery_progress_tolerance", 0.05),
             prior_init_max_speed=cfg.env.get("prior_init_max_speed", 0.2),
+            continuing_task=cfg.env.get("continuing_task", False),
+            virtual_episode_length=cfg.env.get("virtual_episode_length", cfg.env.episode_length),
         )
     return _init
 
@@ -93,6 +100,7 @@ def eval_and_log_video(
                 render_mode="rgb_array",
                 episode_length=ec["episode_length"],
                 randomize_init_pos=False,
+                random_init_start_probability=0.0,
                 layout=ec.get("layout", "hard"),
                 obs_n_stack=ec.get("obs_n_stack", 1),
                 prior_mode=ec.get("prior_mode", False),
@@ -103,6 +111,8 @@ def eval_and_log_video(
                 reward_every_n_waypoints=ec.get("reward_every_n_waypoints", 3),
                 hole_penalty=ec.get("hole_penalty", 5.0),
                 dense_main_progress_scale=ec.get("dense_main_progress_scale", 100.0),
+                continuing_task=ec.get("continuing_task", False),
+                virtual_episode_length=ec.get("virtual_episode_length", ec["episode_length"]),
             )]),
         )
         eval_env.training = False
@@ -136,7 +146,7 @@ def eval_and_log_video(
         step += 1
         if step % 200 == 0:
             print(f"[eval] step={step:4d}  cumulative_reward={total_reward:.3f}")
-        if done[0]:
+        if done[0] or step >= int(ec["episode_length"] if own_env else raw_env.episode_length):
             break
     print(f"[eval] done after {step} steps  total_reward={total_reward:.3f}")
 

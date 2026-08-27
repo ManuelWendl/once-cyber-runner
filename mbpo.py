@@ -699,7 +699,10 @@ class MBPOTrainer:
         # Fraction of every SAC batch drawn from real (vs. model) data. The
         # remainder comes from synthetic rollouts. Replaces the old implicit
         # mix where real transitions were written into the SAC buffer directly.
-        self.real_ratio = float(ac.get("real_ratio", 0.1))
+        self.real_ratio_start = float(ac.get("real_ratio_start", ac.get("real_ratio", 0.1)))
+        self.real_ratio_end = float(ac.get("real_ratio_end", ac.get("real_ratio", 0.1)))
+        self.real_ratio_schedule_steps = max(1, int(ac.get("real_ratio_schedule_steps", 1)))
+        self.real_ratio = self.real_ratio_start
 
         # Optimism / exploration bonus: rollout reward += optimism * ‖σ_ep‖₂,
         # where σ_ep is ensemble disagreement. Rewards visiting
@@ -870,7 +873,9 @@ class MBPOTrainer:
                 values = torch.min(qs[0], qs[1])
         return values.cpu().numpy().flatten()
 
-    def _shield(self, obs_norm: np.ndarray, act: np.ndarray):
+    def _shield(
+        self, obs_norm: np.ndarray, act: np.ndarray, threshold: float | None = None
+    ):
         """Apply the safety shield to a batch of proposed actions.
 
         Returns ``(act_exec, unsafe, values)``. Where the backup deems the proposed
@@ -882,7 +887,8 @@ class MBPOTrainer:
             return act, np.zeros(len(act), dtype=bool), None
         backup_obs = self._to_backup_obs(obs_norm)
         values = self._recovery_values(backup_obs, act)      # recoverability of a_learned
-        unsafe = values < self.safety_threshold
+        active_threshold = self.safety_threshold if threshold is None else float(threshold)
+        unsafe = values < active_threshold
         act_exec = act
         if unsafe.any():
             act_exec = act.copy()
@@ -1114,6 +1120,28 @@ class MBPOTrainer:
 
     # ── main loop ─────────────────────────────────────────────────────────
 
+    def _waypoint_warmup_actions(self) -> np.ndarray:
+        """Safe, dynamics-aware demonstrations for initial replay coverage.
+
+        The controller aims at the next visible waypoint and damps marble
+        velocity. It is used only during warmup; the shield still has final
+        authority and SAC controls every subsequent real/model transition.
+        """
+        kp = float(self._ac.get("warmup_waypoint_kp", 10.0))
+        kd = float(self._ac.get("warmup_waypoint_kd", 4.0))
+        action_limit = float(self._ac.get("warmup_waypoint_action_limit", 1.0))
+        actions = []
+        for wrapped in self.env.venv.envs:
+            raw_env = wrapped.unwrapped
+            pos = raw_env._get_ball_pos_board_frame()
+            target_idx = min(raw_env._seg_idx + 1, len(raw_env.waypoints) - 1)
+            error = raw_env.waypoints[target_idx] - pos
+            desired_acceleration = kp * error - kd * raw_env._ball_vel
+            # Positive board commands accelerate the marble in the negative
+            # board-frame x/y direction for alpha/beta respectively.
+            actions.append(np.clip(-desired_acceleration, -action_limit, action_limit))
+        return np.asarray(actions, dtype=np.float32)
+
     def learn(self, total_timesteps: int, wandb_run=None) -> None:
         ac = self._ac
         obs = self.env.reset()                    # normalized obs (fed to the policy)
@@ -1131,15 +1159,29 @@ class MBPOTrainer:
         model_train_nlls: list[float] = []
         model_val_nlls: list[float] = []
         backup_triggers: list[float] = []   # per-step real-env shield trigger rate
+        hole_events: list[float] = []
+        goal_events: list[float] = []
+        path_progress: list[float] = []
 
         while step < total_timesteps:
+            ratio_fraction = min(1.0, step / self.real_ratio_schedule_steps)
+            self.real_ratio = (
+                self.real_ratio_start
+                + ratio_fraction * (self.real_ratio_end - self.real_ratio_start)
+            )
+            self.sac.replay_buffer.real_ratio = self.real_ratio
             # Random exploration during warmup, SAC policy afterwards
             if step < ac.warmup_steps:
-                act = np.stack([self.env.action_space.sample() for _ in range(n_envs)])
+                if ac.get("warmup_policy", "random") == "waypoint_pd":
+                    act = self._waypoint_warmup_actions()
+                else:
+                    act = np.stack([self.env.action_space.sample() for _ in range(n_envs)])
                 # Warmup proposals are random, but must obey the same safety
                 # shield as learned-policy actions. The real buffer still stores
                 # the action that was actually executed.
-                act_exec, unsafe, _ = self._shield(obs, act)
+                act_exec, unsafe, _ = self._shield(
+                    obs, act, threshold=ac.get("warmup_safety_threshold", None)
+                )
                 if unsafe is not None and unsafe.size:
                     backup_triggers.append(float(unsafe.mean()))
             else:
@@ -1184,10 +1226,19 @@ class MBPOTrainer:
                     obs_raw[i:i+1], next_o, act[i:i+1],
                     rew_raw[i:i+1], t, [infos[i]],
                 )
-                ep_info = infos[i].get("episode")
+                # Virtual episodes are finite reporting/planning windows only:
+                # their last transition remains non-terminal in both replay
+                # buffers, so SAC and the model bootstrap across the boundary.
+                ep_info = infos[i].get("virtual_episode", infos[i].get("episode"))
                 if ep_info is not None:
                     ep_rewards.append(float(ep_info["r"]))
                     ep_lengths.append(int(ep_info["l"]))
+                reason = infos[i].get("termination_reason")
+                hole_events.append(float(reason == "hole"))
+                goal_events.append(float(reason == "goal"))
+                progress = float(infos[i].get("path_progress", -1.0))
+                if progress >= 0.0:
+                    path_progress.append(progress)
 
             obs = nobs
             obs_raw = nobs_raw
@@ -1210,6 +1261,12 @@ class MBPOTrainer:
 
             if step >= ac.warmup_steps and _crossed(ac.rollout_freq):
                 self._generate_rollouts(self._rollout_length(step))
+
+            checkpoint_freq = int(ac.get("checkpoint_freq", 0))
+            if checkpoint_freq > 0 and _crossed(checkpoint_freq):
+                checkpoint_name = f"mbpo_checkpoint_{step}"
+                self.save(checkpoint_name)
+                self.env.save(f"{checkpoint_name}_vecnormalize.pkl")
 
             # Gate SAC updates on whichever buffer actually feeds the batch: at
             # real_ratio=1 the model buffer stays empty, so gating on it alone
@@ -1288,6 +1345,25 @@ class MBPOTrainer:
                 log["train/real_buffer"] = self.real_buffer.size()
                 log["train/model_buffer"] = self.sac.replay_buffer.size()
                 log["train/real_ratio"] = self.real_ratio
+                # Report physical outcomes separately from virtual windows.
+                # Rates use the latest 2k real transitions and are scaled per
+                # 1k, making safety/solution progress comparable across runs.
+                event_window = min(2_000, len(hole_events))
+                if event_window:
+                    hole_rate = 1_000.0 * float(np.mean(hole_events[-event_window:]))
+                    goal_rate = 1_000.0 * float(np.mean(goal_events[-event_window:]))
+                    log["safety/holes_total"] = int(np.sum(hole_events))
+                    log["safety/holes_per_1k"] = hole_rate
+                    log["train/goals_total"] = int(np.sum(goal_events))
+                    log["train/goals_per_1k"] = goal_rate
+                    parts.append(f"holes/1k={hole_rate:.2f}")
+                    parts.append(f"goals/1k={goal_rate:.2f}")
+                if path_progress:
+                    recent_progress = path_progress[-min(2_000, len(path_progress)):]
+                    log["train/path_progress_max"] = float(np.max(path_progress))
+                    log["train/path_progress_recent_max"] = float(np.max(recent_progress))
+                    log["train/path_progress_recent_mean"] = float(np.mean(recent_progress))
+                    parts.append(f"progress={np.max(recent_progress):.2f}")
                 # ── safety shield trigger rates ───────────────────────────
                 if self.backup_policy is not None:
                     if backup_triggers:

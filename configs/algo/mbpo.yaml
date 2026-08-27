@@ -44,10 +44,18 @@ model_buffer_size: 200_000       # rolling window of recent synthetic rollouts; 
                                  # settings below this retains about five model fits at
                                  # rollout length 1 and becomes fresher as length grows
 real_ratio: 0.1                  # equal real/model policy batch while model quality settles
+real_ratio_start: 1.0            # begin from trustworthy real data
+real_ratio_end: 0.5              # introduce model data only after the model has coverage
+real_ratio_schedule_steps: 100_000
 
 # ── Rollout schedule ──────────────────────────────────────────────────────────
-warmup_steps: 10_048           # pure random collection before model training
+warmup_steps: 1000           # pure random collection before model training
                                # (multiple of n_envs=64; matches SAC learning_starts≈10k)
+warmup_policy: random          # random | waypoint_pd (shield is applied to either)
+warmup_waypoint_kp: 10.0
+warmup_waypoint_kd: 4.0
+warmup_waypoint_action_limit: 1.0
+warmup_safety_threshold: null   # optional controller-specific threshold
 rollout_batch_size: 5_000      # enough synthetic diversity for the high SAC update rate
 min_rollout_length: 1
 max_rollout_length: 3
@@ -69,6 +77,7 @@ optimism: 0.0                  # rollout reward += optimism * ‖σ_epistemic‖
 
 # ── Policy update ─────────────────────────────────────────────────────────────
 utd_ratio: 75                   # SAC gradient steps per env step (after warmup)
+checkpoint_freq: 50_000         # save policy/dynamics/VecNormalize during long runs
 
 # ── Safety shield (backup / recovery policy) ──────────────────────────────────
 # "Ergodic rollout" shield. Off by default (backup_wandb_id: null). When a backup

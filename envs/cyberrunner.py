@@ -569,9 +569,16 @@ def compute_path_progress(
     # Distance from marble to closest point on each segment
     dist_to_seg = np.linalg.norm(marble_pos - closest_on_seg, axis=1)  # [S]
 
-    # Find closest segment
-    best_seg = np.argmin(dist_to_seg)
-    min_dist = dist_to_seg[best_seg]
+    # Find the closest segment. At a waypoint, the incoming and outgoing
+    # segments are exactly tied; choosing np.argmin would always select the
+    # incoming segment, making ``vec_to_next_wp`` point back to the waypoint
+    # itself (zero vector) and causing policies to stop there. Break geometric
+    # ties by choosing the projection with the greatest path progress.
+    min_dist = float(np.min(dist_to_seg))
+    tied = np.flatnonzero(dist_to_seg <= min_dist + 1e-7)
+    # Segment indices follow path order, so the last tied segment is the
+    # outgoing/furthest-progress one (including at multi-segment junctions).
+    best_seg = int(tied[-1])
 
     # If marble is very close to path (within 2mm), use direct projection
     if min_dist < 0.002:
@@ -1115,6 +1122,7 @@ class CyberRunnerEnv(gym.Env):
         render_mode: str | None = None,
         episode_length: int = 2000,
         randomize_init_pos: bool = False,
+        random_init_start_probability: float = 0.0,
         reward_every_n_waypoints: int = 3,
         hole_penalty: float = 5.0,
         dense_main_progress_scale: float = 100.0,
@@ -1125,15 +1133,24 @@ class CyberRunnerEnv(gym.Env):
         recovery_progress_tolerance: float = 0.05,
         prior_init_max_speed: float = 0.2,
         obs_n_stack: int = 1,
+        continuing_task: bool = False,
+        virtual_episode_length: int | None = None,
     ):
         super().__init__()
 
         self.render_mode = render_mode
         self.episode_length = episode_length
         self.randomize_init_pos = randomize_init_pos
+        self.random_init_start_probability = float(
+            np.clip(random_init_start_probability, 0.0, 1.0)
+        )
         self.reward_every_n_waypoints = reward_every_n_waypoints
         self.hole_penalty = hole_penalty
         self.dense_main_progress_scale = float(dense_main_progress_scale)
+        self.continuing_task = bool(continuing_task) and not bool(prior_mode)
+        self.virtual_episode_length = max(
+            1, int(virtual_episode_length or episode_length)
+        )
 
         # Frame stacking: instead of a recurrent policy, expose the last
         # ``obs_n_stack`` (base-observation, action) frames concatenated
@@ -1213,6 +1230,8 @@ class CyberRunnerEnv(gym.Env):
         self._min_hole_distance = np.inf
         self._recovered = False
         self._recovery_start_progress = 0.0
+        self._virtual_step_count = 0
+        self._virtual_return = 0.0
 
     # ── helpers ────────────────────────────────────────────────────────────
 
@@ -1268,7 +1287,14 @@ class CyberRunnerEnv(gym.Env):
         if self.prior_mode:
             init_pos = self._sample_safe_position()
         elif self.randomize_init_pos:
-            idx = self.np_random.integers(0, len(self.waypoints))
+            # The final waypoint is the terminal goal. Spawning there creates
+            # one-step "successes" with no maze solving and corrupts both the
+            # terminal model and goal-rate metric, so curriculum starts sample
+            # only non-terminal waypoints.
+            if self.np_random.random() < self.random_init_start_probability:
+                idx = 0
+            else:
+                idx = self.np_random.integers(0, max(1, len(self.waypoints) - 1))
             init_pos = self.waypoints[idx]
         else:
             init_pos = self.waypoints[0]
@@ -1310,6 +1336,8 @@ class CyberRunnerEnv(gym.Env):
 
         # Reset episode state
         self._step_count = 0
+        self._virtual_step_count = 0
+        self._virtual_return = 0.0
         self._recovered = False
         ball_pos = self._get_ball_pos_board_frame()
         self._prev_ball_pos = ball_pos.copy()
@@ -1369,6 +1397,21 @@ class CyberRunnerEnv(gym.Env):
 
         # Check termination
         terminated, truncated, info = self._check_termination(ball_pos)
+
+        # A virtual episode is a logging/training window, never an MDP terminal.
+        # Physical terminal events close the current (possibly short) window too;
+        # DummyVecEnv then performs the real reset for a hole or goal.
+        self._virtual_step_count += 1
+        self._virtual_return += float(reward)
+        virtual_boundary = self._virtual_step_count >= self.virtual_episode_length
+        if self.continuing_task and (virtual_boundary or terminated):
+            info["virtual_episode"] = {
+                "r": float(self._virtual_return),
+                "l": int(self._virtual_step_count),
+                "boundary": "terminal" if terminated else "time",
+            }
+            self._virtual_step_count = 0
+            self._virtual_return = 0.0
 
         # Keep the last valid path progress while detection is temporarily lost.
         # Resetting it to the off-path sentinel (-1) lets an agent move forward
@@ -1509,7 +1552,7 @@ class CyberRunnerEnv(gym.Env):
         # Check timeout. In prior_mode a timeout is a genuine failure (the ball
         # never recovered), so we mark it terminated — not truncated — to stop
         # SB3 bootstrapping V(s_final) into the recovery-probability target.
-        if self._step_count >= self.episode_length:
+        if not self.continuing_task and self._step_count >= self.episode_length:
             if self.prior_mode:
                 terminated = True
             else:

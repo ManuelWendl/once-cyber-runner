@@ -17,7 +17,10 @@ env:
   obs_n_stack: 5                    # stack the last N (observation, action) frames so a
                                     # feed-forward policy can infer velocity (1 = no stacking)
   episode_length: 2000
+  continuing_task: false           # if true, time windows do not reset or set done
+  virtual_episode_length: 2000     # logging/planning window in a continuing task
   randomize_init_pos: true
+  random_init_start_probability: 0.0  # when randomized, reserve this fraction for waypoint 0
   layout: easy
   # Prior (recovery / stabilization) branch — see CyberRunnerEnv.prior_mode.
   prior_mode: false

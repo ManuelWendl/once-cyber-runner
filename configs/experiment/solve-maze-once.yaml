@@ -14,18 +14,27 @@
 defaults:
   - override /algo: mbpo
 
-total_timesteps: 200_000
+total_timesteps: 500_000
 
 env:
   reward_every_n_waypoints: 3
   hole_penalty: 5.0
   episode_length: 2000
+  continuing_task: true
+  virtual_episode_length: 2000
+  randomize_init_pos: true
+  random_init_start_probability: 0.5
 
 algo:
+  warmup_policy: waypoint_pd
+  warmup_waypoint_kp: 5.0
+  warmup_waypoint_kd: 0.5
+  warmup_waypoint_action_limit: 0.2
+  warmup_safety_threshold: 0.7
   # ── Safety shield / recovery policy ─────────────────────────────────────────
-  backup_wandb_id: 68zc4cmb #led23vhn #oe73q5n6        # trained recovery (backup-sac) policy on wandb
+  backup_wandb_id: u8rnq5nr #led23vhn #oe73q5n6        # trained recovery (backup-sac) policy on wandb
   backup_wandb_project: cyberrunner
   backup_policy_path: null         # local fallback (.zip) if backup_wandb_id is null
   backup_vecnorm_path: null        # local fallback (VecNormalize .pkl)
-  safety_threshold: 0.5            # recoverability below this ⇒ fall back to recovery policy
-  optimism: 5.0                    # rollout reward += optimism * ‖σ_epistemic‖₂.
+  safety_threshold: 0.85           # measured safe/permissive balance; >=0.90 stalls recovery
+  optimism: 0.5                    # avoid rewarding model error as if it were task progress
