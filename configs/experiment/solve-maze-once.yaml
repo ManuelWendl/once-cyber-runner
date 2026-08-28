@@ -22,8 +22,8 @@ env:
   episode_length: 2000
   continuing_task: true
   virtual_episode_length: 2000
-  randomize_init_pos: false
-  random_init_start_probability: 1.0
+  randomize_init_pos: true
+  random_init_start_probability: 0.5
 
 algo:
   warmup_policy: waypoint_pd
