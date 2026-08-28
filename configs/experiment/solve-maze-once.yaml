@@ -14,7 +14,7 @@
 defaults:
   - override /algo: mbpo
 
-total_timesteps: 500_000
+total_timesteps: 1_000_000
 
 env:
   reward_every_n_waypoints: 3
@@ -36,5 +36,5 @@ algo:
   backup_wandb_project: cyberrunner
   backup_policy_path: null         # local fallback (.zip) if backup_wandb_id is null
   backup_vecnorm_path: null        # local fallback (VecNormalize .pkl)
-  safety_threshold: 0.9           # measured safe/permissive balance; >=0.90 stalls recovery
+  safety_threshold: 0.85           # measured safe/permissive balance; >=0.90 stalls recovery
   optimism: 0.5                    # avoid rewarding model error as if it were task progress
