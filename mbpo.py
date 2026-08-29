@@ -33,7 +33,7 @@ from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.logger import configure as configure_logger
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
-from stable_baselines3.common.utils import set_random_seed
+from stable_baselines3.common.utils import polyak_update, set_random_seed
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from omegaconf import DictConfig
 
@@ -776,6 +776,31 @@ class MBPOTrainer:
         self._rollout_shield_rate = float("nan")   # last rollout's mean trigger rate
         self._load_backup(ac, cfg, device)
 
+        # ── Robust (pessimistic) recovery-Q update ─────────────────────────────
+        # Prop. robust_bound: periodically re-fits ONLY the loaded SAC backup's
+        # critic (never its actor π_r) toward the pessimistic lower bound
+        # Q_{R_eps,t}^{pi_r}, discounting the nominal recoverability value by a
+        # penalty on how much the CURRENT world-model ensemble disagrees with
+        # itself at the queried (s,a) — see ``_robust_recovery_q_update``.
+        self.robust_recovery_update = (
+            bool(ac.get("robust_recovery_update", False))
+            and self.backup_policy is not None
+            and isinstance(self.backup_policy, SAC)
+        )
+        self.robust_recovery_L = float(ac.get("robust_recovery_L", 1.0))          # Lipschitz constant L
+        self.robust_recovery_margin = float(ac.get("robust_recovery_margin", 0.0))  # constant margin m
+        if bool(ac.get("robust_recovery_update", False)) and not self.robust_recovery_update:
+            print(
+                "[MBPO] robust_recovery_update requested but no SAC backup is loaded — disabled.",
+                flush=True,
+            )
+        elif self.robust_recovery_update:
+            print(
+                f"[MBPO] Robust recovery Q update ENABLED "
+                f"(L={self.robust_recovery_L}, m={self.robust_recovery_margin}).",
+                flush=True,
+            )
+
         self._ac = ac
 
     # ── safety shield (backup / recovery policy) ──────────────────────────────
@@ -792,6 +817,11 @@ class MBPOTrainer:
         self.backup_policy = None
         self.backup_vecnorm = None
         self.safety_threshold = float(ac.get("safety_threshold", 0.3))
+        # Geometric recovery-set R defaults (overwritten below once a backup is
+        # actually loaded); consumed by the robust recovery-Q update.
+        self._recovery_hole_margin_factor = float(cfg.env.get("recovery_hole_margin_factor", 3.0))
+        self._recovery_speed_threshold = float(cfg.env.get("recovery_speed_threshold", 0.03))
+        self._holes = None
 
         bp_path = ac.get("backup_policy_path", None)
         bv_path = ac.get("backup_vecnorm_path", None)
@@ -837,6 +867,18 @@ class MBPOTrainer:
         self.backup_vecnorm = VecNormalize.load(bv_path, dummy)
         self.backup_vecnorm.training = False
         self.backup_vecnorm.norm_reward = False
+        # Geometric recovery-set R membership (hole-safe & low-speed) for the
+        # robust recovery-Q update — read from the backup's OWN saved env cfg
+        # when available (the recovery task it was actually trained under),
+        # else the caller's env cfg. Holes come from the SAME (backup-layout)
+        # dummy env so R matches the maze the backup was trained against.
+        self._recovery_hole_margin_factor = float(
+            ecfg.get("recovery_hole_margin_factor", cfg.env.get("recovery_hole_margin_factor", 3.0))
+        )
+        self._recovery_speed_threshold = float(
+            ecfg.get("recovery_speed_threshold", cfg.env.get("recovery_speed_threshold", 0.03))
+        )
+        self._holes = np.asarray(dummy.envs[0].unwrapped.holes, dtype=np.float32)
         print(
             f"[MBPO] Safety shield loaded ({model_cls.__name__}): {bp_path}  "
             f"threshold={self.safety_threshold}",
@@ -857,6 +899,135 @@ class MBPOTrainer:
             (raw - b.obs_rms.mean) / np.sqrt(b.obs_rms.var + b.epsilon),
             -b.clip_obs, b.clip_obs,
         ).astype(np.float32)
+
+    def _in_recovery_set(self, raw_obs: np.ndarray, raw_next_obs: np.ndarray) -> np.ndarray:
+        """Geometric recovery-set membership R (hole-safe & low-speed), (B,) bool.
+
+        The same geometric condition ``CyberRunnerEnv._check_recovery`` uses,
+        minus its episode-relative "no forward progress" guard — an anti-
+        reward-hacking term tied to a per-episode progress baseline that isn't
+        recoverable from a stored replay transition, not part of the physical
+        set R itself. Ball position sits at offset [2:4] of the newest frame;
+        ball velocity is the forward finite difference (next-obs ball pos −
+        obs ball pos) / dt, matching how CyberRunnerEnv itself derives
+        ``_ball_vel`` from consecutive positions under this fixed-dt physics."""
+        from envs.cyberrunner import FRAME_SKIP, HOLE_RADIUS, MARBLE_RADIUS, TIMESTEP
+        dt = TIMESTEP * FRAME_SKIP
+        ball = raw_obs[:, 2:4]
+        ball_next = raw_next_obs[:, 2:4]
+        speed = np.linalg.norm((ball_next - ball) / dt, axis=1)
+        hole_dist = np.linalg.norm(self._holes[None] - ball[:, None], axis=2).min(axis=1)
+        hole_safe = hole_dist > HOLE_RADIUS + self._recovery_hole_margin_factor * MARBLE_RADIUS
+        speed_ok = speed < self._recovery_speed_threshold
+        return hole_safe & speed_ok
+
+    def _robust_recovery_q_update(self) -> float:
+        """Pessimistic (robustified) recovery-Q update — Prop. robust_bound.
+
+        Re-fits ONLY the loaded backup's critic (its Q-function), never its
+        actor π_r, toward the pessimistic lower bound
+
+            Q_{R_eps,t}^{pi_r}(s,a) = E_{pi_r,mu}[ sum_h  1{s_h in R_eps}
+                                        - min(2L·(rho_t(s_h,a_h) - m)_+, 1) ]
+
+        via the standard Bellman recursion this finite-horizon sum satisfies:
+        a per-step "reward" ``r_h = 1{s_h in R_eps} - penalty(s_h,a_h)``, with
+        the trajectory absorbed (zero future value, s_dagger) once it reaches
+        R_eps — exactly mirroring how the backup's own recovery reward is
+        terminal-only (see ``CyberRunnerEnv._compute_reward``, prior_mode).
+        ``rho_t`` is approximated by the world-model ensemble's epistemic
+        disagreement (the same ‖σ_epistemic‖₂ used for rollout-uncertainty
+        truncation elsewhere). The proposition's per-step contraction schedule
+        δ_max(h) (with the bounded-noise slack ω̄) is collapsed to the single
+        constant hyperparameter ``robust_recovery_margin`` (m), applied
+        identically at every step rather than the exact recursive schedule;
+        ``robust_recovery_L`` is the Lipschitz constant L.
+
+        Uses REAL transitions (``self.real_buffer``) for (s,a,s') — the world
+        model is queried only to score rho_t. The true executed outcome is a
+        valid sample of the calibrated model class F_t and, unlike rolling H
+        steps through the (imperfect) world model, doesn't compound synthetic
+        rollout error into the critic target.
+
+        The bootstrapped target is additionally intersected with the critic's
+        own current prediction at (s,a) — a "PessimisticCostUpdate"-style clip
+        (that reference formulation works with costs, lower-is-better, and
+        takes the min of the fresh bootstrap and the current estimate; here Q
+        is a recovery PROBABILITY, higher-is-better, so the pessimistic
+        combination is the MAX instead — see the ``torch.maximum`` below).
+        """
+        ac = self._ac
+        bs = int(ac.get("robust_recovery_batch_size", 256))
+        if self.real_buffer.size() < bs:
+            return float("nan")
+
+        gamma = float(self.backup_policy.gamma)   # the backup's own (undiscounted) training gamma
+        tau = float(self.backup_policy.tau)
+        target_update_interval = int(getattr(self.backup_policy, "target_update_interval", 1))
+        L = self.robust_recovery_L
+        m = self.robust_recovery_margin
+        policy = self.backup_policy.policy
+
+        policy.critic.set_training_mode(True)
+        losses = []
+        n_steps = int(ac.get("robust_recovery_gradient_steps", 50))
+        for grad_step in range(n_steps):
+            b = self.real_buffer.sample(bs)   # RAW storage (env=None ⇒ no normalization)
+            raw_obs = b.observations.cpu().numpy()
+            raw_next = b.next_observations.cpu().numpy()
+            act = b.actions.cpu().numpy()
+
+            # rho_t(s,a): world-model ensemble epistemic disagreement, in the
+            # LEARNER's own normalized obs space (where self.dynamics is trained).
+            obs_norm = self.env.normalize_obs(raw_obs.copy())
+            _, _, _, rho = self.dynamics.sample(obs_norm, act)
+            penalty = np.minimum(2.0 * L * np.clip(rho - m, 0.0, None), 1.0)
+
+            in_r = self._in_recovery_set(raw_obs, raw_next)
+            reward = in_r.astype(np.float32) - penalty.astype(np.float32)
+            done = b.dones.cpu().numpy().reshape(-1) > 0.5
+            absorbed = in_r | done   # s_dagger reached, or a genuine env terminal (e.g. hole)
+
+            backup_obs = self._to_backup_obs(obs_norm)
+            backup_next_obs = self._to_backup_obs(self.env.normalize_obs(raw_next.copy()))
+
+            obs_t = torch.as_tensor(backup_obs, dtype=torch.float32, device=self.device)
+            next_obs_t = torch.as_tensor(backup_next_obs, dtype=torch.float32, device=self.device)
+            act_t = torch.as_tensor(act, dtype=torch.float32, device=self.device)
+            reward_t = torch.as_tensor(reward, dtype=torch.float32, device=self.device).unsqueeze(-1)
+            absorbed_t = torch.as_tensor(absorbed, dtype=torch.float32, device=self.device).unsqueeze(-1)
+
+            with torch.no_grad():
+                # Plain expectation over the FROZEN recovery policy's actions —
+                # no entropy bonus (the proposition's E_{pi_r,mu} is not a soft value).
+                next_act, _ = policy.actor.action_log_prob(next_obs_t)
+                next_qs = torch.cat(policy.critic_target(next_obs_t, next_act), dim=1)
+                next_q, _ = next_qs.min(dim=1, keepdim=True)
+                new_target_q = reward_t + (1.0 - absorbed_t) * gamma * next_q
+
+                # Intersect with the critic's OWN current (pre-update) belief at
+                # this exact (s,a) — the PessimisticCostUpdate trick, adapted:
+                # that reference works with COSTS (lower is better) and takes
+                # the min; here Q is a recovery PROBABILITY (higher is better),
+                # so the pessimistic combination is the MAX — Q(s,a) is only
+                # ever revised upward (or held), never pulled below what the
+                # critic already believes, so this fit can't ratchet the
+                # estimate down without bound across repeated re-fits.
+                old_qs = torch.cat(policy.critic(obs_t, act_t), dim=1)
+                old_target_q, _ = old_qs.min(dim=1, keepdim=True)
+                target = torch.maximum(new_target_q, old_target_q)
+
+            current_qs = policy.critic(obs_t, act_t)
+            loss = 0.5 * sum(F.mse_loss(q, target) for q in current_qs)
+
+            policy.critic.optimizer.zero_grad()
+            loss.backward()
+            policy.critic.optimizer.step()
+            if grad_step % target_update_interval == 0:
+                polyak_update(policy.critic.parameters(), policy.critic_target.parameters(), tau)
+            losses.append(float(loss.item()))
+        policy.critic.set_training_mode(False)
+        return float(np.mean(losses)) if losses else float("nan")
 
     def _recovery_values(self, backup_obs: np.ndarray, act: np.ndarray) -> np.ndarray:
         """Recoverability of ``act`` in the given (backup-normalized) states, (B,).
@@ -1159,6 +1330,7 @@ class MBPOTrainer:
         model_train_nlls: list[float] = []
         model_val_nlls: list[float] = []
         backup_triggers: list[float] = []   # per-step real-env shield trigger rate
+        robust_recovery_losses: list[float] = []   # pessimistic recovery-Q critic loss
         hole_events: list[float] = []
         goal_events: list[float] = []
         path_progress: list[float] = []
@@ -1261,6 +1433,13 @@ class MBPOTrainer:
 
             if step >= ac.warmup_steps and _crossed(ac.rollout_freq):
                 self._generate_rollouts(self._rollout_length(step))
+
+            if self.robust_recovery_update and step >= ac.warmup_steps and _crossed(
+                int(ac.get("robust_recovery_update_freq", 2000))
+            ):
+                rrl = self._robust_recovery_q_update()
+                if not np.isnan(rrl):
+                    robust_recovery_losses.append(rrl)
 
             checkpoint_freq = int(ac.get("checkpoint_freq", 0))
             if checkpoint_freq > 0 and _crossed(checkpoint_freq):
@@ -1373,6 +1552,10 @@ class MBPOTrainer:
                     if not np.isnan(self._rollout_shield_rate):
                         log["shield/rollout_trigger_rate"] = self._rollout_shield_rate
                         parts.append(f"shield_roll={self._rollout_shield_rate:.3f}")
+                if self.robust_recovery_update and robust_recovery_losses:
+                    rrl = float(np.mean(robust_recovery_losses[-50:]))
+                    log["shield/robust_recovery_critic_loss"] = rrl
+                    parts.append(f"recov_q_loss={rrl:.4f}")
                 log["train/rollout_len"] = self._rollout_length(step)
                 # Realized mean rollout length after uncertainty/terminal
                 # truncation — if this is far below rollout_len, the model is

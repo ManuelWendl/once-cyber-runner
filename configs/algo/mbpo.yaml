@@ -95,3 +95,22 @@ backup_wandb_project: cyberrunner
 backup_policy_path: null        # local fallback (.zip) if no wandb id is given
 backup_vecnorm_path: null       # local fallback (VecNormalize .pkl)
 safety_threshold: 0.3           # recoverability below this ⇒ play the recovery policy
+
+# ── Robust (pessimistic) recovery-Q update ──────────────────────────────────────
+# Prop. robust_bound: periodically re-fits ONLY the loaded SAC backup's critic
+# (never its actor π_r — the recovery policy itself is untouched) toward the
+# pessimistic lower bound
+#     Q_{R_eps,t}^{pi_r}(s,a) = E_{pi_r,mu}[ sum_h  1{s_h in R_eps}
+#                                 - min(2L·(rho_t(s_h,a_h) - m)_+, 1) ]
+# rho_t is approximated by the world-model ensemble's epistemic disagreement
+# (‖σ_epistemic‖₂, the same quantity used for rollout-uncertainty truncation
+# above). The proposition's per-step contraction schedule δ_max(h) is collapsed
+# to the single constant margin `robust_recovery_margin` (m) below, subtracted
+# from rho_t identically at every step. Requires an SAC backup (backup_wandb_id
+# above); no-op otherwise. See MBPOTrainer._robust_recovery_q_update.
+robust_recovery_update: false        # off by default
+robust_recovery_L: 1.0               # Lipschitz constant L in the 2L(rho_t - m)_+ penalty
+robust_recovery_margin: 0.0          # constant margin m subtracted from rho_t each step
+robust_recovery_update_freq: 2000    # re-fit the backup critic every N env steps
+robust_recovery_gradient_steps: 50   # critic-only gradient steps per re-fit
+robust_recovery_batch_size: 256
