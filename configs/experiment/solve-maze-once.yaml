@@ -36,9 +36,9 @@ algo:
   backup_wandb_project: cyberrunner
   backup_policy_path: null         # local fallback (.zip) if backup_wandb_id is null
   backup_vecnorm_path: null        # local fallback (VecNormalize .pkl)
-  safety_threshold: 0.87           # measured safe/permissive balance; >=0.90 stalls recovery
+  safety_threshold: 0.88           # measured safe/permissive balance; >=0.90 stalls recovery
   optimism: 0.5                    # avoid rewarding model error as if it were task progress
   # ── Robust (pessimistic) recovery-Q update (Prop. robust_bound) ────────────
   robust_recovery_update: true
-  robust_recovery_L: 10.0
+  robust_recovery_L: 1.0
   robust_recovery_margin: 0.05
