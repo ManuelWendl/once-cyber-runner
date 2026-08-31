@@ -816,7 +816,17 @@ class MBPOTrainer:
         """
         self.backup_policy = None
         self.backup_vecnorm = None
-        self.safety_threshold = float(ac.get("safety_threshold", 0.3))
+        # Annealed safety threshold: strict (high) early, while the world model
+        # has the least real data to be calibrated against, relaxing toward the
+        # permissive steady-state value as training accumulates real experience.
+        # ``safety_threshold`` alone (old configs) means a constant threshold —
+        # start == end. Updated live during learn() (see the real_ratio-style
+        # schedule there); _shield() always reads the current self.safety_threshold.
+        default_st = float(ac.get("safety_threshold", 0.3))
+        self.safety_threshold_start = float(ac.get("safety_threshold_start", default_st))
+        self.safety_threshold_end = float(ac.get("safety_threshold_end", default_st))
+        self.safety_threshold_schedule_steps = max(1, int(ac.get("safety_threshold_schedule_steps", 1)))
+        self.safety_threshold = self.safety_threshold_start
         # Geometric recovery-set R defaults (overwritten below once a backup is
         # actually loaded); consumed by the robust recovery-Q update.
         self._recovery_hole_margin_factor = float(cfg.env.get("recovery_hole_margin_factor", 3.0))
@@ -1342,6 +1352,12 @@ class MBPOTrainer:
                 + ratio_fraction * (self.real_ratio_end - self.real_ratio_start)
             )
             self.sac.replay_buffer.real_ratio = self.real_ratio
+
+            st_fraction = min(1.0, step / self.safety_threshold_schedule_steps)
+            self.safety_threshold = (
+                self.safety_threshold_start
+                + st_fraction * (self.safety_threshold_end - self.safety_threshold_start)
+            )
             # Random exploration during warmup, SAC policy afterwards
             if step < ac.warmup_steps:
                 if ac.get("warmup_policy", "random") == "waypoint_pd":
@@ -1524,6 +1540,9 @@ class MBPOTrainer:
                 log["train/real_buffer"] = self.real_buffer.size()
                 log["train/model_buffer"] = self.sac.replay_buffer.size()
                 log["train/real_ratio"] = self.real_ratio
+                if self.backup_policy is not None:
+                    log["shield/safety_threshold"] = self.safety_threshold
+                    parts.append(f"safety_th={self.safety_threshold:.3f}")
                 # Report physical outcomes separately from virtual windows.
                 # Rates use the latest 2k real transitions and are scaled per
                 # 1k, making safety/solution progress comparable across runs.
@@ -1597,6 +1616,48 @@ class MBPOTrainer:
                 print("  ".join(parts), flush=True)
                 if wandb_run is not None:
                     wandb_run.log(log, step=step)
+
+    def load_weights(self, prefix: str) -> None:
+        """Warm-start from a previously saved MBPOTrainer checkpoint (SAC actor
+        +critic(s) and the dynamics ensemble). Copies weights into the ALREADY
+        correctly-wired ``self.sac``/``self.dynamics`` (buffers, MixedReplayBuffer,
+        ``_vec_normalize_env``, safety shield — all as built by ``__init__``), so
+        no rewiring is needed. Replay buffers (real/model) are NOT persisted —
+        they start empty and refill during ``learn()`` — only the actor/critic/
+        dynamics weights resume from a competent starting point instead of
+        random init. The caller MUST construct ``self.env`` from the SAME
+        ``{prefix}_vecnormalize.pkl`` stats the checkpoint was trained under
+        (see ``train.py``'s ``resume_from`` handling) — the loaded policy
+        expects inputs on that exact normalization scale.
+        """
+        loaded = SAC.load(f"{prefix}_policy.zip", device=self.device)
+        self.sac.set_parameters(loaded.get_parameters())
+        # ``get_parameters()``/``set_parameters()`` only cover the state-dicts
+        # SB3 tracks as "params" (policy + actor/critic optimizers) — NOT the
+        # entropy-coefficient pytorch_variables, which SB3 saves/restores
+        # separately in its full save()/load() path. Missing this left
+        # log_ent_coef at its FRESH init value (ent_coef≈1.0) instead of the
+        # converged one (≈1e-4-1e-3), so the entropy bonus term suddenly
+        # dominated the actor loss on resume and wrecked an already-precise,
+        # low-entropy policy (see run qtn9utmd: progress collapsed 13.84→5.5).
+        if loaded.ent_coef_optimizer is not None and self.sac.ent_coef_optimizer is not None:
+            with torch.no_grad():
+                self.sac.log_ent_coef.copy_(loaded.log_ent_coef)
+            self.sac.ent_coef_optimizer.load_state_dict(loaded.ent_coef_optimizer.state_dict())
+        elif hasattr(loaded, "ent_coef_tensor"):
+            self.sac.ent_coef_tensor = loaded.ent_coef_tensor.clone().to(self.device)
+        self.dynamics.load_state_dict(torch.load(f"{prefix}_dynamics.pt", map_location=self.device))
+        with torch.no_grad():
+            ent_coef = (
+                float(self.sac.log_ent_coef.exp())
+                if self.sac.ent_coef_optimizer is not None
+                else float(self.sac.ent_coef_tensor)
+            )
+        print(
+            f"[MBPO] Resumed weights from {prefix}_policy.zip / {prefix}_dynamics.pt "
+            f"(ent_coef={ent_coef:.5f})",
+            flush=True,
+        )
 
     def save(self, name: str) -> None:
         self.sac.save(f"{name}_policy")

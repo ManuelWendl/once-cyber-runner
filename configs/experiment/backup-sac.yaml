@@ -14,8 +14,8 @@ env:
   randomize_init_pos: true
   prior_mode: true
   recovery_speed_threshold: 0.05
-  recovery_hole_margin_factor: 1.5
-  recovery_progress_tolerance: 1e9  # allow same-or-behind path progress vs.
+  recovery_hole_margin_factor: 1.0
+  recovery_progress_tolerance: 0.1  # allow same-or-behind path progress vs.
                                       # the spawn point (small jitter margin);
                                       # never counts as recovered if ahead
   prior_init_max_speed: 0.3

@@ -185,12 +185,22 @@ def main(cfg: DictConfig):
             dir=wandb_dir,
         )
 
-    env = VecNormalize(
-        make_vec_env(make_env(cfg), n_envs=cfg.algo.n_envs, seed=cfg.seed),
-        norm_obs=True,
-        norm_reward=not cfg.env.get("prior_mode", False),
-        gamma=cfg.algo.gamma,
-    )
+    resume_from = cfg.get("resume_from", None)
+    venv = make_vec_env(make_env(cfg), n_envs=cfg.algo.n_envs, seed=cfg.seed)
+    if resume_from:
+        # Reuse the EXACT normalization stats the checkpoint was trained under —
+        # the warm-started policy/dynamics expect inputs on that scale, not a
+        # freshly-reset running mean/var.
+        env = VecNormalize.load(f"{resume_from}_vecnormalize.pkl", venv)
+        env.training = True
+        env.norm_reward = not cfg.env.get("prior_mode", False)
+    else:
+        env = VecNormalize(
+            venv,
+            norm_obs=True,
+            norm_reward=not cfg.env.get("prior_mode", False),
+            gamma=cfg.algo.gamma,
+        )
 
     algo = cfg.algo.name.lower()
     if algo == "ppo":
@@ -223,6 +233,8 @@ def main(cfg: DictConfig):
     elif algo == "mbpo":
         from mbpo import MBPOTrainer
         trainer = MBPOTrainer(env, cfg, device=cfg.device, seed=cfg.seed)
+        if resume_from:
+            trainer.load_weights(resume_from)
         trainer.learn(cfg.total_timesteps, wandb_run=run)
         trainer.save("mbpo_cyberrunner")
         env.save("mbpo_cyberrunner_vecnormalize.pkl")

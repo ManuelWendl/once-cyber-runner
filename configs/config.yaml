@@ -8,6 +8,10 @@ total_timesteps: 1_000_000
 device: cuda
 seed: 0   # global RNG seed (env, SB3 policy/sampling, world model). Vary per run
           # for sweeps: python train.py -m +experiment=... seed=0,1,2
+resume_from: null  # mbpo only: file prefix (e.g. "mbpo_cyberrunner") to warm-start
+                    # SAC actor/critic + dynamics weights AND VecNormalize stats from
+                    # ({prefix}_policy.zip, _dynamics.pt, _vecnormalize.pkl must exist).
+                    # Replay buffers are NOT resumed (refill from scratch); null = fresh init.
 
 env:
   reward_every_n_waypoints: 3
