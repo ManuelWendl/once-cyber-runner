@@ -7,7 +7,7 @@
 defaults:
   - override /algo: sac_backup
 
-total_timesteps: 1_000_000
+total_timesteps: 2_000_000
 
 env:
   episode_length: 100
@@ -18,7 +18,7 @@ env:
   recovery_progress_tolerance: 0.1  # allow same-or-behind path progress vs.
                                       # the spawn point (small jitter margin);
                                       # never counts as recovered if ahead
-  prior_init_max_speed: 0.3
+  prior_init_max_speed: 0.4
   # unused in prior_mode but required by schema:
   reward_every_n_waypoints: 3
   hole_penalty: 5.0

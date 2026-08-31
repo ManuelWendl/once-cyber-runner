@@ -37,7 +37,7 @@ algo:
   backup_policy_path: null         # local fallback (.zip) if backup_wandb_id is null
   backup_vecnorm_path: null        # local fallback (VecNormalize .pkl)
   safety_threshold: 0.75
-  optimism: 1.0
+  optimism: 0.0
   target_entropy: -2.0
   robust_recovery_update: true
   robust_recovery_L: 3.0
