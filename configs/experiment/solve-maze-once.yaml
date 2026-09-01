@@ -14,7 +14,7 @@
 defaults:
   - override /algo: mbpo
 
-total_timesteps: 500_000
+total_timesteps: 1_000_000
 
 env:
   reward_every_n_waypoints: 3
@@ -30,15 +30,27 @@ algo:
   warmup_waypoint_kp: 5.0
   warmup_waypoint_kd: 0.5
   warmup_waypoint_action_limit: 0.2
-  warmup_safety_threshold: 0.75  # matches safety_threshold — warmup is the LEAST reliable phase
+  warmup_safety_threshold: 0.6   # matches safety_threshold — warmup is the LEAST reliable phase
   # ── Safety shield / recovery policy ─────────────────────────────────────────
-  backup_wandb_id: d54f8wb4 #led23vhn #oe73q5n6        # trained recovery (backup-sac) policy on wandb
+  backup_wandb_id: s164wa1q #led23vhn #oe73q5n6        # trained recovery (backup-sac) policy on wandb
   backup_wandb_project: cyberrunner
   backup_policy_path: null         # local fallback (.zip) if backup_wandb_id is null
   backup_vecnorm_path: null        # local fallback (VecNormalize .pkl)
-  safety_threshold: 0.75
-  optimism: 0.0
+  # th=0.75/L=3/m=0.15/opt=0/tgt_ent=-2 regressed to precent=1.01 with the new
+  # margin=1.0 backup (this exact combo was also one of the weaker performers
+  # in the sweep under the old backup). th=0.7/L=2/m=0.2/opt=0.5/tgt_ent=-2
+  # (the config that reached full completion, 13.84, in the sweep) ALSO got
+  # stuck early (~1.3) with the new backup — entropy fully collapsed to -2
+  # by step 90k, well before making real progress. Since it's the exact same
+  # config that worked before, this points at the new backup's Q-value
+  # distribution having a different scale than the old one, so the SAME
+  # numeric threshold isn't the same effective strictness. Lowered back to
+  # the maximally-permissive value we know works (0.6, the very first
+  # retuned value, before any threshold bisection) to re-establish a
+  # working baseline against the new backup specifically.
+  safety_threshold: 0.6
+  optimism: 0.5
   target_entropy: -2.0
   robust_recovery_update: true
-  robust_recovery_L: 3.0
-  robust_recovery_margin: 0.15
+  robust_recovery_L: 2.0
+  robust_recovery_margin: 0.2
