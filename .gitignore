@@ -8,6 +8,7 @@ out/
 *.db
 gifs/
 artifacts/
+plotting/
 
 # Generated docs / scratch reports
 docs/dense_prior_explained.tex

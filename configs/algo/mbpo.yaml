@@ -58,7 +58,7 @@ warmup_waypoint_action_limit: 1.0
 warmup_safety_threshold: null   # optional controller-specific threshold
 rollout_batch_size: 5_000      # enough synthetic diversity for the high SAC update rate
 min_rollout_length: 1
-max_rollout_length: 3
+max_rollout_length: 1
 rollout_schedule_steps: 1_000_000  # steps over which length grows min→max
 rollout_unc_threshold: 0.5     # truncate an imagined branch once epistemic ensemble
                                # disagreement ‖σ_epistemic‖₂ exceeds this, so rollouts stay in
