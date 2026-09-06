@@ -22,3 +22,33 @@ env:
   # unused in prior_mode but required by schema:
   reward_every_n_waypoints: 3
   hole_penalty: 5.0
+  # Marble-mass domain randomization: the backup must recover under a marble
+  # heavier/lighter than the nominal 0.009 kg system-identified value, not
+  # just at it. Also supplies the "ensemble" for the pessimistic recovery-Q
+  # update below (algo.robust_recovery_*) in place of a learned dynamics
+  # ensemble.
+  randomize_marble_mass: true
+  marble_mass_low: 0.006   # ~33% lighter than nominal
+  marble_mass_high: 0.012  # ~33% heavier than nominal
+
+algo:
+  # Pessimistic (robustified) recovery-Q update — see robust_backup.py and the
+  # long comment in configs/algo/sac_backup.yaml. rho_t here is a single
+  # (FRAME_SKIP-step) kinematic disagreement in RAW physical units
+  # (radians + meters) across the randomized masses above — NOT comparable to
+  # solve-maze-once.yaml's NN-ensemble rho (~0.05-0.08, in normalized obs
+  # space). A quick calibration run on this exact env/mass range measured rho
+  # at median ~1.2e-5, p90 ~2.0e-5, p99.9 ~2.9e-5, max ~5.5e-5; margin/L below
+  # are picked relative to THAT scale (margin a bit above the typical value,
+  # L saturating the penalty somewhat above the observed max) as a STARTING
+  # POINT, not a tuned optimum — retune against your own run's measured rho
+  # and the logged shield/robust_recovery_critic_loss, the way
+  # robust_recovery_margin/_L were tuned for the NN-ensemble version (see the
+  # "Robust recovery-Q tuning" memory).
+  robust_recovery_update: true
+  robust_recovery_ensemble_size: 5
+  robust_recovery_margin: 1.5e-5
+  robust_recovery_L: 8000.0
+  robust_recovery_update_freq: 2000
+  robust_recovery_gradient_steps: 50
+  robust_recovery_batch_size: 256

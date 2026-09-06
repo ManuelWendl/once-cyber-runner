@@ -14,7 +14,7 @@
 defaults:
   - override /algo: mbpo
 
-total_timesteps: 1_000_000
+total_timesteps: 2_000_000
 
 env:
   reward_every_n_waypoints: 3
@@ -48,9 +48,9 @@ algo:
   # the maximally-permissive value we know works (0.6, the very first
   # retuned value, before any threshold bisection) to re-establish a
   # working baseline against the new backup specifically.
-  safety_threshold: 0.6
-  optimism: 0.5
+  safety_threshold: 0.75
+  optimism: 5
   target_entropy: -2.0
   robust_recovery_update: true
-  robust_recovery_L: 2.0
-  robust_recovery_margin: 0.2
+  robust_recovery_L: 1.0
+  robust_recovery_margin: 0.1

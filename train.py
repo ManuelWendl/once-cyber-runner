@@ -69,6 +69,9 @@ def make_env(cfg):
             prior_init_max_speed=cfg.env.get("prior_init_max_speed", 0.2),
             continuing_task=cfg.env.get("continuing_task", False),
             virtual_episode_length=cfg.env.get("virtual_episode_length", cfg.env.episode_length),
+            randomize_marble_mass=cfg.env.get("randomize_marble_mass", False),
+            marble_mass_low=cfg.env.get("marble_mass_low", 0.009),
+            marble_mass_high=cfg.env.get("marble_mass_high", 0.009),
         )
     return _init
 
@@ -113,6 +116,9 @@ def eval_and_log_video(
                 dense_main_progress_scale=ec.get("dense_main_progress_scale", 100.0),
                 continuing_task=ec.get("continuing_task", False),
                 virtual_episode_length=ec.get("virtual_episode_length", ec["episode_length"]),
+                randomize_marble_mass=ec.get("randomize_marble_mass", False),
+                marble_mass_low=ec.get("marble_mass_low", 0.009),
+                marble_mass_high=ec.get("marble_mass_high", 0.009),
             )]),
         )
         eval_env.training = False
@@ -266,6 +272,42 @@ def main(cfg: DictConfig):
 
     log_interval = wb_cfg.get("log_interval", 10_000)
     callbacks = [WandbCallback(log_interval=log_interval)] if run is not None else []
+
+    # Pessimistic (robustified) recovery-Q update for a directly-trained SAC
+    # backup — the domain-randomization counterpart of mbpo.py's
+    # MBPOTrainer._robust_recovery_q_update (see robust_backup.py for the
+    # full write-up). Independent of wandb logging, so it runs whenever
+    # configured regardless of `run`.
+    if algo == "sac" and cfg.algo.get("robust_recovery_update", False):
+        if not cfg.env.get("randomize_marble_mass", False):
+            print(
+                "[train] algo.robust_recovery_update requested but env.randomize_marble_mass "
+                "is False — the domain-randomization ensemble would be degenerate (a single "
+                "mass), disabling.",
+                flush=True,
+            )
+        elif not cfg.env.get("prior_mode", False):
+            print(
+                "[train] algo.robust_recovery_update requested but env.prior_mode is False "
+                "(not training a recovery/backup policy) — disabling.",
+                flush=True,
+            )
+        else:
+            from robust_backup import RobustBackupQCallback
+            callbacks.append(RobustBackupQCallback(
+                env_layout=cfg.env.get("layout", "hard"),
+                marble_mass_low=cfg.env.get("marble_mass_low", 0.009),
+                marble_mass_high=cfg.env.get("marble_mass_high", 0.009),
+                ensemble_size=cfg.algo.get("robust_recovery_ensemble_size", 5),
+                L=cfg.algo.get("robust_recovery_L", 1.0),
+                margin=cfg.algo.get("robust_recovery_margin", 0.0),
+                update_freq=cfg.algo.get("robust_recovery_update_freq", 2000),
+                gradient_steps=cfg.algo.get("robust_recovery_gradient_steps", 50),
+                batch_size=cfg.algo.get("robust_recovery_batch_size", 256),
+                buffer_size=cfg.algo.get("robust_recovery_buffer_size", 50_000),
+            ))
+            print("[train] Pessimistic recovery-Q update ENABLED (domain-randomization rho_t).", flush=True)
+
     model.learn(total_timesteps=cfg.total_timesteps, progress_bar=True, callback=callbacks)
 
     suffix = "prior" if cfg.env.get("prior_mode", False) else "cyberrunner"

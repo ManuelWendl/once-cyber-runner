@@ -34,6 +34,10 @@ MARBLE_MASS = 0.009
 MARBLE_RADIUS = 0.0063
 MARBLE_FRICTION = (0.250129382, 0.07549734, 0.00275288)  # slide, spin, roll
 MARBLE_SOLREF = (0.02, 1.25)  # timeconst, dampingratio
+MARBLE_INERTIA_COEFF = 2.0 / 5.0  # solid-sphere moment of inertia: I = (2/5) m r^2 —
+                                   # shared by the initial build and by online mass
+                                   # domain randomization (CyberRunnerEnv._set_marble_mass)
+                                   # so a randomized mass always gets consistent inertia.
 
 # Geometry
 BOARD_WIDTH = 0.276
@@ -1050,7 +1054,7 @@ def _add_marble(world, start_pos: np.ndarray):
     # Inertial properties
     marble.ipos = [0, 0, 0]
     marble.mass = MARBLE_MASS
-    inertia_val = 2.0 / 5.0 * MARBLE_MASS * MARBLE_RADIUS**2
+    inertia_val = MARBLE_INERTIA_COEFF * MARBLE_MASS * MARBLE_RADIUS**2
     marble.inertia = [inertia_val, inertia_val, inertia_val]
 
     # Free joint
@@ -1117,6 +1121,20 @@ class CyberRunnerEnv(gym.Env):
           may never claim recovery by coasting further toward the goal — that
           would let the shield "launder" forward progress through an
           unrelated recovery reward.
+
+    Marble-mass domain randomization (``randomize_marble_mass=True``):
+        Each ``reset()`` resamples the marble's mass uniformly from
+        ``[marble_mass_low, marble_mass_high]`` (kg) and applies it to the live
+        MuJoCo model via ``_set_marble_mass`` (mass + matching solid-sphere
+        inertia, then ``mj_setConst`` to refresh MuJoCo's derived constants) —
+        no model recompilation needed. The sampled mass is exposed as
+        ``info["marble_mass"]``. ``get_sim_state``/``set_sim_state`` snapshot
+        and restore the full simulator state (qpos/qvel/act/ctrl); together
+        with ``_set_marble_mass`` they let external code replay the SAME
+        (state, action) under several masses to measure how much the mass
+        uncertainty makes next states disagree — used by
+        ``robust_backup.RobustBackupQCallback`` as a physical-simulator
+        stand-in for a learned dynamics ensemble's epistemic disagreement.
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
@@ -1139,6 +1157,9 @@ class CyberRunnerEnv(gym.Env):
         obs_n_stack: int = 1,
         continuing_task: bool = False,
         virtual_episode_length: int | None = None,
+        randomize_marble_mass: bool = False,
+        marble_mass_low: float = MARBLE_MASS,
+        marble_mass_high: float = MARBLE_MASS,
     ):
         super().__init__()
 
@@ -1171,6 +1192,15 @@ class CyberRunnerEnv(gym.Env):
         # jitter so a stationary ball isn't spuriously denied recovery.
         self.recovery_progress_tolerance = float(recovery_progress_tolerance)
         self.prior_init_max_speed = float(prior_init_max_speed)
+
+        # Marble-mass domain randomization: resampled uniformly on every
+        # reset() from [marble_mass_low, marble_mass_high] (kg). Both default
+        # to the nominal MARBLE_MASS, so randomization is off unless the range
+        # is widened AND randomize_marble_mass is set.
+        self.randomize_marble_mass = bool(randomize_marble_mass)
+        self.marble_mass_low = float(marble_mass_low)
+        self.marble_mass_high = float(marble_mass_high)
+        self._marble_mass = MARBLE_MASS  # updated in reset() when randomized
 
         # Load maze layout
         if layout not in _LAYOUT_LOADERS:
@@ -1239,6 +1269,42 @@ class CyberRunnerEnv(gym.Env):
 
     # ── helpers ────────────────────────────────────────────────────────────
 
+    def _set_marble_mass(self, mass: float) -> None:
+        """Set the marble's mass and its matching solid-sphere inertia on the
+        LIVE model, then refresh MuJoCo's derived constants (``body_invweight0``
+        etc., normally computed once by ``mj_compile``) via ``mj_setConst`` so
+        the new inertial properties are honored by contacts/dynamics
+        immediately — no recompilation needed. This is what makes per-episode
+        (or per-query) mass domain randomization cheap."""
+        self.model.body_mass[self.marble_body_id] = mass
+        inertia_val = MARBLE_INERTIA_COEFF * mass * MARBLE_RADIUS**2
+        self.model.body_inertia[self.marble_body_id] = [inertia_val, inertia_val, inertia_val]
+        mujoco.mj_setConst(self.model, self.data)
+        self._marble_mass = float(mass)
+
+    def get_sim_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Snapshot the full simulator state (qpos, qvel, act, ctrl) — enough
+        to exactly restore or replay physics elsewhere via ``set_sim_state``.
+        Used to replay the same (state, action) under several domain-
+        randomized marble masses (see ``robust_backup.py``)."""
+        return (
+            self.data.qpos.copy(),
+            self.data.qvel.copy(),
+            self.data.act.copy(),
+            self.data.ctrl.copy(),
+        )
+
+    def set_sim_state(self, state: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]) -> None:
+        """Restore a snapshot returned by ``get_sim_state`` and refresh derived
+        (mj_forward) quantities. Does NOT touch the marble mass — combine with
+        ``_set_marble_mass`` to replay the same state under a different mass."""
+        qpos, qvel, act, ctrl = state
+        self.data.qpos[:] = qpos
+        self.data.qvel[:] = qvel
+        self.data.act[:] = act
+        self.data.ctrl[:] = ctrl
+        mujoco.mj_forward(self.model, self.data)
+
     def _compute_min_hole_distance(self, ball_pos: np.ndarray) -> float:
         return float(np.linalg.norm(self.holes - ball_pos, axis=1).min())
 
@@ -1286,6 +1352,13 @@ class CyberRunnerEnv(gym.Env):
 
         # Reset MuJoCo
         mujoco.mj_resetData(self.model, self.data)
+
+        # Domain-randomize the marble mass for this episode (before mj_forward
+        # below so the resampled inertial properties are in effect from step 0).
+        if self.randomize_marble_mass:
+            self._set_marble_mass(
+                float(self.np_random.uniform(self.marble_mass_low, self.marble_mass_high))
+            )
 
         # Set initial marble position
         if self.prior_mode:
@@ -1367,7 +1440,7 @@ class CyberRunnerEnv(gym.Env):
             self._frames = [frame0.copy() for _ in range(self.obs_n_stack)]
 
         obs = self._stacked_obs(base_obs)
-        info = {"path_progress": self._prev_progress}
+        info = {"path_progress": self._prev_progress, "marble_mass": self._marble_mass}
 
         return obs, info
 
@@ -1435,6 +1508,7 @@ class CyberRunnerEnv(gym.Env):
             del self._frames[:-self.obs_n_stack]
         obs = self._stacked_obs(base_obs)
         info["path_progress"] = curr_progress
+        info["marble_mass"] = self._marble_mass
 
         return obs, reward, terminated, truncated, info
 

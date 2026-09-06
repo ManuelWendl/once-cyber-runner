@@ -26,6 +26,13 @@ env:
   randomize_init_pos: true
   random_init_start_probability: 0.0  # when randomized, reserve this fraction for waypoint 0
   layout: easy
+  # Marble-mass domain randomization: resampled uniformly on every reset from
+  # [marble_mass_low, marble_mass_high] (kg). Both default to the nominal
+  # MARBLE_MASS (envs/cyberrunner.py), so this is a no-op until widened AND
+  # randomize_marble_mass is enabled — see configs/experiment/backup-sac.yaml.
+  randomize_marble_mass: false
+  marble_mass_low: 0.009
+  marble_mass_high: 0.009
   # Prior (recovery / stabilization) branch — see CyberRunnerEnv.prior_mode.
   prior_mode: false
   recovery_speed_threshold: 0.03    # m/s — ball must be slower than this to count as recovered

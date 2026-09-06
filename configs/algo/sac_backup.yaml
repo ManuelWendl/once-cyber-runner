@@ -4,7 +4,31 @@ learning_rate: 3e-4
 buffer_size: 1_000_000
 batch_size: 256
 tau: 0.005
-gamma: 1.0         
+gamma: 1.0
 learning_starts: 10_000
 gradient_steps: 1    # UTD per env step (multiplied by n_envs internally)
 ent_coef: auto
+
+# ── Robust (pessimistic) recovery-Q update — domain-randomization variant ───
+# Mirrors mbpo.py's MBPOTrainer._robust_recovery_q_update / Prop. robust_bound
+# (see robust_backup.py), but this fits the backup's critic WHILE training it
+# directly with SAC — there is no learned world-model ensemble available yet
+# at this point, so rho_t(s,a) is instead the disagreement among the TRUE
+# simulator's next-state predictions across robust_recovery_ensemble_size
+# marble masses spanning [env.marble_mass_low, env.marble_mass_high]. Requires
+# env.randomize_marble_mass=true and env.prior_mode=true (both hold in
+# configs/experiment/backup-sac.yaml); no-op otherwise.
+# NOTE: this rho has a DIFFERENT scale than the NN-ensemble epistemic
+# disagreement mbpo.py measures (physical mm/rad units vs. a learned std), so
+# robust_recovery_margin/_L below need their OWN empirical retuning against
+# the logged shield/robust_recovery_critic_loss and measured rho — don't
+# reuse solve-maze-once.yaml's tuned values (see the "Robust recovery-Q
+# tuning" memory for how that tuning was done against the other rho).
+robust_recovery_update: false          # off by default
+robust_recovery_ensemble_size: 5       # number of randomized masses (mu spanning the DR range)
+robust_recovery_L: 1.0                 # Lipschitz constant L in the 2L(rho_t - m)_+ penalty
+robust_recovery_margin: 0.0            # constant margin m subtracted from rho_t each step
+robust_recovery_update_freq: 2000      # re-fit the critic every N env timesteps
+robust_recovery_gradient_steps: 50     # critic-only gradient steps per re-fit
+robust_recovery_batch_size: 256
+robust_recovery_buffer_size: 50_000    # ring buffer of recent (s,a,s',sim_state) used to sample re-fit batches
