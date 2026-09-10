@@ -777,11 +777,16 @@ class MBPOTrainer:
         self._load_backup(ac, cfg, device)
 
         # ── Robust (pessimistic) recovery-Q update ─────────────────────────────
-        # Prop. robust_bound: periodically re-fits ONLY the loaded SAC backup's
-        # critic (never its actor π_r) toward the pessimistic lower bound
-        # Q_{R_eps,t}^{pi_r}, discounting the nominal recoverability value by a
-        # penalty on how much the CURRENT world-model ensemble disagrees with
-        # itself at the queried (s,a) — see ``_robust_recovery_q_update``.
+        # Prop. robust_bound: periodically re-fits the loaded SAC backup's
+        # critic toward the pessimistic lower bound Q_{R_eps,t}^{pi_r},
+        # discounting the nominal recoverability value by a penalty on how
+        # much the CURRENT world-model ensemble disagrees with itself at the
+        # queried (s,a) — see ``_robust_recovery_q_update``. Optionally (see
+        # ``robust_recovery_policy_update`` below) ALSO fine-tunes the
+        # backup's actor π_r against that same (robustified) critic, using
+        # the identical batch/cadence — i.e. it stops being frozen and keeps
+        # improving online, the same way SAC.train() interleaves actor and
+        # critic updates.
         self.robust_recovery_update = (
             bool(ac.get("robust_recovery_update", False))
             and self.backup_policy is not None
@@ -798,6 +803,34 @@ class MBPOTrainer:
             print(
                 f"[MBPO] Robust recovery Q update ENABLED "
                 f"(L={self.robust_recovery_L}, m={self.robust_recovery_margin}).",
+                flush=True,
+            )
+
+        # Actor (policy π_r) fine-tuning piggybacks on the critic update above:
+        # only meaningful once that's on, since it needs the same re-fitted
+        # critic and reuses its batch/cadence. off by default — the backup
+        # stays frozen unless explicitly asked to keep learning.
+        self.robust_recovery_policy_update = bool(
+            ac.get("robust_recovery_policy_update", False)
+        ) and self.robust_recovery_update
+        if (
+            bool(ac.get("robust_recovery_policy_update", False))
+            and not self.robust_recovery_policy_update
+        ):
+            print(
+                "[MBPO] robust_recovery_policy_update requested but robust_recovery_update "
+                "is disabled (or no SAC backup is loaded) — backup actor stays frozen.",
+                flush=True,
+            )
+        elif self.robust_recovery_policy_update:
+            policy_lr = ac.get("robust_recovery_policy_lr", None)
+            if policy_lr is not None:
+                for group in self.backup_policy.policy.actor.optimizer.param_groups:
+                    group["lr"] = float(policy_lr)
+            print(
+                f"[MBPO] Robust recovery POLICY update ENABLED — fine-tuning the "
+                f"backup's actor π_r online "
+                f"(lr={'checkpoint default' if policy_lr is None else policy_lr}).",
                 flush=True,
             )
 
@@ -931,11 +964,11 @@ class MBPOTrainer:
         speed_ok = speed < self._recovery_speed_threshold
         return hole_safe & speed_ok
 
-    def _robust_recovery_q_update(self) -> float:
+    def _robust_recovery_q_update(self) -> tuple[float, float]:
         """Pessimistic (robustified) recovery-Q update — Prop. robust_bound.
 
-        Re-fits ONLY the loaded backup's critic (its Q-function), never its
-        actor π_r, toward the pessimistic lower bound
+        Re-fits the loaded backup's critic (its Q-function) toward the
+        pessimistic lower bound
 
             Q_{R_eps,t}^{pi_r}(s,a) = E_{pi_r,mu}[ sum_h  1{s_h in R_eps}
                                         - min(2L·(rho_t(s_h,a_h) - m)_+, 1) ]
@@ -965,11 +998,22 @@ class MBPOTrainer:
         takes the min of the fresh bootstrap and the current estimate; here Q
         is a recovery PROBABILITY, higher-is-better, so the pessimistic
         combination is the MAX instead — see the ``torch.maximum`` below).
+
+        If ``self.robust_recovery_policy_update`` is set, each gradient step
+        ALSO takes one standard SAC actor-improvement step for the backup's
+        π_r against this just-refit critic (plus its entropy-coefficient
+        update, if it was trained with ``ent_coef='auto'``) — see
+        ``_robust_recovery_policy_step``. This reuses the exact same
+        backup-normalized batch and cadence as the critic re-fit, so the
+        backup stops being a frozen shield and keeps improving online,
+        mirroring how ``SAC.train()`` interleaves critic and actor updates.
+        Returns ``(critic_loss, actor_loss)``; ``actor_loss`` is ``nan`` when
+        policy fine-tuning is disabled.
         """
         ac = self._ac
         bs = int(ac.get("robust_recovery_batch_size", 256))
         if self.real_buffer.size() < bs:
-            return float("nan")
+            return float("nan"), float("nan")
 
         gamma = float(self.backup_policy.gamma)   # the backup's own (undiscounted) training gamma
         tau = float(self.backup_policy.tau)
@@ -977,9 +1021,13 @@ class MBPOTrainer:
         L = self.robust_recovery_L
         m = self.robust_recovery_margin
         policy = self.backup_policy.policy
+        update_policy = self.robust_recovery_policy_update
 
         policy.critic.set_training_mode(True)
+        if update_policy:
+            policy.actor.set_training_mode(True)
         losses = []
+        actor_losses = []
         n_steps = int(ac.get("robust_recovery_gradient_steps", 50))
         for grad_step in range(n_steps):
             b = self.real_buffer.sample(bs)   # RAW storage (env=None ⇒ no normalization)
@@ -1008,7 +1056,8 @@ class MBPOTrainer:
             absorbed_t = torch.as_tensor(absorbed, dtype=torch.float32, device=self.device).unsqueeze(-1)
 
             with torch.no_grad():
-                # Plain expectation over the FROZEN recovery policy's actions —
+                # Plain expectation over the recovery policy's actions (current
+                # π_r — frozen unless robust_recovery_policy_update is on) —
                 # no entropy bonus (the proposition's E_{pi_r,mu} is not a soft value).
                 next_act, _ = policy.actor.action_log_prob(next_obs_t)
                 next_qs = torch.cat(policy.critic_target(next_obs_t, next_act), dim=1)
@@ -1036,8 +1085,53 @@ class MBPOTrainer:
             if grad_step % target_update_interval == 0:
                 polyak_update(policy.critic.parameters(), policy.critic_target.parameters(), tau)
             losses.append(float(loss.item()))
+
+            # Policy improvement step, against the critic just updated above —
+            # same ordering SAC.train() uses (critic first, then actor sees the
+            # fresh Q). Reuses this grad_step's own batch; no extra sampling.
+            if update_policy:
+                actor_losses.append(self._robust_recovery_policy_step(obs_t))
         policy.critic.set_training_mode(False)
-        return float(np.mean(losses)) if losses else float("nan")
+        if update_policy:
+            policy.actor.set_training_mode(False)
+        critic_loss = float(np.mean(losses)) if losses else float("nan")
+        actor_loss = float(np.mean(actor_losses)) if actor_losses else float("nan")
+        return critic_loss, actor_loss
+
+    def _robust_recovery_policy_step(self, obs_t: torch.Tensor) -> float:
+        """One SAC policy-improvement step for the backup's actor π_r against
+        its own (just-refit) critic — mirrors ``SAC.train()``'s actor update
+        exactly (including its ``ent_coef='auto'`` entropy-coefficient step),
+        reusing the batch already sampled for this grad step's critic re-fit.
+
+        Unlike the critic target above, this has no pessimistic/robust
+        adjustment of its own: π_r simply climbs whatever Q the critic (now
+        robustified) currently reports, which is the standard SAC policy-
+        improvement guarantee applied to that (already pessimistic) Q.
+        """
+        backup = self.backup_policy
+        policy = backup.policy
+
+        actions_pi, log_prob = policy.actor.action_log_prob(obs_t)
+        log_prob = log_prob.reshape(-1, 1)
+
+        if backup.ent_coef_optimizer is not None and backup.log_ent_coef is not None:
+            ent_coef = torch.exp(backup.log_ent_coef.detach())
+            ent_coef_loss = -(backup.log_ent_coef * (log_prob + backup.target_entropy).detach()).mean()
+            backup.ent_coef_optimizer.zero_grad()
+            ent_coef_loss.backward()
+            backup.ent_coef_optimizer.step()
+        else:
+            ent_coef = backup.ent_coef_tensor
+
+        q_values_pi = torch.cat(policy.critic(obs_t, actions_pi), dim=1)
+        min_qf_pi, _ = torch.min(q_values_pi, dim=1, keepdim=True)
+        actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
+
+        policy.actor.optimizer.zero_grad()
+        actor_loss.backward()
+        policy.actor.optimizer.step()
+        return float(actor_loss.item())
 
     def _recovery_values(self, backup_obs: np.ndarray, act: np.ndarray) -> np.ndarray:
         """Recoverability of ``act`` in the given (backup-normalized) states, (B,).
@@ -1341,6 +1435,7 @@ class MBPOTrainer:
         model_val_nlls: list[float] = []
         backup_triggers: list[float] = []   # per-step real-env shield trigger rate
         robust_recovery_losses: list[float] = []   # pessimistic recovery-Q critic loss
+        robust_recovery_actor_losses: list[float] = []   # backup π_r fine-tune actor loss
         hole_events: list[float] = []
         goal_events: list[float] = []
         path_progress: list[float] = []
@@ -1453,9 +1548,11 @@ class MBPOTrainer:
             if self.robust_recovery_update and step >= ac.warmup_steps and _crossed(
                 int(ac.get("robust_recovery_update_freq", 2000))
             ):
-                rrl = self._robust_recovery_q_update()
+                rrl, ral = self._robust_recovery_q_update()
                 if not np.isnan(rrl):
                     robust_recovery_losses.append(rrl)
+                if not np.isnan(ral):
+                    robust_recovery_actor_losses.append(ral)
 
             checkpoint_freq = int(ac.get("checkpoint_freq", 0))
             if checkpoint_freq > 0 and _crossed(checkpoint_freq):
@@ -1575,6 +1672,10 @@ class MBPOTrainer:
                     rrl = float(np.mean(robust_recovery_losses[-50:]))
                     log["shield/robust_recovery_critic_loss"] = rrl
                     parts.append(f"recov_q_loss={rrl:.4f}")
+                if self.robust_recovery_policy_update and robust_recovery_actor_losses:
+                    ral = float(np.mean(robust_recovery_actor_losses[-50:]))
+                    log["shield/robust_recovery_actor_loss"] = ral
+                    parts.append(f"recov_pi_loss={ral:.4f}")
                 log["train/rollout_len"] = self._rollout_length(step)
                 # Realized mean rollout length after uncertainty/terminal
                 # truncation — if this is far below rollout_len, the model is
@@ -1662,4 +1763,15 @@ class MBPOTrainer:
     def save(self, name: str) -> None:
         self.sac.save(f"{name}_policy")
         torch.save(self.dynamics.state_dict(), f"{name}_dynamics.pt")
-        print(f"Saved: {name}_policy.zip  {name}_dynamics.pt")
+        saved = [f"{name}_policy.zip", f"{name}_dynamics.pt"]
+        # The backup's critic (robust_recovery_update) and, optionally, its
+        # actor (robust_recovery_policy_update) keep changing online via
+        # _robust_recovery_q_update — without this they'd be lost the moment
+        # the run ends, silently discarding the fine-tuning.
+        if self.backup_policy is not None and (
+            self.robust_recovery_update or self.robust_recovery_policy_update
+        ):
+            self.backup_policy.save(f"{name}_backup")
+            self.backup_vecnorm.save(f"{name}_backup_vecnormalize.pkl")
+            saved += [f"{name}_backup.zip", f"{name}_backup_vecnormalize.pkl"]
+        print(f"Saved: {'  '.join(saved)}")

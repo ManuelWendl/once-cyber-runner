@@ -32,7 +32,7 @@ algo:
   warmup_waypoint_action_limit: 0.2
   warmup_safety_threshold: 0.6   # matches safety_threshold — warmup is the LEAST reliable phase
   # ── Safety shield / recovery policy ─────────────────────────────────────────
-  backup_wandb_id: s164wa1q #led23vhn #oe73q5n6        # trained recovery (backup-sac) policy on wandb
+  backup_wandb_id: s164wa1q #led23vhn #oe73q5n6        # trained recovery (backup-sac) policy on wandb, p3d3af7d,tv5u146e,frzdolkz,kwvfnc69,xi9mts9d
   backup_wandb_project: cyberrunner
   backup_policy_path: null         # local fallback (.zip) if backup_wandb_id is null
   backup_vecnorm_path: null        # local fallback (VecNormalize .pkl)
@@ -54,3 +54,10 @@ algo:
   robust_recovery_update: true
   robust_recovery_L: 1.0
   robust_recovery_margin: 0.1
+  # Also fine-tune the backup's actor π_r online (it was frozen before —
+  # only its critic was re-fit above). Uses the checkpoint's own actor LR
+  # (robust_recovery_policy_lr: null); lower it here if fine-tuning proves
+  # unstable. Untuned — watch shield/robust_recovery_actor_loss and
+  # shield/real_trigger_rate after enabling.
+  robust_recovery_policy_update: true
+  robust_recovery_policy_lr: null
