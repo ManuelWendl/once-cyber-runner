@@ -1072,7 +1072,17 @@ class MBPOTrainer:
                 # ever revised upward (or held), never pulled below what the
                 # critic already believes, so this fit can't ratchet the
                 # estimate down without bound across repeated re-fits.
-                old_qs = torch.cat(policy.critic(obs_t, act_t), dim=1)
+                # Uses critic_target (not the online critic) for this belief,
+                # same as next_q above and for the same reason: the online
+                # critic is mid-update (this very loop steps it every grad_step),
+                # so reading its OWN live weights back as a floor is a
+                # self-referential feedback loop — every step's "current belief"
+                # already includes the previous step's own upward revision, so
+                # it compounds within a single re-fit call, not just across
+                # them. critic_target only moves via slow polyak averaging, so
+                # it still gives the intended "don't drop below what we
+                # believe" floor without the online net chasing its own tail.
+                old_qs = torch.cat(policy.critic_target(obs_t, act_t), dim=1)
                 old_target_q, _ = old_qs.min(dim=1, keepdim=True)
                 target = torch.maximum(new_target_q, old_target_q)
 

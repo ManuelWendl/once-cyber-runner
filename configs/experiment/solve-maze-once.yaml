@@ -49,7 +49,7 @@ algo:
   # retuned value, before any threshold bisection) to re-establish a
   # working baseline against the new backup specifically.
   safety_threshold: 0.75
-  optimism: 5
+  optimism: 0.5
   target_entropy: -2.0
   robust_recovery_update: true
   robust_recovery_L: 1.0
