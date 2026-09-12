@@ -922,6 +922,10 @@ class MBPOTrainer:
             ecfg.get("recovery_speed_threshold", cfg.env.get("recovery_speed_threshold", 0.03))
         )
         self._holes = np.asarray(dummy.envs[0].unwrapped.holes, dtype=np.float32)
+        # Frame-stack width — needed by _in_recovery_set to pull a long-baseline
+        # (noise-robust) velocity estimate straight out of the stack instead of
+        # differencing two independent (each noisy) buffer entries.
+        self._recovery_obs_n_stack = obs_n_stack
         print(
             f"[MBPO] Safety shield loaded ({model_cls.__name__}): {bp_path}  "
             f"threshold={self.safety_threshold}",
@@ -944,22 +948,42 @@ class MBPOTrainer:
         ).astype(np.float32)
 
     def _in_recovery_set(self, raw_obs: np.ndarray, raw_next_obs: np.ndarray) -> np.ndarray:
-        """Geometric recovery-set membership R (hole-safe & low-speed), (B,) bool.
+        """Geometric recovery-set membership of s' = ``raw_next_obs`` (hole-safe
+        & low-speed), (B,) bool — the same geometric condition
+        ``CyberRunnerEnv._check_recovery`` uses, minus its episode-relative "no
+        forward progress" guard (an anti-reward-hacking term tied to a
+        per-episode progress baseline that isn't recoverable from a stored
+        replay transition, not part of the physical set R itself).
 
-        The same geometric condition ``CyberRunnerEnv._check_recovery`` uses,
-        minus its episode-relative "no forward progress" guard — an anti-
-        reward-hacking term tied to a per-episode progress baseline that isn't
-        recoverable from a stored replay transition, not part of the physical
-        set R itself. Ball position sits at offset [2:4] of the newest frame;
-        ball velocity is the forward finite difference (next-obs ball pos −
-        obs ball pos) / dt, matching how CyberRunnerEnv itself derives
-        ``_ball_vel`` from consecutive positions under this fixed-dt physics."""
+        Both hole-safety and speed are evaluated AT s' (the state whose
+        membership is being tested — the one the reward/absorption in
+        ``_robust_recovery_q_update`` actually attaches to), matching how
+        ``CyberRunnerEnv`` itself evaluates ``_check_recovery`` using the
+        POST-step ``_min_hole_distance``/``_ball_speed``, not the pre-step ones.
+
+        Ball position sits at offset [2:4] of the newest (stacked) frame.
+        Speed uses the frame stack's own OLDEST-vs-newest ball position
+        (an ``obs_n_stack - 1``-step baseline, all read out of s' alone) rather
+        than differencing s' against the separately-sampled s — stacking
+        exists precisely "to reveal velocity" (see ``CyberRunnerEnv``'s class
+        docstring), and a longer baseline dilutes the same ±``BALL_POS_NOISE``
+        observation noise proportionally further. A single-step (1/60s)
+        difference of two independently-noisy positions has noise on the
+        order of 0.03-0.05 m/s — comparable to the entire
+        ``recovery_speed_threshold`` — which made speed_ok, and hence in_r,
+        an unreliable signal. Falls back to the old single-step, cross-buffer
+        difference when ``obs_n_stack <= 1`` (no stack to read a baseline from)."""
         from envs.cyberrunner import FRAME_SKIP, HOLE_RADIUS, MARBLE_RADIUS, TIMESTEP
-        dt = TIMESTEP * FRAME_SKIP
-        ball = raw_obs[:, 2:4]
+        n = self._recovery_obs_n_stack
         ball_next = raw_next_obs[:, 2:4]
-        speed = np.linalg.norm((ball_next - ball) / dt, axis=1)
-        hole_dist = np.linalg.norm(self._holes[None] - ball[:, None], axis=2).min(axis=1)
+        if n > 1:
+            oldest = raw_next_obs[:, (n - 1) * 6 + 2:(n - 1) * 6 + 4]
+            dt = TIMESTEP * FRAME_SKIP * (n - 1)
+            speed = np.linalg.norm((ball_next - oldest) / dt, axis=1)
+        else:
+            dt = TIMESTEP * FRAME_SKIP
+            speed = np.linalg.norm((ball_next - raw_obs[:, 2:4]) / dt, axis=1)
+        hole_dist = np.linalg.norm(self._holes[None] - ball_next[:, None], axis=2).min(axis=1)
         hole_safe = hole_dist > HOLE_RADIUS + self._recovery_hole_margin_factor * MARBLE_RADIUS
         speed_ok = speed < self._recovery_speed_threshold
         return hole_safe & speed_ok
@@ -1000,13 +1024,11 @@ class MBPOTrainer:
         combination is the MAX instead — see the ``torch.maximum`` below).
 
         If ``self.robust_recovery_policy_update`` is set, each gradient step
-        ALSO takes one standard SAC actor-improvement step for the backup's
-        π_r against this just-refit critic (plus its entropy-coefficient
-        update, if it was trained with ``ent_coef='auto'``) — see
-        ``_robust_recovery_policy_step``. This reuses the exact same
-        backup-normalized batch and cadence as the critic re-fit, so the
-        backup stops being a frozen shield and keeps improving online,
-        mirroring how ``SAC.train()`` interleaves critic and actor updates.
+        ALSO takes one deterministic (no entropy bonus — see
+        ``_robust_recovery_policy_step`` for why) policy-improvement step for
+        the backup's π_r against this just-refit critic. This reuses the
+        exact same backup-normalized batch and cadence as the critic re-fit,
+        so the backup stops being a frozen shield and keeps improving online.
         Returns ``(critic_loss, actor_loss)``; ``actor_loss`` is ``nan`` when
         policy fine-tuning is disabled.
         """
@@ -1109,34 +1131,30 @@ class MBPOTrainer:
         return critic_loss, actor_loss
 
     def _robust_recovery_policy_step(self, obs_t: torch.Tensor) -> float:
-        """One SAC policy-improvement step for the backup's actor π_r against
-        its own (just-refit) critic — mirrors ``SAC.train()``'s actor update
-        exactly (including its ``ent_coef='auto'`` entropy-coefficient step),
-        reusing the batch already sampled for this grad step's critic re-fit.
+        """One DETERMINISTIC policy-improvement step for the backup's actor
+        π_r against its own (just-refit) critic, reusing the batch already
+        sampled for this grad step's critic re-fit.
 
-        Unlike the critic target above, this has no pessimistic/robust
-        adjustment of its own: π_r simply climbs whatever Q the critic (now
-        robustified) currently reports, which is the standard SAC policy-
-        improvement guarantee applied to that (already pessimistic) Q.
+        Deliberately NOT SAC's actor step: that update maximizes
+        ``Q(s,a) - ent_coef·log π(a|s)``, a max-ENTROPY objective — correct
+        only when the critic it's climbing is itself the corresponding soft
+        (entropy-regularized) value. Here it isn't: ``_robust_recovery_q_update``
+        builds a deliberately HARD recovery-probability target with no entropy
+        term ("the proposition's E_{pi_r,mu} is not a soft value" — see its
+        own comment). Pairing that hard-value critic with a soft actor step
+        would nudge π_r to trade away actual recovery probability for
+        entropy it gets no credit for in the critic it's supposedly
+        improving against — exactly backwards for a safety backstop. So this
+        step maximizes ``min(Q1,Q2)`` alone, with no entropy bonus and no
+        online ``ent_coef`` adaptation (which that bonus is the only reason
+        to run).
         """
-        backup = self.backup_policy
-        policy = backup.policy
+        policy = self.backup_policy.policy
 
-        actions_pi, log_prob = policy.actor.action_log_prob(obs_t)
-        log_prob = log_prob.reshape(-1, 1)
-
-        if backup.ent_coef_optimizer is not None and backup.log_ent_coef is not None:
-            ent_coef = torch.exp(backup.log_ent_coef.detach())
-            ent_coef_loss = -(backup.log_ent_coef * (log_prob + backup.target_entropy).detach()).mean()
-            backup.ent_coef_optimizer.zero_grad()
-            ent_coef_loss.backward()
-            backup.ent_coef_optimizer.step()
-        else:
-            ent_coef = backup.ent_coef_tensor
-
+        actions_pi, _ = policy.actor.action_log_prob(obs_t)   # reparameterized sample; log_prob unused
         q_values_pi = torch.cat(policy.critic(obs_t, actions_pi), dim=1)
         min_qf_pi, _ = torch.min(q_values_pi, dim=1, keepdim=True)
-        actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
+        actor_loss = -min_qf_pi.mean()
 
         policy.actor.optimizer.zero_grad()
         actor_loss.backward()

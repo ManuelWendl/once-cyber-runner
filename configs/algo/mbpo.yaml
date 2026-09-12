@@ -123,10 +123,12 @@ robust_recovery_batch_size: 256
 # By default the recovery policy π_r itself stays FROZEN — only its critic is
 # re-fit above. Set robust_recovery_policy_update: true to also fine-tune π_r
 # online: each of the robust_recovery_gradient_steps above additionally takes
-# one standard SAC actor-improvement step (climbing the just-refit, pessimistic
-# critic; includes π_r's own ent_coef='auto' update, if it has one) on the same
-# batch — see MBPOTrainer._robust_recovery_policy_step. No-op unless
-# robust_recovery_update above is also true (it needs that re-fit critic).
+# one DETERMINISTIC (no entropy bonus, no ent_coef adaptation — the re-fit
+# critic is a hard recovery probability, not a soft/entropy-regularized value,
+# so a max-entropy actor step would be inconsistent with it) policy-improvement
+# step climbing the just-refit critic, on the same batch — see
+# MBPOTrainer._robust_recovery_policy_step. No-op unless robust_recovery_update
+# above is also true (it needs that re-fit critic).
 # The backup keeps whatever gets fine-tuned: MBPOTrainer.save() persists the
 # (possibly updated) backup policy + its VecNormalize alongside the learner.
 robust_recovery_policy_update: false   # off by default — π_r stays frozen
