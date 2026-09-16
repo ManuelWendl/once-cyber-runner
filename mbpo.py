@@ -1465,6 +1465,7 @@ class MBPOTrainer:
         robust_recovery_losses: list[float] = []   # pessimistic recovery-Q critic loss
         robust_recovery_actor_losses: list[float] = []   # backup π_r fine-tune actor loss
         hole_events: list[float] = []
+        holes_so_far = 0   # running count, mirrors sum(hole_events) in O(1) — logged as safety/holes_total
         goal_events: list[float] = []
         path_progress: list[float] = []
 
@@ -1545,8 +1546,11 @@ class MBPOTrainer:
                     ep_rewards.append(float(ep_info["r"]))
                     ep_lengths.append(int(ep_info["l"]))
                 reason = infos[i].get("termination_reason")
-                hole_events.append(float(reason == "hole"))
+                is_hole = reason == "hole"
+                hole_events.append(float(is_hole))
                 goal_events.append(float(reason == "goal"))
+                if is_hole:
+                    holes_so_far += 1
                 progress = float(infos[i].get("path_progress", -1.0))
                 if progress >= 0.0:
                     path_progress.append(progress)
@@ -1675,7 +1679,7 @@ class MBPOTrainer:
                 if event_window:
                     hole_rate = 1_000.0 * float(np.mean(hole_events[-event_window:]))
                     goal_rate = 1_000.0 * float(np.mean(goal_events[-event_window:]))
-                    log["safety/holes_total"] = int(np.sum(hole_events))
+                    log["safety/holes_total"] = holes_so_far
                     log["safety/holes_per_1k"] = hole_rate
                     log["train/goals_total"] = int(np.sum(goal_events))
                     log["train/goals_per_1k"] = goal_rate

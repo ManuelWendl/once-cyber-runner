@@ -1154,6 +1154,8 @@ class CyberRunnerEnv(gym.Env):
         recovery_hole_margin_factor: float = 3.0,
         recovery_progress_tolerance: float = 0.05,
         prior_init_max_speed: float = 0.2,
+        prior_spawn_region: tuple[float, float, float, float] | None = None,
+        prior_min_speed_frac: float = 0.0,
         obs_n_stack: int = 1,
         continuing_task: bool = False,
         virtual_episode_length: int | None = None,
@@ -1192,6 +1194,22 @@ class CyberRunnerEnv(gym.Env):
         # jitter so a stationary ball isn't spuriously denied recovery.
         self.recovery_progress_tolerance = float(recovery_progress_tolerance)
         self.prior_init_max_speed = float(prior_init_max_speed)
+        # Optional (x_min, x_max, y_min, y_max) box concentrating prior_mode
+        # spawns in a specific board region — e.g. to give a recovery policy
+        # denser practice at a hole cluster that uniform-random spawning under-
+        # represents relative to how often a path-following policy actually
+        # encounters it. None (default) preserves the original whole-board
+        # uniform sampling everywhere this env is already used.
+        self.prior_spawn_region = (
+            tuple(float(v) for v in prior_spawn_region) if prior_spawn_region else None
+        )
+        # Fraction of prior_init_max_speed used as the LOWER bound when
+        # sampling the recovery kick's speed (still uniform up to
+        # prior_init_max_speed) — 0.0 (default) preserves the original
+        # uniform-from-zero sampling; raise it to bias training toward the
+        # faster kicks a path-following policy is more likely to actually need
+        # recovering from.
+        self.prior_min_speed_frac = float(np.clip(prior_min_speed_frac, 0.0, 1.0))
 
         # Marble-mass domain randomization: resampled uniformly on every
         # reset() from [marble_mass_low, marble_mass_high] (kg). Both default
@@ -1333,11 +1351,19 @@ class CyberRunnerEnv(gym.Env):
         return hole_safe and speed_ok and progress_ok
 
     def _sample_safe_position(self) -> np.ndarray:
-        """Uniformly sample a board position that is hole-safe for spawning."""
+        """Uniformly sample a board position that is hole-safe for spawning —
+        over the whole board, or within ``self.prior_spawn_region`` if set
+        (clamped to the board bounds)."""
         margin = MARBLE_RADIUS + HOLE_RADIUS
+        x_lo, x_hi = MARBLE_RADIUS, BOARD_WIDTH - MARBLE_RADIUS
+        y_lo, y_hi = MARBLE_RADIUS, BOARD_HEIGHT - MARBLE_RADIUS
+        if self.prior_spawn_region is not None:
+            rx_lo, rx_hi, ry_lo, ry_hi = self.prior_spawn_region
+            x_lo, x_hi = max(x_lo, rx_lo), min(x_hi, rx_hi)
+            y_lo, y_hi = max(y_lo, ry_lo), min(y_hi, ry_hi)
         for _ in range(1000):
-            x = self.np_random.uniform(MARBLE_RADIUS, BOARD_WIDTH - MARBLE_RADIUS)
-            y = self.np_random.uniform(MARBLE_RADIUS, BOARD_HEIGHT - MARBLE_RADIUS)
+            x = self.np_random.uniform(x_lo, x_hi)
+            y = self.np_random.uniform(y_lo, y_hi)
             candidate = np.array([x, y], dtype=np.float32)
             if np.linalg.norm(self.holes - candidate, axis=1).min() > margin:
                 return candidate
@@ -1392,7 +1418,10 @@ class CyberRunnerEnv(gym.Env):
             self._min_hole_distance = self._compute_min_hole_distance(init_pos)
             for _ in range(200):
                 theta = self.np_random.uniform(0.0, 2 * np.pi)
-                speed = self.np_random.uniform(0.0, self.prior_init_max_speed)
+                speed = self.np_random.uniform(
+                    self.prior_min_speed_frac * self.prior_init_max_speed,
+                    self.prior_init_max_speed,
+                )
                 self.data.qvel[2] = speed * np.cos(theta)
                 self.data.qvel[3] = speed * np.sin(theta)
                 already_recovered = (

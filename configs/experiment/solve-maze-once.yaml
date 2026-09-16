@@ -22,42 +22,66 @@ env:
   episode_length: 2000
   continuing_task: true
   virtual_episode_length: 2000
-  randomize_init_pos: false
-  random_init_start_probability: 1
+  # On any terminal reset (fall OR goal — DummyVecEnv auto-resets on
+  # `terminated`), spawn at waypoint 0 only half the time; the other half at a
+  # uniformly random non-terminal waypoint. Directly targets the failure mode
+  # documented in hole-budget-safety-threshold: every prior run, once knocked
+  # back to waypoint 0 near the 8.7-8.9 wall, either never re-attempted it
+  # (shield idle, actor stuck) or paid a full re-climb in falls to get back.
+  # A 50/50 split keeps waypoint-0 starts (still the majority of the curriculum,
+  # and required for a true full-maze rollout to ever get logged/measured) while
+  # giving the policy regular practice starting already near/past the hard
+  # passage, so a fall there costs a short re-approach instead of a full restart.
+  randomize_init_pos: true
+  random_init_start_probability: 0.5
 
 algo:
   warmup_policy: waypoint_pd
   warmup_waypoint_kp: 5.0
   warmup_waypoint_kd: 0.5
   warmup_waypoint_action_limit: 0.2
-  warmup_safety_threshold: 0.6   # matches safety_threshold — warmup is the LEAST reliable phase
+  warmup_safety_threshold: 1.0   # matches safety_threshold — warmup is the LEAST reliable phase
   # ── Safety shield / recovery policy ─────────────────────────────────────────
-  backup_wandb_id: s164wa1q #led23vhn #oe73q5n6        # trained recovery (backup-sac) policy on wandb, p3d3af7d,tv5u146e,frzdolkz,kwvfnc69,xi9mts9d
+  # backup_wandb_id must be an SAC backup with the SAME obs_n_stack/layout as
+  # this experiment's env (see shielded-mbpo-obs-invariant). p5dobopp is
+  # p3d3af7d fine-tuned for 500k extra steps with training concentrated on the
+  # hole cluster around path_progress 7.5-9.8 (the one spot every earlier
+  # backup/config combo got stuck at) — see configs/experiment/backup-sac.yaml
+  # for how to reproduce that fine-tune against a different base backup.
+  backup_wandb_id: p5dobopp   # other trained backups: p3d3af7d, tv5u146e, frzdolkz, kwvfnc69, xi9mts9d
   backup_wandb_project: cyberrunner
   backup_policy_path: null         # local fallback (.zip) if backup_wandb_id is null
   backup_vecnorm_path: null        # local fallback (VecNormalize .pkl)
-  # th=0.75/L=3/m=0.15/opt=0/tgt_ent=-2 regressed to precent=1.01 with the new
-  # margin=1.0 backup (this exact combo was also one of the weaker performers
-  # in the sweep under the old backup). th=0.7/L=2/m=0.2/opt=0.5/tgt_ent=-2
-  # (the config that reached full completion, 13.84, in the sweep) ALSO got
-  # stuck early (~1.3) with the new backup — entropy fully collapsed to -2
-  # by step 90k, well before making real progress. Since it's the exact same
-  # config that worked before, this points at the new backup's Q-value
-  # distribution having a different scale than the old one, so the SAME
-  # numeric threshold isn't the same effective strictness. Lowered back to
-  # the maximally-permissive value we know works (0.6, the very first
-  # retuned value, before any threshold bisection) to re-establish a
-  # working baseline against the new backup specifically.
-  safety_threshold: 0.75
-  optimism: 0.5
+  # Constant threshold, no schedule, no falls-so-far-dependent ramp (removed
+  # the earlier hole_budget mechanism — see hole-budget-safety-threshold
+  # memory for why: it papered over risk with an adaptive number instead of
+  # a real pessimism fix, and still burst under the n_envs=64 burst
+  # mechanism). 1.0 is the strictest possible plain reading of Q as a
+  # recovery probability — only act unshielded when the backup is certain.
+  safety_threshold: 1.0
+  # optimism=0 (not the algo default 0.5): it rewards synthetic rollouts for
+  # visiting high-uncertainty (i.e. riskier) states, which is directly
+  # counterproductive once real falls are budgeted below.
+  optimism: 0.0
   target_entropy: -2.0
   robust_recovery_update: true
-  robust_recovery_L: 1.0
-  robust_recovery_margin: 0.1
-  # Also fine-tune the backup's actor π_r online (it was frozen before —
-  # only its critic was re-fit above). Uses the checkpoint's own actor LR
-  # (robust_recovery_policy_lr: null); lower it here if fine-tuning proves
-  # unstable. Untuned — watch shield/robust_recovery_actor_loss and
-  # shield/real_trigger_rate after enabling.
+  # L raised 1.5→2.5 (margin left at the previously-validated 0.3) to push
+  # the pessimism harder directly in Q, instead of compensating with a
+  # threshold that climbs over the course of training — the fixed-threshold
+  # analogue of what hole_budget was papering over: Q_{R_eps} is penalized
+  # 2L·(rho_t-m)_+ per step of ensemble disagreement above margin m, so
+  # raising L saturates the penalty (→1) at lower disagreement (rho_t-m
+  # >= 1/(2L); 0.33 at L=1.5, 0.2 at L=2.5) — a smaller, standard-shaped
+  # hyperparameter change, not a new mechanism.
+  robust_recovery_L: 2.0
+  robust_recovery_margin: 0.3
+  # Also fine-tune the backup's actor π_r online (it was frozen before — only
+  # its critic was re-fit above). Deterministic step, no entropy bonus (see
+  # mbpo.py _robust_recovery_policy_step) — watch shield/real_trigger_rate.
   robust_recovery_policy_update: true
   robust_recovery_policy_lr: null
+  # More of the SAC policy's training batches come from the world model
+  # rather than real transitions (algo default anneals real_ratio 1.0→0.5;
+  # this anneals further to 0.2), so it can practice the hard passage above
+  # cheaply in imagination rather than needing as many risky real attempts.
+  real_ratio_end: 0.2

@@ -67,6 +67,8 @@ def make_env(cfg):
             recovery_hole_margin_factor=cfg.env.get("recovery_hole_margin_factor", 3.0),
             recovery_progress_tolerance=cfg.env.get("recovery_progress_tolerance", 0.05),
             prior_init_max_speed=cfg.env.get("prior_init_max_speed", 0.2),
+            prior_spawn_region=cfg.env.get("prior_spawn_region", None),
+            prior_min_speed_frac=cfg.env.get("prior_min_speed_frac", 0.0),
             continuing_task=cfg.env.get("continuing_task", False),
             virtual_episode_length=cfg.env.get("virtual_episode_length", cfg.env.episode_length),
             randomize_marble_mass=cfg.env.get("randomize_marble_mass", False),
@@ -223,19 +225,33 @@ def main(cfg: DictConfig):
             seed=cfg.seed,
         )
     elif algo == "sac":
-        model = SAC(
-            "MlpPolicy", env, verbose=1, device=cfg.device,
-            learning_rate=cfg.algo.learning_rate,
-            buffer_size=cfg.algo.buffer_size,
-            batch_size=cfg.algo.batch_size,
-            tau=cfg.algo.tau,
-            gamma=cfg.algo.gamma,
-            learning_starts=cfg.algo.learning_starts,
-            gradient_steps=cfg.algo.get("gradient_steps", 1) * cfg.algo.n_envs,
-            ent_coef=cfg.algo.ent_coef,
-            target_entropy=cfg.algo.get("target_entropy", "auto"),
-            seed=cfg.seed,
-        )
+        if resume_from:
+            # Warm-start the ACTUAL policy/critic weights, not just VecNormalize
+            # stats (which the block above already handles). Previously this
+            # branch always built a fresh SAC() even when resume_from was set —
+            # resume_from only ever affected the env's normalization, silently
+            # discarding the checkpoint's learned weights. Matches how a plain
+            # sac/prior-mode run saves itself: model.save(f"{algo}_{suffix}")
+            # → "{suffix}.zip", e.g. "sac_prior.zip" — NOT the mbpo branch's
+            # "{name}_policy.zip" convention (a different save() call entirely).
+            # Buffers are never persisted (fresh here too), so training refills
+            # them from scratch same as any other resume path in this repo.
+            model = SAC.load(f"{resume_from}.zip", env=env, device=cfg.device)
+            print(f"[train] Warm-started SAC from {resume_from}.zip", flush=True)
+        else:
+            model = SAC(
+                "MlpPolicy", env, verbose=1, device=cfg.device,
+                learning_rate=cfg.algo.learning_rate,
+                buffer_size=cfg.algo.buffer_size,
+                batch_size=cfg.algo.batch_size,
+                tau=cfg.algo.tau,
+                gamma=cfg.algo.gamma,
+                learning_starts=cfg.algo.learning_starts,
+                gradient_steps=cfg.algo.get("gradient_steps", 1) * cfg.algo.n_envs,
+                ent_coef=cfg.algo.ent_coef,
+                target_entropy=cfg.algo.get("target_entropy", "auto"),
+                seed=cfg.seed,
+            )
     elif algo == "mbpo":
         from mbpo import MBPOTrainer
         trainer = MBPOTrainer(env, cfg, device=cfg.device, seed=cfg.seed)
