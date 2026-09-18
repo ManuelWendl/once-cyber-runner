@@ -48,7 +48,7 @@ algo:
   # hole cluster around path_progress 7.5-9.8 (the one spot every earlier
   # backup/config combo got stuck at) — see configs/experiment/backup-sac.yaml
   # for how to reproduce that fine-tune against a different base backup.
-  backup_wandb_id: p5dobopp   # other trained backups: p3d3af7d, tv5u146e, frzdolkz, kwvfnc69, xi9mts9d
+  backup_wandb_id: u8rnq5nr   # other trained backups: p3d3af7d, tv5u146e, frzdolkz, kwvfnc69, xi9mts9d
   backup_wandb_project: cyberrunner
   backup_policy_path: null         # local fallback (.zip) if backup_wandb_id is null
   backup_vecnorm_path: null        # local fallback (VecNormalize .pkl)
@@ -59,22 +59,28 @@ algo:
   # mechanism). 1.0 is the strictest possible plain reading of Q as a
   # recovery probability — only act unshielded when the backup is certain.
   safety_threshold: 1.0
-  # optimism=0 (not the algo default 0.5): it rewards synthetic rollouts for
-  # visiting high-uncertainty (i.e. riskier) states, which is directly
-  # counterproductive once real falls are budgeted below.
-  optimism: 0.0
+  # optimism=0.5 (the algo default): rewards synthetic rollouts for visiting
+  # high-uncertainty states. Re-enabled per the goal-condition run comparison
+  # (rdjehlxf) which used 0.5 and reached the actual goal 6x with fewer holes
+  # than the optimism=0.0 run — the earlier "counterproductive" reasoning
+  # doesn't hold once the recovery-Q pessimism (below) is doing its job.
+  optimism: 0.5
   target_entropy: -2.0
   robust_recovery_update: true
-  # L raised 1.5→2.5 (margin left at the previously-validated 0.3) to push
-  # the pessimism harder directly in Q, instead of compensating with a
-  # threshold that climbs over the course of training — the fixed-threshold
-  # analogue of what hole_budget was papering over: Q_{R_eps} is penalized
-  # 2L·(rho_t-m)_+ per step of ensemble disagreement above margin m, so
-  # raising L saturates the penalty (→1) at lower disagreement (rho_t-m
-  # >= 1/(2L); 0.33 at L=1.5, 0.2 at L=2.5) — a smaller, standard-shaped
-  # hyperparameter change, not a new mechanism.
-  robust_recovery_L: 2.0
-  robust_recovery_margin: 0.3
+  # L brought back down 2.5→1.0 (margin left at 0.3): 2.5 pushed
+  # shield/real_trigger_rate up to ~85-89% by the end of a run, and the main
+  # SAC critic diverged under that much "action overwriting" mismatch
+  # (critic_loss into the millions, q down past -3000) — good safety numbers
+  # but a policy whose own value function wasu8rnq5nrn't converging, i.e. poor avg
+  # reward despite a fine max-progress readout. 1.0 is the algo's original
+  # default, less pessimistic than even the 2.0 that (d3dphzj1, rdjehlxf)
+  # used successfully — testing whether backing off further keeps the shield
+  # engaged less often, letting the critic actually converge, while
+  # robust_recovery_L=1.0 combined with a constant safety_threshold=1.0 still
+  # keeps the Q-based veto meaningful (not toothless — same user-set
+  # threshold, no schedule).
+  robust_recovery_L: 1.0
+  robust_recovery_margin: 0.35
   # Also fine-tune the backup's actor π_r online (it was frozen before — only
   # its critic was re-fit above). Deterministic step, no entropy bonus (see
   # mbpo.py _robust_recovery_policy_step) — watch shield/real_trigger_rate.
