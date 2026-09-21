@@ -795,20 +795,6 @@ class MBPOTrainer:
         self.robust_recovery_L = float(ac.get("robust_recovery_L", 1.0))          # Lipschitz constant L
         self.robust_recovery_margin = float(ac.get("robust_recovery_margin", 0.0))  # constant margin m
 
-        # Action-overwriting fix: whenever the shield overrides a_learned, the SAC
-        # critic's stored transition is (s, a_learned, r(a_exec), s'(a_exec)) — the
-        # label reflects a DIFFERENT action's consequence, not a_learned's. This is
-        # Bellman-inconsistent and (empirically, see hole-budget-safety-threshold
-        # memory) the likely driver of the unbounded main-critic divergence seen
-        # once shield/real_trigger_rate is moderate-to-high. Subtracting a fixed
-        # penalty from the reward on overridden transitions (POLICY-facing buffer
-        # only — the world model still gets the true, unmodified reward) makes the
-        # label an honest, consistent function of a_learned again: "proposing
-        # something the shield distrusts always costs you this much," rather than
-        # inheriting whatever the backup's unrelated outcome happened to be. Off
-        # (0.0) by default; standard shielded-RL constraint-violation penalty, not
-        # an adaptive/reactive mechanism.
-        self.robust_override_penalty = float(ac.get("robust_override_penalty", 0.0))
         if bool(ac.get("robust_recovery_update", False)) and not self.robust_recovery_update:
             print(
                 "[MBPO] robust_recovery_update requested but no SAC backup is loaded — disabled.",
@@ -1341,6 +1327,12 @@ class MBPOTrainer:
         self.dynamics.set_sampling_idx(int(np.random.randint(len(self.dynamics.elite_indices))))
 
         all_obs, all_nobs, all_act, all_rew, all_done = [], [], [], [], []
+        # Separate, override-only accumulators: (s, a_learned, 0, terminal)
+        # transitions for branches where the shield overrode a_learned — kept
+        # apart from the main arrays above so they never touch the world
+        # model and never corrupt the real (s, a_exec, ...) transition's own
+        # bootstrap. See the matching real-data-path comment in learn().
+        all_override_obs, all_override_act = [], []
         # Branches that hit an absorbing state (hole/goal) stop being rolled
         # forward — so a single rollout can't keep stamping penalties past a
         # terminal, and longer rollouts stay on the real MDP's support.
@@ -1351,11 +1343,10 @@ class MBPOTrainer:
         shield_rates: list[float] = []
         for _ in range(length):
             act, _ = self.sac.predict(obs, deterministic=False)   # a_learned
-            # Safety shield: overwrite the executed action with the recovery
-            # policy's where a_learned is judged unrecoverable. The dynamics and
-            # reward are queried with the EXECUTED action, but the stored action
-            # (below) is a_learned — action overwriting on the planning MDP:
-            #   transition = (s, a_learned, s'(s, a_exec), r(s, a_exec)).
+            # Safety shield: the dynamics/reward are queried with the EXECUTED
+            # action, and the stored action (below) is ALSO a_exec — no action
+            # overwriting, so the transition is Bellman-consistent by
+            # construction: (s, a_exec, s'(s, a_exec), r(s, a_exec)).
             act_exec, unsafe, _ = self._shield(obs, act)
             if unsafe is not None:
                 shield_rates.append(float(unsafe.mean()))
@@ -1365,12 +1356,6 @@ class MBPOTrainer:
             hist_act = self._normalize_history_action(act_exec)
             nobs, rew, done, unc = self.dynamics.sample(obs, act_exec, hist_act)
             rew = rew + self.optimism * unc   # optimism / UCB exploration bonus
-            # Same override penalty as the real-data path (robust_override_penalty
-            # above) — this rollout buffer is entirely SAC-facing, so no separate
-            # world-model view to keep unpenalized.
-            if self.robust_override_penalty and unsafe is not None and unsafe.any():
-                rew = rew.copy()
-                rew[unsafe] -= self.robust_override_penalty
             unc_means.append(float(unc.mean()))
 
             # Only keep transitions the model is confident about: an alive branch
@@ -1381,10 +1366,16 @@ class MBPOTrainer:
             m = alive & reliable
             all_obs.append(obs[m])
             all_nobs.append(nobs[m])
-            all_act.append(act[m])
+            all_act.append(act_exec[m])
             all_rew.append(rew[m])
             all_done.append(done[m])
             stored_per_branch[m] += 1
+
+            if unsafe is not None:
+                mo = m & unsafe
+                if mo.any():
+                    all_override_obs.append(obs[mo])
+                    all_override_act.append(act[mo])
 
             # Stop rolling a branch if it terminated, went off-distribution, or
             # was already dead.
@@ -1408,6 +1399,19 @@ class MBPOTrainer:
             np.concatenate(all_act), np.concatenate(all_rew),
             np.concatenate(all_done),
         )
+        if all_override_obs:
+            # a_learned was never executed in these branches — zero-reward
+            # terminal transitions, isolated from the real ones above.
+            # next_obs is irrelevant (masked by the terminal flag), so the
+            # same (unnormalized) obs is reused as a placeholder.
+            override_obs_raw = self.env.unnormalize_obs(np.concatenate(all_override_obs))
+            override_act = np.concatenate(all_override_act)
+            n_override = len(override_obs_raw)
+            self._batch_add_to_sac(
+                override_obs_raw, override_obs_raw,
+                override_act, np.zeros(n_override, dtype=np.float32),
+                np.ones(n_override, dtype=bool),
+            )
 
     def _batch_add_to_sac(self, obs: np.ndarray, nobs: np.ndarray,
                            act: np.ndarray, rew: np.ndarray,
@@ -1530,16 +1534,16 @@ class MBPOTrainer:
             # RAW views for buffer storage (SB3 stores raw, normalizes at sample).
             nobs_raw = self.env.get_original_obs()
             rew_raw = self.env.get_original_reward()
-            # Policy-facing reward only: penalize transitions where a_learned got
-            # overridden (see robust_override_penalty above). The world model
-            # (real_buffer, below) always gets the true, unpenalized rew_raw.
-            policy_rew_raw = rew_raw
-            if self.robust_override_penalty and unsafe is not None and unsafe.any():
-                policy_rew_raw = rew_raw.copy()
-                policy_rew_raw[unsafe] -= self.robust_override_penalty
 
-            # Store each parallel env transition in two action-consistent views:
-            # executed action for dynamics, proposed action for shielded SAC.
+            # Store each parallel env transition: both buffers key on the
+            # EXECUTED action a_exec, paired with its own true reward/next-state
+            # — no action overwriting, so both are Bellman-consistent by
+            # construction. Where the shield overrode a_learned, ALSO inject a
+            # separate (s, a_learned, 0, terminal) transition into the
+            # policy-facing buffer only: an honest, isolated signal that
+            # proposing that specific action here is worth nothing, without
+            # contaminating it with the backup's unrelated outcome and without
+            # touching the real transition's own bootstrap.
             for i in range(n_envs):
                 terminal = bool(done[i]) and not infos[i].get("TimeLimit.truncated", False)
                 t = np.array([terminal])
@@ -1560,13 +1564,20 @@ class MBPOTrainer:
                     obs_raw[i:i+1], next_o, act_exec[i:i+1],
                     rew_raw[i:i+1], t, [infos[i]],
                 )
-                # Policy view of the identical outcome: key it by the action SAC
-                # proposed, matching synthetic action-overwriting transitions.
-                # Uses policy_rew_raw (override-penalized), not rew_raw.
+                # Policy view of the SAME real outcome — same action, same
+                # reward, same next state as the world-model buffer above.
                 self.policy_real_buffer.add(
-                    obs_raw[i:i+1], next_o, act[i:i+1],
-                    policy_rew_raw[i:i+1], t, [infos[i]],
+                    obs_raw[i:i+1], next_o, act_exec[i:i+1],
+                    rew_raw[i:i+1], t, [infos[i]],
                 )
+                if unsafe is not None and unsafe[i]:
+                    # a_learned was never executed here — record it as its own
+                    # zero-reward terminal transition (next_obs is irrelevant,
+                    # masked by the terminal flag; reuse next_o as a placeholder).
+                    self.policy_real_buffer.add(
+                        obs_raw[i:i+1], next_o, act[i:i+1],
+                        np.zeros(1, dtype=np.float32), np.array([True]), [infos[i]],
+                    )
                 # Virtual episodes are finite reporting/planning windows only:
                 # their last transition remains non-terminal in both replay
                 # buffers, so SAC and the model bootstrap across the boundary.

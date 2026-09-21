@@ -3,10 +3,13 @@
 # by a trained recovery/backup policy. At each step the backup policy's Q-function
 # judges the learning policy's proposed action a_learned: if the recoverability
 # min(Q1,Q2)(s, a_learned) < safety_threshold the recovery policy acts instead.
-#   • World-model buffer ← EXECUTED action (learns true dynamics s'=f(s, a_exec))
-#   • SAC real/model MDP ← (s, a_learned, s'(s, a_exec), r(s, a_exec))
-#     i.e. action overwriting: the critic learns the consequence of *proposing*
-#     a_learned while the state/reward follow the executed (possibly backup) action.
+#   • World-model buffer ← (s, a_exec, s'(s, a_exec), r(s, a_exec)) — always the
+#     real executed transition, learns true dynamics s'=f(s, a_exec).
+#   • SAC real/model MDP ← the SAME (s, a_exec, s'(s, a_exec), r(s, a_exec)); no
+#     action overwriting. Where a_learned got overridden, a separate
+#     (s, a_learned, 0, terminal) transition is ALSO stored (policy-facing
+#     buffer only) — an isolated signal that proposing a_learned there is
+#     worth nothing, without corrupting the real transition's own bootstrap.
 # The backup's own VecNormalize is downloaded with it and used to renormalize obs
 # before the Q-query.
 # Run: python train.py +experiment=solve-maze-once
@@ -22,18 +25,6 @@ env:
   episode_length: 2000
   continuing_task: true
   virtual_episode_length: 2000
-  # Always reset to waypoint 0 (removed the 50/50 random-respawn curriculum,
-  # 2026-09-18) — two independent runs (safety_threshold=1.0 AND 0.87, wildly
-  # different trigger rates and training-time goal counts, 0 vs 200+) both got
-  # stuck at path_progress≈1.0 from a genuine cold-start eval despite one of
-  # them logging 200+ "goals" during training. The random-respawn curriculum
-  # meant only half of resets ever practiced starting from waypoint 0 itself,
-  # and once ent_coef collapses (~60-90k steps into every run) there's no
-  # exploration left to revisit and fix a bad deterministic behavior learned
-  # early at that specific, comparatively under-visited state — even while
-  # the policy gets genuinely good everywhere else it visits more often. This
-  # is the direct test of that theory: 100% cold-start training. See
-  # hole-budget-safety-threshold memory for the full comparison.
   randomize_init_pos: false
   random_init_start_probability: 0.0
 
@@ -77,7 +68,7 @@ algo:
   # (rdjehlxf) which used 0.5 and reached the actual goal 6x with fewer holes
   # than the optimism=0.0 run — the earlier "counterproductive" reasoning
   # doesn't hold once the recovery-Q pessimism (below) is doing its job.
-  optimism: 0.5
+  optimism: 1.0
   target_entropy: -2.0
   robust_recovery_update: true
   # L brought back down 2.5→1.0 (margin left at 0.3): 2.5 pushed
@@ -112,29 +103,25 @@ algo:
   # optimism=0.5). No observed downside to keeping it at 1 — see
   # hole-budget-safety-threshold memory.
   max_rollout_length: 1
-  # ── Main-critic divergence fix (validated 2026-09-18, run 10rpqob0) ────────
-  # "Action overwriting" (the header comment above) stores (s, a_learned,
-  # r(a_exec), s'(a_exec)) whenever the shield fires — Bellman-inconsistent
-  # once shield/real_trigger_rate is moderate-to-high (every useful run):
-  # a_learned drifts as the actor trains while r,s' stay anchored to the more
-  # static backup, so the critic chases a target that barely depends on the
-  # action it's attached to. Confirmed by direct ablation (a no-shield control
-  # run never diverges at all) and root-caused by reading the buffer code, not
-  # just inferred from symptoms — see hole-budget-safety-threshold memory.
-  # robust_override_penalty subtracts a fixed constraint-violation cost from
-  # the reward on overridden transitions, in the SAC-facing buffer only (the
-  # world model still gets the true reward) — a standard shielded-RL penalty,
-  # not an adaptive/reactive mechanism. Tried ALSO zeroing the bootstrap on
-  # override (robust_override_terminal) — that stopped the divergence
-  # completely but froze learning outright (goals_total stuck for 240k+
-  # steps, shield_real_trigger_rate never declining) by deleting the only
-  # multi-step signal for ~80% of every batch — reverted, not used.
-  robust_override_penalty: 0.2
-  # utd_ratio (algo default 75) alone only delayed/dampened the divergence,
-  # never eliminated it, at any value tried (75, 20). Combined with the
-  # penalty above at 10, the critic stayed genuinely bounded (final q≈-5.5,
-  # critic_loss≈0.7 — orders of magnitude below every other variant) for the
-  # full 2M steps while goals_total kept climbing throughout (not frozen):
-  # 15 holes / 9 goals / path_progress_max=13.88 by the end of run 10rpqob0.
-  # Neither lever alone was sufficient; this combination is.
+  # ── Action-overwriting REMOVED (2026-09-21) ─────────────────────────────────
+  # Previously: whenever the shield overrode a_learned, the SAC-facing buffer
+  # stored (s, a_learned, r(a_exec), s'(a_exec)) — a_learned drifts as the
+  # actor trains while r,s' stay anchored to the (more static) backup, so the
+  # critic chases a target that barely depends on the action it's attached
+  # to. This was root-caused as the main-critic divergence driver (confirmed
+  # by a no-shield control ablation that never diverged at all) and patched
+  # with robust_override_penalty (a fixed reward deduction on the overridden
+  # transition). That patch is now superseded: both the world-model and
+  # policy-facing buffers store the SAME real, Bellman-consistent transition
+  # (s, a_exec, r(a_exec), s'(a_exec)); where the shield overrode a_learned, a
+  # SEPARATE (s, a_learned, 0, terminal) transition is injected into the
+  # policy-facing buffer only — an isolated, honest "proposing this here is
+  # worth nothing" signal that doesn't touch the real transition's bootstrap.
+  # See MBPOTrainer.learn() / MBPOTrainer._generate_rollouts.
+  # utd_ratio (algo default 75) alone only delayed/dampened the OLD
+  # divergence, never eliminated it, at any value tried (75, 20); combined
+  # with the (now-removed) override penalty at 10 it stayed genuinely
+  # bounded for the full 2M steps of run 10rpqob0. Kept at 10 here as a
+  # still-reasonable, conservative choice — not re-validated against the new
+  # transition scheme yet.
   utd_ratio: 10

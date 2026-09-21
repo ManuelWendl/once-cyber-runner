@@ -25,7 +25,7 @@ ent_coef: auto
 # reuse solve-maze-once.yaml's tuned values (see the "Robust recovery-Q
 # tuning" memory for how that tuning was done against the other rho).
 robust_recovery_update: false          # off by default
-robust_recovery_ensemble_size: 5       # number of randomized masses (mu spanning the DR range)
+robust_recovery_ensemble_size: 64       # number of randomized masses (mu spanning the DR range)
 robust_recovery_L: 1.0                 # Lipschitz constant L in the 2L(rho_t - m)_+ penalty
 robust_recovery_margin: 0.0            # constant margin m subtracted from rho_t each step
 robust_recovery_update_freq: 2000      # re-fit the critic every N env timesteps
