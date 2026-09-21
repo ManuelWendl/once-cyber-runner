@@ -118,6 +118,13 @@ robust_recovery_update: false        # off by default
 robust_recovery_L: 1.0               # Lipschitz constant L in the 2L(rho_t - m)_+ penalty
 robust_recovery_margin: 0.0          # constant margin m subtracted from rho_t each step
 robust_recovery_update_freq: 2000    # re-fit the backup critic every N env steps
+# Standard shielded-RL constraint-violation penalty: when the shield overrides
+# a_learned, the SAC-facing replay buffer (not the world model's) subtracts this
+# from the stored reward, making the label an honest function of a_learned again
+# instead of inheriting the backup's unrelated outcome. 0.0 (off) is a no-op —
+# the pre-existing action-overwriting behavior. See MBPOTrainer.learn() and
+# MBPOTrainer._generate_rollouts.
+robust_override_penalty: 0.0
 robust_recovery_gradient_steps: 50   # critic (+ actor, if enabled below) gradient steps per re-fit
 robust_recovery_batch_size: 256
 # By default the recovery policy π_r itself stays FROZEN — only its critic is

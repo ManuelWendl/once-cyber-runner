@@ -22,25 +22,27 @@ env:
   episode_length: 2000
   continuing_task: true
   virtual_episode_length: 2000
-  # On any terminal reset (fall OR goal — DummyVecEnv auto-resets on
-  # `terminated`), spawn at waypoint 0 only half the time; the other half at a
-  # uniformly random non-terminal waypoint. Directly targets the failure mode
-  # documented in hole-budget-safety-threshold: every prior run, once knocked
-  # back to waypoint 0 near the 8.7-8.9 wall, either never re-attempted it
-  # (shield idle, actor stuck) or paid a full re-climb in falls to get back.
-  # A 50/50 split keeps waypoint-0 starts (still the majority of the curriculum,
-  # and required for a true full-maze rollout to ever get logged/measured) while
-  # giving the policy regular practice starting already near/past the hard
-  # passage, so a fall there costs a short re-approach instead of a full restart.
-  randomize_init_pos: true
-  random_init_start_probability: 0.5
+  # Always reset to waypoint 0 (removed the 50/50 random-respawn curriculum,
+  # 2026-09-18) — two independent runs (safety_threshold=1.0 AND 0.87, wildly
+  # different trigger rates and training-time goal counts, 0 vs 200+) both got
+  # stuck at path_progress≈1.0 from a genuine cold-start eval despite one of
+  # them logging 200+ "goals" during training. The random-respawn curriculum
+  # meant only half of resets ever practiced starting from waypoint 0 itself,
+  # and once ent_coef collapses (~60-90k steps into every run) there's no
+  # exploration left to revisit and fix a bad deterministic behavior learned
+  # early at that specific, comparatively under-visited state — even while
+  # the policy gets genuinely good everywhere else it visits more often. This
+  # is the direct test of that theory: 100% cold-start training. See
+  # hole-budget-safety-threshold memory for the full comparison.
+  randomize_init_pos: false
+  random_init_start_probability: 0.0
 
 algo:
   warmup_policy: waypoint_pd
   warmup_waypoint_kp: 5.0
   warmup_waypoint_kd: 0.5
   warmup_waypoint_action_limit: 0.2
-  warmup_safety_threshold: 1.0   # matches safety_threshold — warmup is the LEAST reliable phase
+  warmup_safety_threshold: 0.87   # matches safety_threshold — warmup is the LEAST reliable phase
   # ── Safety shield / recovery policy ─────────────────────────────────────────
   # backup_wandb_id must be an SAC backup with the SAME obs_n_stack/layout as
   # this experiment's env (see shielded-mbpo-obs-invariant). p5dobopp is
@@ -48,7 +50,7 @@ algo:
   # hole cluster around path_progress 7.5-9.8 (the one spot every earlier
   # backup/config combo got stuck at) — see configs/experiment/backup-sac.yaml
   # for how to reproduce that fine-tune against a different base backup.
-  backup_wandb_id: u8rnq5nr   # other trained backups: p3d3af7d, tv5u146e, frzdolkz, kwvfnc69, xi9mts9d
+  backup_wandb_id: p5dobopp   # other trained backups: p3d3af7d, tv5u146e, frzdolkz, kwvfnc69, xi9mts9d
   backup_wandb_project: cyberrunner
   backup_policy_path: null         # local fallback (.zip) if backup_wandb_id is null
   backup_vecnorm_path: null        # local fallback (VecNormalize .pkl)
@@ -56,9 +58,20 @@ algo:
   # the earlier hole_budget mechanism — see hole-budget-safety-threshold
   # memory for why: it papered over risk with an adaptive number instead of
   # a real pessimism fix, and still burst under the n_envs=64 burst
-  # mechanism). 1.0 is the strictest possible plain reading of Q as a
-  # recovery probability — only act unshielded when the backup is certain.
-  safety_threshold: 1.0
+  # mechanism). 0.87 (not the "maximally strict" 1.0 tried earlier) — matches
+  # an old (2026-08-28), pre-robust-recovery-update run that genuinely
+  # learned to traverse the maze (goals_total 291-613 in just 500k steps,
+  # vs 9 in 2M at threshold=1.0). At threshold=1.0 the backup's Q has to
+  # output the literal maximum to ever be trusted, which a continuous
+  # estimator essentially never does — shield/real_trigger_rate sat at
+  # 60-90%+, meaning the actor almost never got to execute its own actions
+  # and never built real multi-step control skill (confirmed via a genuine
+  # cold-start eval: stuck at path_progress≈1.0 the entire episode, every
+  # time). That old run's trigger rate was 18-35% at threshold=0.87 — real
+  # headroom for the shield to actually trust a decent action. Still a
+  # plain constant, no schedule, no reactivity — same principle as before,
+  # different (evidence-backed) number.
+  safety_threshold: 0.87
   # optimism=0.5 (the algo default): rewards synthetic rollouts for visiting
   # high-uncertainty states. Re-enabled per the goal-condition run comparison
   # (rdjehlxf) which used 0.5 and reached the actual goal 6x with fewer holes
@@ -71,14 +84,10 @@ algo:
   # shield/real_trigger_rate up to ~85-89% by the end of a run, and the main
   # SAC critic diverged under that much "action overwriting" mismatch
   # (critic_loss into the millions, q down past -3000) — good safety numbers
-  # but a policy whose own value function wasu8rnq5nrn't converging, i.e. poor avg
+  # but a policy whose own value function wasn't converging, i.e. poor avg
   # reward despite a fine max-progress readout. 1.0 is the algo's original
   # default, less pessimistic than even the 2.0 that (d3dphzj1, rdjehlxf)
-  # used successfully — testing whether backing off further keeps the shield
-  # engaged less often, letting the critic actually converge, while
-  # robust_recovery_L=1.0 combined with a constant safety_threshold=1.0 still
-  # keeps the Q-based veto meaningful (not toothless — same user-set
-  # threshold, no schedule).
+  # used successfully.
   robust_recovery_L: 1.0
   robust_recovery_margin: 0.35
   # Also fine-tune the backup's actor π_r online (it was frozen before — only
@@ -86,8 +95,46 @@ algo:
   # mbpo.py _robust_recovery_policy_step) — watch shield/real_trigger_rate.
   robust_recovery_policy_update: true
   robust_recovery_policy_lr: null
-  # More of the SAC policy's training batches come from the world model
-  # rather than real transitions (algo default anneals real_ratio 1.0→0.5;
-  # this anneals further to 0.2), so it can practice the hard passage above
-  # cheaply in imagination rather than needing as many risky real attempts.
-  real_ratio_end: 0.2
+  # real_ratio_end brought back up 0.2→0.5 (algo default anneals real_ratio
+  # 1.0→0.5 already; 0.2 was an extra anneal added earlier reasoning "practice
+  # the hard passage more cheaply in imagination" — but it also means 80% of
+  # SAC's training data is synthetic, doubly compounding the action-overwriting
+  # mismatch (model error AND shield mismatch stacked). The old successful run
+  # used the algo's plain 0.5 default, unmodified.
+  real_ratio_end: 0.5
+  # max_rollout_length reverted 3→1 (2026-09-19): the growth schedule 1→3 was
+  # root-caused as the actual driver of the "second, unrelated" critic
+  # divergence documented below (compounding world-model error in longer
+  # synthetic rollouts) — confirmed by direct ablation (run 3vv7jpiu):
+  # max_rollout_length=1 completed the full 2M steps with q/critic_loss never
+  # leaving single digits and safety/holes_total=5 (vs 180 with growth
+  # enabled and optimism=0.0, or full divergence with growth enabled and
+  # optimism=0.5). No observed downside to keeping it at 1 — see
+  # hole-budget-safety-threshold memory.
+  max_rollout_length: 1
+  # ── Main-critic divergence fix (validated 2026-09-18, run 10rpqob0) ────────
+  # "Action overwriting" (the header comment above) stores (s, a_learned,
+  # r(a_exec), s'(a_exec)) whenever the shield fires — Bellman-inconsistent
+  # once shield/real_trigger_rate is moderate-to-high (every useful run):
+  # a_learned drifts as the actor trains while r,s' stay anchored to the more
+  # static backup, so the critic chases a target that barely depends on the
+  # action it's attached to. Confirmed by direct ablation (a no-shield control
+  # run never diverges at all) and root-caused by reading the buffer code, not
+  # just inferred from symptoms — see hole-budget-safety-threshold memory.
+  # robust_override_penalty subtracts a fixed constraint-violation cost from
+  # the reward on overridden transitions, in the SAC-facing buffer only (the
+  # world model still gets the true reward) — a standard shielded-RL penalty,
+  # not an adaptive/reactive mechanism. Tried ALSO zeroing the bootstrap on
+  # override (robust_override_terminal) — that stopped the divergence
+  # completely but froze learning outright (goals_total stuck for 240k+
+  # steps, shield_real_trigger_rate never declining) by deleting the only
+  # multi-step signal for ~80% of every batch — reverted, not used.
+  robust_override_penalty: 0.2
+  # utd_ratio (algo default 75) alone only delayed/dampened the divergence,
+  # never eliminated it, at any value tried (75, 20). Combined with the
+  # penalty above at 10, the critic stayed genuinely bounded (final q≈-5.5,
+  # critic_loss≈0.7 — orders of magnitude below every other variant) for the
+  # full 2M steps while goals_total kept climbing throughout (not frozen):
+  # 15 holes / 9 goals / path_progress_max=13.88 by the end of run 10rpqob0.
+  # Neither lever alone was sufficient; this combination is.
+  utd_ratio: 10
